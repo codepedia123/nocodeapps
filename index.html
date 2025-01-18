@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High-Quality Custom No-Code Apps</title>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* Tailwind-like utility classes */
+        :root {
+            --color-green-50: #f0fdf4;
+            --color-green-600: #16a34a;
+            --color-green-700: #15803d;
+            --color-gray-600: #4b5563;
+            --color-gray-900: #111827;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Montserrat', sans-serif;
+            line-height: 1.5;
+            color: var(--color-gray-900);
+        }
+        .container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 0 1rem; }
+        .flex { display: flex; }
+        .items-center { align-items: center; }
+        .justify-between { justify-content: space-between; }
+        .gap-4 { gap: 1rem; }
+        .gap-6 { gap: 1.5rem; }
+        .space-y-6 > * + * { margin-top: 1.5rem; }
+        .space-y-8 > * + * { margin-top: 2rem; }
+        .text-sm { font-size: 0.875rem; }
+        .text-lg { font-size: 1.125rem; }
+        .text-xl { font-size: 1.25rem; }
+        .text-2xl { font-size: 1.5rem; }
+        .text-3xl { font-size: 1.875rem; }
+        .text-4xl { font-size: 2.25rem; }
+        .font-medium { font-weight: 500; }
+        .font-bold { font-weight: 700; }
+        .text-center { text-align: center; }
+        .text-gray-600 { color: var(--color-gray-600); }
+        .bg-white { background-color: white; }
+        .bg-green-50 { background-color: var(--color-green-50); }
+        .rounded-lg { border-radius: 0.5rem; }
+        .rounded-full { border-radius: 9999px; }
+        .shadow-sm { box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
+        .shadow-lg { box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); }
+        .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+        .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
+        .px-4 { padding-left: 1rem; padding-right: 1rem; }
+        .py-20 { padding-top: 5rem; padding-bottom: 5rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .mb-6 { margin-bottom: 1.5rem; }
+        .mb-16 { margin-bottom: 4rem; }
+        .w-full { width: 100%; }
+        .h-10 { height: 2.5rem; }
+        .h-32 { height: 8rem; }
+        .object-contain { object-fit: contain; }
+        .inline-block { display: inline-block; }
+        .inline-flex { display: inline-flex; }
+
+        /* Custom styles */
+        .hero-section {
+            background: linear-gradient(to bottom right, var(--color-green-50), white);
+            padding: 5rem 0;
+        }
+        .btn {
+            display: inline-block;
+            padding: 0.75rem 1.5rem;
+            font-weight: 600;
+            text-align: center;
+            text-decoration: none;
+            border-radius: 0.375rem;
+            transition: background-color 0.3s;
+        }
+        .btn-primary {
+            background-color: var(--color-green-600);
+            color: white;
+        }
+        .btn-primary:hover {
+            background-color: var(--color-green-700);
+        }
+        .btn-outline {
+            border: 1px solid var(--color-gray-600);
+            color: var(--color-gray-600);
+        }
+        .btn-outline:hover {
+            background-color: var(--color-gray-600);
+            color: white;
+        }
+        .feature-card {
+            background-color: white;
+            padding: 1.5rem;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transition: box-shadow 0.3s;
+        }
+        .feature-card:hover {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+
+        @media (min-width: 768px) {
+            .md\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .md\:text-6xl { font-size: 3.75rem; }
+            .md\:py-32 { padding-top: 8rem; padding-bottom: 8rem; }
+        }
+
+        @media (min-width: 1024px) {
+            .lg\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+    </style>
+</head>
+<body>
+    <nav class="bg-white shadow-sm">
+        <div class="container flex items-center justify-between py-4">
+            <div class="flex items-center gap-6">
+                <img src="https://us1.discourse-cdn.com/flex015/uploads/thunkable/original/3X/0/f/0f59f292712368bce16ff80133ae10de8a6f27e8.png" alt="Thunkable Logo" class="h-10 w-auto">
+            </div>
+            <div class="flex items-center gap-4">
+                <a href="https://www.fiverr.com/users/thenocodeappste/portfolio?roleIds=" class="text-gray-600 hover:text-gray-900" target="_blank" rel="noopener noreferrer">Portfolio</a>
+                <a href="https://pro.fiverr.com/certified/thunkable?utm_source=fiverr_certified&utm_medium=homepage&utm_campaign=certified_home&service=thunkable-project&active_expert_id=147498421" class="btn btn-primary" target="_blank" rel="noopener noreferrer">Chat Now</a>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <section class="hero-section">
+            <div class="container">
+                <div class="flex flex-col md:flex-row items-center gap-8">
+                    <div class="space-y-6 md:w-1/2">
+                        <div class="inline-flex items-center gap-2 bg-white px-4 py-2 rounded-full shadow-sm">
+                            <div class="flex gap-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4 text-yellow-400">
+                                    <path fill-rule="evenodd" d="M10.788 3.21c.448-1.077 1.976-1.077 2.424 0l2.082 5.007 5.404.433c1.164.093 1.636 1.545.749 2.305l-4.117 3.527 1.257 5.273c.271 1.136-.964 2.033-1.96 1.425L12 18.354 7.373 21.18c-.996.608-2.231-.29-1.96-1.425l1.257-5.273-4.117-3.527c-.887-.76-.415-2.212.749-2.305l5.404-.433 2.082-5.006z" clip-rule="evenodd" />
+                                </svg>
+                            </div>
+                            <span class="text-sm font-medium">4.8 Stars</span>
+                        </div>
+                        <h1 class="text-4xl md:text-6xl font-bold leading-tight">
+                            High-Quality Custom <span style="color: var(--color-green-600);">No-Code Apps</span>
+                        </h1>
+                        <p class="text-xl md:text-2xl text-gray-600">
+                            But Just at Hundreds Not For Thousands of Bucks
+                        </p>
+                        <a href="https://pro.fiverr.com/certified/thunkable?utm_source=fiverr_certified&utm_medium=homepage&utm_campaign=certified_home&service=thunkable-project&active_expert_id=147498421" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+                            Chat with Us on Fiverr Now!
+                        </a>
+                    </div>
+                    <div class="md:w-1/2">
+                        <img src="https://res.cloudinary.com/di751ehfz/image/upload/v1737183099/mobile-development-animate_qia1jr.svg" alt="Mobile App Development Illustration" class="w-full h-auto">
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="py-20 bg-white">
+            <div class="container">
+                <div class="max-w-3xl mx-auto text-center mb-16">
+                    <h2 class="text-3xl md:text-4xl font-bold mb-6">
+                        High-Quality App Development
+                    </h2>
+                    <p class="text-lg text-gray-600">
+                        Imagine turning your app idea into reality with ease. Our No-Code Solutions
+                        make it possible—quickly, affordably, and with scalability in mind.
+                    </p>
+                </div>
+                <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    <div class="feature-card">
+                        <div class="mb-6 flex justify-center">
+                            <img src="https://us1.discourse-cdn.com/flex015/uploads/thunkable/original/3X/0/f/0f59f292712368bce16ff80133ae10de8a6f27e8.png" alt="Thunkable Certified" class="h-32 w-auto object-contain">
+                        </div>
+                        <h3 class="text-xl font-bold mb-4">Thunkable Certified</h3>
+                        <p class="text-gray-600">Professional team with outstanding 4.8-star rating</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="mb-6 flex justify-center">
+                            <img src="https://res.cloudinary.com/di751ehfz/image/upload/v1737183214/Mobile_development-rafiki_1_uvmbki.png" alt="Custom Solutions" class="h-32 w-auto object-contain">
+                        </div>
+                        <h3 class="text-xl font-bold mb-4">Custom Solutions</h3>
+                        <p class="text-gray-600">Not templates, but fully customized applications</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="mb-6 flex justify-center">
+                            <img src="https://res.cloudinary.com/di751ehfz/image/upload/v1737183361/electric_wjra4t.png" alt="Powerful Integration" class="h-32 w-auto object-contain">
+                        </div>
+                        <h3 class="text-xl font-bold mb-4">Powerful Integration</h3>
+                        <p class="text-gray-600">Using Thunkable, Airtable, and Zapier</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="bg-green-50 py-20">
+            <div class="container">
+                <div class="max-w-3xl mx-auto text-center space-y-8">
+                    <h2 class="text-3xl md:text-4xl font-bold">
+                        Got the Next Great App Idea?
+                    </h2>
+                    <p class="text-lg text-gray-600">
+                        Start a Chat with us on Fiverr Now! And take the First Step of Building your Dream Startup.
+                    </p>
+                    <div class="space-y-4">
+                        <a href="https://pro.fiverr.com/certified/thunkable?utm_source=fiverr_certified&utm_medium=homepage&utm_campaign=certified_home&service=thunkable-project&active_expert_id=147498421" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+                            Chat with Us on Fiverr Now!
+                        </a>
+                        <p class="text-sm text-gray-500">
+                            Our Team usually responds under an Hour.
+                        </p>
+                    </div>
+                    <a href="https://www.fiverr.com/users/thenocodeappste/portfolio?roleIds=" class="btn btn-outline" target="_blank" rel="noopener noreferrer">
+                        View Portfolio Projects
+                    </a>
+                </div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>
