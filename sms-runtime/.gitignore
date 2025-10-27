@@ -1,0 +1,23 @@
+# Venv and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Home directory exclusions (to ignore ../ stuff)
+../*
+!.gitignore
+!README.md
+!requirements.txt
+!app.py
+!*.py  # Include your scripts
+
+# OS files
+.DS_Store
+.Trash/
+*.swp
+*.swo
+
+# Logs and temp
+*.log
