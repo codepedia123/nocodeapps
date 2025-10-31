@@ -1,7 +1,0 @@
-redis==5.0.1
-fastapi==0.115.12
-uvicorn==0.24.0
-langchain==0.1.0
-langchain-openai==0.1.0
-twilio==8.10.0
-python-multipart==0.0.9
