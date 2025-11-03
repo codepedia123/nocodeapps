@@ -5,7 +5,7 @@ import redis
 app = FastAPI()
 
 # Redis connection (local or Render)
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+redis_url = os.getenv('REDIS_URL', 'redis://red-d44f17jipnbc73dqs2k0:6379')
 r = redis.from_url(redis_url, decode_responses=True)
 
 # Your routes (e.g., /runtime, /users) here...
