@@ -7,7 +7,7 @@ import json
 from pydantic import BaseModel
 
 # Redis connection (Render env or local fallback)
-redis_url = os.getenv('REDIS_URL', 'redis://red-d44f17jipnbc73dqs2k0:6379')
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
 try:
     r = redis.from_url(redis_url, decode_responses=True)
     r.ping()  # Test connection
