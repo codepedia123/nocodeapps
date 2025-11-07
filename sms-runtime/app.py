@@ -1,4 +1,5 @@
 # sms-runtime/app.py
+
 import os
 import json
 import time
@@ -8,7 +9,6 @@ import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 
 # ----------------------------------------------------------------------
 # Redis connection – uses Render's REDIS_URL or fallback KV instance
@@ -21,7 +21,6 @@ except redis.ConnectionError as e:
     print(f"Redis connection failed: {e}")
     r = None
 
-
 app = FastAPI(title="SMS Runtime Backend")
 
 # CORS – allow any origin
@@ -32,7 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ----------------------------------------------------------------------
 # Request Models
@@ -46,14 +44,12 @@ class UpdateRequest(BaseModel):
     id: str
     updates: Dict[str, Any]
 
-
 # ----------------------------------------------------------------------
 # Helper
 # ----------------------------------------------------------------------
 def _require_redis():
     if not r:
         raise HTTPException(status_code=503, detail="Redis not available")
-
 
 # ----------------------------------------------------------------------
 # HEALTH CHECK
@@ -66,7 +62,6 @@ def health():
         "redis": redis_status,
         "endpoints": ["/add", "/fetch", "/update", "/delete"]
     }
-
 
 # ----------------------------------------------------------------------
 # ADD
@@ -115,7 +110,6 @@ def add_endpoint(req: AddRequest):
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
-
 # ----------------------------------------------------------------------
 # FETCH
 # ----------------------------------------------------------------------
@@ -128,7 +122,6 @@ def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
                 filters[k.strip()] = v.strip()
     return filters
 
-
 def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
     if not filters:
         return True
@@ -136,7 +129,6 @@ def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
         if str(record.get(k, "")).lower() != v.lower():
             return False
     return True
-
 
 @app.get("/fetch")
 def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
@@ -212,7 +204,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
         out = {}
         for ck in r.smembers("conversations"):
             agent_id, phone = ck.split(":", 1)
-            key = f"convo:{agent_id cég}:{phone}"
+            key = f"convo:{agent_id}:{phone}"
             msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
             meta_key = f"convo_meta:{agent_id}:{phone}"
             meta = dict(r.hgetall(meta_key))
@@ -226,7 +218,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
         return out
 
     raise HTTPException(status_code=400, detail="Invalid table")
-
 
 # ----------------------------------------------------------------------
 # UPDATE
@@ -272,7 +263,6 @@ def update_endpoint(req: UpdateRequest):
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
-
 # ----------------------------------------------------------------------
 # DELETE
 # ----------------------------------------------------------------------
@@ -307,7 +297,6 @@ def delete_endpoint(table: str, id: str):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     raise HTTPException(status_code=400, detail="Invalid table")
-
 
 # ----------------------------------------------------------------------
 # Run (Render uses: uvicorn sms-runtime.app:app)
