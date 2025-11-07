@@ -2,7 +2,8 @@
 import os
 import json
 import time
-from typing import Dict, Any, Optional
+import uuid
+from typing import Dict, Any, Optional, List, Tuple
 
 import redis
 from fastapi import FastAPI, HTTPException
@@ -10,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ----------------------------------------------------------------------
-# Redis connection – uses Render's REDIS_URL or fallback KV instance
+# Redis connection – uses REDIS_URL or fallback
 # ----------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://red-d44f17jipnbc73dqs2k0:6379")
 try:
@@ -22,7 +23,6 @@ except Exception as e:
 
 app = FastAPI(title="SMS Runtime Backend")
 
-# allow any origin for now
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,7 +32,7 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------------------------
-# Request Models
+# Request models
 # ----------------------------------------------------------------------
 class AddRequest(BaseModel):
     table: str
@@ -44,7 +44,7 @@ class UpdateRequest(BaseModel):
     updates: Dict[str, Any]
 
 # ----------------------------------------------------------------------
-# Helpers: ID management and shifting logic
+# Helpers and key utilities
 # ----------------------------------------------------------------------
 def _require_redis():
     if not r:
@@ -68,109 +68,232 @@ def _convo_msg_key(agent_name: str, phone: str) -> str:
 def _convo_meta_key(agent_name: str, phone: str) -> str:
     return f"convo_meta:{agent_name}:{phone}"
 
-# Shift user IDs down after deleting a user with numeric id `deleted_id`
-def _shift_users_down(deleted_id: int):
-    next_id = _get_next_user_id()
-    if deleted_id >= next_id or deleted_id < 1:
-        # nothing to shift
-        return
+# ----------------------------------------------------------------------
+# Compaction helpers
+# These functions create contiguous ids and update dependent references.
+# They use temporary keys to avoid rename collisions.
+# ----------------------------------------------------------------------
+def _all_numeric_suffix_ids(prefix: str) -> List[int]:
+    # prefix examples: "user" or "agent"
+    ids = []
+    pattern = f"{prefix}:*"
+    for key in r.scan_iter(match=pattern):
+        parts = key.split(":")
+        if len(parts) >= 2:
+            suffix = parts[1]
+            if suffix.isdigit():
+                ids.append(int(suffix))
+    ids = sorted(set(ids))
+    return ids
 
-    # Move each user i -> i-1 for i in deleted_id+1 .. next_id
-    for i in range(deleted_id + 1, next_id + 1):
-        old = _user_key(i)
-        new = _user_key(i - 1)
-        if r.exists(old):
-            # ensure destination does not exist to avoid RENAME error
-            if r.exists(new):
-                r.delete(new)
-            r.rename(old, new)
-            # update membership set
-            r.srem("users", str(i))
-            r.sadd("users", str(i - 1))
+def compact_users() -> Dict[str, Any]:
+    """
+    Make user ids sequential from 1..N. Update agents.user_id references.
+    Return summary dict.
+    """
+    # gather current numeric user ids
+    ids = _all_numeric_suffix_ids("user")
+    if not ids:
+        r.set("next_user_id", 0)
+        r.delete("users")
+        return {"status": "ok", "users_before": 0, "users_after": 0}
 
-    # Update agents that reference user ids
-    # Agents are stored as hashes named "agent{n}"
-    for aid in r.smembers("agents"):
+    # mapping old_id -> new_id
+    mapping: Dict[int, int] = {}
+    for new_idx, old_id in enumerate(ids, start=1):
+        mapping[old_id] = new_idx
+
+    # step 1: rename all old user keys that need renaming to temp keys
+    temp_map: Dict[str, Tuple[int, int]] = {}
+    uid_uuid = uuid.uuid4().hex
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            continue
+        old_key = _user_key(old_id)
+        if not r.exists(old_key):
+            continue
+        temp_key = f"tmp:rekey:user:{uid_uuid}:{old_id}"
+        if r.exists(temp_key):
+            r.delete(temp_key)
+        r.rename(old_key, temp_key)
+        temp_map[temp_key] = (old_id, new_id)
+
+    # step 2: remove old numeric entries from set and add new ones for keys that remained (non-renamed)
+    # rebuild users set cleanly later; first collect final ids with data
+    final_ids: List[int] = []
+    # keys that were not moved but are valid (old_id == new_id)
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            key = _user_key(old_id)
+            if r.exists(key):
+                final_ids.append(new_id)
+
+    # step 3: rename temps to final keys and record final_ids
+    for temp_key, (old_id, new_id) in temp_map.items():
+        final_key = _user_key(new_id)
+        if r.exists(final_key):
+            r.delete(final_key)
+        r.rename(temp_key, final_key)
+        final_ids.append(new_id)
+
+    final_ids = sorted(set(final_ids))
+
+    # step 4: rebuild users set to match final ids
+    r.delete("users")
+    for uid in final_ids:
+        r.sadd("users", str(uid))
+
+    # step 5: update agents.user_id fields that referenced old ids
+    # map old numeric -> new numeric
+    old_to_new = {old: new for old, new in mapping.items() if old != new}
+    for aid in list(r.smembers("agents")):
         try:
-            # read user_id if present
             user_id = r.hget(aid, "user_id")
-            if user_id is None:
+            if not user_id:
                 continue
-            # user_id stored as string number
             if user_id.isdigit():
-                uid = int(user_id)
-                if uid > deleted_id:
-                    # decrement
-                    r.hset(aid, "user_id", str(uid - 1))
+                old_uid = int(user_id)
+                if old_uid in old_to_new:
+                    r.hset(aid, "user_id", str(old_to_new[old_uid]))
         except Exception:
             continue
 
-    # decrement next_user_id
-    r.decr("next_user_id")
+    # step 6: set next_user_id correctly
+    r.set("next_user_id", len(final_ids))
+    return {"status": "ok", "users_before": len(ids), "users_after": len(final_ids)}
 
-# Shift agent IDs down after deleting an agent with numeric index `deleted_index`
-# This will rename agent hashes and update conversation keys/meta and the conversations set.
-def _shift_agents_down(deleted_index: int):
-    next_agent = _get_next_agent_id()
-    if deleted_index >= next_agent or deleted_index < 1:
-        return
+def _collect_conversations_for_agent(agent_name: str) -> List[str]:
+    # returns conversation set entries like "agentN:phone" for this agent
+    out = []
+    for ck in r.smembers("conversations"):
+        if not ck:
+            continue
+        if ck.startswith(agent_name + ":"):
+            out.append(ck)
+    return out
 
-    for j in range(deleted_index + 1, next_agent + 1):
-        old_name = _agent_name(j)
-        new_name = _agent_name(j - 1)
+def compact_agents() -> Dict[str, Any]:
+    """
+    Make agent ids sequential from 1..N. Update conversation keys, meta, and the conversations set.
+    Return summary dict.
+    """
+    ids = _all_numeric_suffix_ids("agent")
+    if not ids:
+        r.set("next_agent_id", 0)
+        r.delete("agents")
+        return {"status": "ok", "agents_before": 0, "agents_after": 0}
 
-        # Rename agent hash (if exists)
+    mapping: Dict[int, int] = {}
+    for new_idx, old_id in enumerate(ids, start=1):
+        mapping[old_id] = new_idx
+
+    agent_uuid = uuid.uuid4().hex
+
+    # We'll perform per-agent renames using temporary agent names to avoid collisions.
+    # For each old->new where different:
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            continue
+        old_name = _agent_name(old_id)
+        new_name = _agent_name(new_id)
+        temp_agent = f"tmp:rekey:agent:{agent_uuid}:{old_id}"
+
+        # rename agent hash to temp
         if r.exists(old_name):
+            if r.exists(temp_agent):
+                r.delete(temp_agent)
+            r.rename(old_name, temp_agent)
+
+        # update agents set: remove old_name, add temp_agent placeholder
+        if r.sismember("agents", old_name):
+            r.srem("agents", old_name)
+            r.sadd("agents", temp_agent)
+
+        # rename conversation keys and meta that belong to old_name to temp_agent prefix
+        convs = _collect_conversations_for_agent(old_name)
+        for ck in convs:
+            try:
+                _, phone = ck.split(":", 1)
+            except ValueError:
+                continue
+            old_msg = _convo_msg_key(old_name, phone)
+            temp_msg = _convo_msg_key(temp_agent, phone)
+            if r.exists(old_msg):
+                if r.exists(temp_msg):
+                    r.delete(temp_msg)
+                r.rename(old_msg, temp_msg)
+
+            old_meta = _convo_meta_key(old_name, phone)
+            temp_meta = _convo_meta_key(temp_agent, phone)
+            if r.exists(old_meta):
+                if r.exists(temp_meta):
+                    r.delete(temp_meta)
+                r.rename(old_meta, temp_meta)
+                # update agent_id field inside meta to temp_agent
+                try:
+                    r.hset(temp_meta, "agent_id", temp_agent)
+                except Exception:
+                    pass
+
+            # update conversations set entry to temp_agent:phone
+            r.srem("conversations", ck)
+            r.sadd("conversations", f"{temp_agent}:{phone}")
+
+        # finally rename temp_agent to final new_name
+        if r.exists(temp_agent):
             if r.exists(new_name):
                 r.delete(new_name)
-            r.rename(old_name, new_name)
+            r.rename(temp_agent, new_name)
 
-        # Update 'agents' set membership
-        r.srem("agents", old_name)
-        r.sadd("agents", new_name)
+        # update agents set: remove temp_agent, add new_name
+        if r.sismember("agents", temp_agent):
+            r.srem("agents", temp_agent)
+            r.sadd("agents", new_name)
 
-        # Update any conversations that reference this agent
-        # We must scan existing conversations set entries and replace the prefix.
-        for ck in list(r.smembers("conversations")):
-            # ck format: "agentN:+phone" or "agentN:phone"
-            if not ck:
+        # rename any temp conversation entries we created to final names
+        convs_temp = _collect_conversations_for_agent(temp_agent)
+        for tck in convs_temp:
+            try:
+                _, phone = tck.split(":", 1)
+            except ValueError:
                 continue
-            if ck.startswith(old_name + ":"):
+            temp_msg = _convo_msg_key(temp_agent, phone)
+            final_msg = _convo_msg_key(new_name, phone)
+            if r.exists(temp_msg):
+                if r.exists(final_msg):
+                    r.delete(final_msg)
+                r.rename(temp_msg, final_msg)
+
+            temp_meta = _convo_meta_key(temp_agent, phone)
+            final_meta = _convo_meta_key(new_name, phone)
+            if r.exists(temp_meta):
+                if r.exists(final_meta):
+                    r.delete(final_meta)
+                r.rename(temp_meta, final_meta)
                 try:
-                    # split into agent portion and phone
-                    _, phone = ck.split(":", 1)
-                except ValueError:
-                    continue
-                old_msg_key = _convo_msg_key(old_name, phone)
-                new_msg_key = _convo_msg_key(new_name, phone)
-                old_meta_key = _convo_meta_key(old_name, phone)
-                new_meta_key = _convo_meta_key(new_name, phone)
+                    r.hset(final_meta, "agent_id", new_name)
+                except Exception:
+                    pass
 
-                # rename message list/key
-                if r.exists(old_msg_key):
-                    if r.exists(new_msg_key):
-                        r.delete(new_msg_key)
-                    r.rename(old_msg_key, new_msg_key)
-
-                # rename meta hash and update its internal agent_id field if present
-                if r.exists(old_meta_key):
-                    if r.exists(new_meta_key):
-                        r.delete(new_meta_key)
-                    r.rename(old_meta_key, new_meta_key)
-                    try:
-                        r.hset(new_meta_key, "agent_id", new_name)
-                    except Exception:
-                        pass
-
-                # update conversations set entry
-                r.srem("conversations", ck)
+            # update conversations set entry from temp_agent:phone to new_name:phone
+            if r.sismember("conversations", tck):
+                r.srem("conversations", tck)
                 r.sadd("conversations", f"{new_name}:{phone}")
 
-    # decrement next_agent_id
-    r.decr("next_agent_id")
+    # rebuild agents set so it contains only agentN names that actually exist
+    r.delete("agents")
+    final_agent_ids = []
+    for new_idx in sorted(mapping.values()):
+        name = _agent_name(new_idx)
+        if r.exists(name):
+            r.sadd("agents", name)
+            final_agent_ids.append(new_idx)
+
+    r.set("next_agent_id", len(final_agent_ids))
+    return {"status": "ok", "agents_before": len(ids), "agents_after": len(final_agent_ids)}
 
 # ----------------------------------------------------------------------
-# Health
+# Health endpoint
 # ----------------------------------------------------------------------
 @app.get("/")
 def health():
@@ -178,11 +301,11 @@ def health():
     return {
         "message": "SMS Runtime Backend Live!",
         "redis": redis_status,
-        "endpoints": ["/add", "/fetch", "/update", "/delete"]
+        "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
     }
 
 # ----------------------------------------------------------------------
-# ADD
+# ADD endpoint
 # ----------------------------------------------------------------------
 @app.post("/add")
 def add_endpoint(req: AddRequest):
@@ -218,7 +341,6 @@ def add_endpoint(req: AddRequest):
         key = _convo_msg_key(agent_id, phone)
         meta_key = _convo_meta_key(agent_id, phone)
         messages = data.pop("messages", [])
-        # replace any existing conversation (explicit behavior from original)
         r.delete(key)
         for m in messages:
             r.rpush(key, json.dumps(m))
@@ -230,8 +352,7 @@ def add_endpoint(req: AddRequest):
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# FETCH
-# Note: For deterministic ordering and speed we iterate numeric ids for users and agents.
+# FETCH endpoint
 # ----------------------------------------------------------------------
 def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
     filters = {}
@@ -255,7 +376,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
     _require_redis()
     filt = _parse_filters(filters)
 
-    # USERS: iterate from 1..next_user_id to preserve order and keep fetch fast
+    # USERS
     if table == "users":
         if id:
             try:
@@ -286,10 +407,9 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 out[str(uid)] = rec
         return out
 
-    # AGENTS: ordered by numeric suffix
+    # AGENTS
     if table == "agents":
         if id:
-            # id might be "agent3" or "3"
             aid = id if id.startswith("agent") else _agent_name(int(id))
             rec = dict(r.hgetall(aid))
             if not rec:
@@ -339,7 +459,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
 
-        # return all conversations (careful: could be large)
         out = {}
         for ck in r.smembers("conversations"):
             if not ck:
@@ -364,7 +483,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# UPDATE
+# UPDATE endpoint
 # ----------------------------------------------------------------------
 @app.post("/update")
 def update_endpoint(req: UpdateRequest):
@@ -413,13 +532,13 @@ def update_endpoint(req: UpdateRequest):
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# DELETE with shifting behavior
+# DELETE with automatic compaction
 # ----------------------------------------------------------------------
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
     _require_redis()
 
-    # USERS: id is numeric (string) -> delete and shift down remaining users
+    # USERS
     if table == "users":
         try:
             uid = int(id)
@@ -428,12 +547,12 @@ def delete_endpoint(table: str, id: str):
         key = _user_key(uid)
         if r.delete(key):
             r.srem("users", str(uid))
-            # Shift later users down so positions remain contiguous
-            _shift_users_down(uid)
+            # compact to remove gaps and keep sequence contiguous
+            compact_users()
             return {"status": "deleted", "id": str(uid)}
         raise HTTPException(status_code=404, detail="User not found")
 
-    # AGENTS: id may be "agentN" or numeric "N"
+    # AGENTS
     if table == "agents":
         if id.startswith("agent"):
             try:
@@ -449,12 +568,12 @@ def delete_endpoint(table: str, id: str):
         aid_name = _agent_name(idx)
         if r.delete(aid_name):
             r.srem("agents", aid_name)
-            # Shift later agents down
-            _shift_agents_down(idx)
+            # compact agents and update conversation keys/meta
+            compact_agents()
             return {"status": "deleted", "id": aid_name}
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # CONVERSATIONS: delete specific conversation by id agent:phone
+    # CONVERSATIONS
     if table == "conversations":
         try:
             agent_id, phone = id.split(":", 1)
@@ -471,7 +590,24 @@ def delete_endpoint(table: str, id: str):
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# Run (use uvicorn sms-runtime.app:app)
+# Admin - manual compaction endpoint
+# Use POST /admin/compact with optional json body {"table": "users"|"agents"|"all"}
+# ----------------------------------------------------------------------
+@app.post("/admin/compact")
+def admin_compact(payload: Optional[Dict[str, Any]] = None):
+    _require_redis()
+    table = None
+    if payload and isinstance(payload, dict):
+        table = payload.get("table")
+    result = {}
+    if table is None or table == "users" or table == "all":
+        result["users"] = compact_users()
+    if table is None or table == "agents" or table == "all":
+        result["agents"] = compact_agents()
+    return {"status": "ok", "result": result}
+
+# ----------------------------------------------------------------------
+# Run
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
