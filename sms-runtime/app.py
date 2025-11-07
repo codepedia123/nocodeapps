@@ -11,9 +11,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ----------------------------------------------------------------------
-# Redis connection – uses REDIS_URL or fallback
+# Config
 # ----------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://red-d44f17jipnbc73dqs2k0:6379")
+# Maximum number of sequential ids to pipeline directly. If next_id is larger,
+# we fall back to scanning the membership set to avoid huge pipelines.
+MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
+
+# ----------------------------------------------------------------------
+# Redis connection
+# ----------------------------------------------------------------------
 try:
     r = redis.from_url(redis_url, decode_responses=True)
     r.ping()
@@ -44,7 +51,7 @@ class UpdateRequest(BaseModel):
     updates: Dict[str, Any]
 
 # ----------------------------------------------------------------------
-# Helpers and key utilities
+# Key utilities and helpers
 # ----------------------------------------------------------------------
 def _require_redis():
     if not r:
@@ -68,13 +75,8 @@ def _convo_msg_key(agent_name: str, phone: str) -> str:
 def _convo_meta_key(agent_name: str, phone: str) -> str:
     return f"convo_meta:{agent_name}:{phone}"
 
-# ----------------------------------------------------------------------
-# Compaction helpers
-# These functions create contiguous ids and update dependent references.
-# They use temporary keys to avoid rename collisions.
-# ----------------------------------------------------------------------
+# get numeric suffix ids for keys like user:N or agent:N
 def _all_numeric_suffix_ids(prefix: str) -> List[int]:
-    # prefix examples: "user" or "agent"
     ids = []
     pattern = f"{prefix}:*"
     for key in r.scan_iter(match=pattern):
@@ -83,29 +85,26 @@ def _all_numeric_suffix_ids(prefix: str) -> List[int]:
             suffix = parts[1]
             if suffix.isdigit():
                 ids.append(int(suffix))
-    ids = sorted(set(ids))
-    return ids
+    return sorted(set(ids))
 
+# ----------------------------------------------------------------------
+# Compaction helpers (unchanged behavior but included)
+# ----------------------------------------------------------------------
 def compact_users() -> Dict[str, Any]:
-    """
-    Make user ids sequential from 1..N. Update agents.user_id references.
-    Return summary dict.
-    """
-    # gather current numeric user ids
     ids = _all_numeric_suffix_ids("user")
     if not ids:
         r.set("next_user_id", 0)
         r.delete("users")
         return {"status": "ok", "users_before": 0, "users_after": 0}
 
-    # mapping old_id -> new_id
     mapping: Dict[int, int] = {}
     for new_idx, old_id in enumerate(ids, start=1):
         mapping[old_id] = new_idx
 
-    # step 1: rename all old user keys that need renaming to temp keys
     temp_map: Dict[str, Tuple[int, int]] = {}
     uid_uuid = uuid.uuid4().hex
+
+    # rename to temp keys to avoid collisions
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             continue
@@ -118,17 +117,13 @@ def compact_users() -> Dict[str, Any]:
         r.rename(old_key, temp_key)
         temp_map[temp_key] = (old_id, new_id)
 
-    # step 2: remove old numeric entries from set and add new ones for keys that remained (non-renamed)
-    # rebuild users set cleanly later; first collect final ids with data
     final_ids: List[int] = []
-    # keys that were not moved but are valid (old_id == new_id)
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             key = _user_key(old_id)
             if r.exists(key):
                 final_ids.append(new_id)
 
-    # step 3: rename temps to final keys and record final_ids
     for temp_key, (old_id, new_id) in temp_map.items():
         final_key = _user_key(new_id)
         if r.exists(final_key):
@@ -137,14 +132,10 @@ def compact_users() -> Dict[str, Any]:
         final_ids.append(new_id)
 
     final_ids = sorted(set(final_ids))
-
-    # step 4: rebuild users set to match final ids
     r.delete("users")
     for uid in final_ids:
         r.sadd("users", str(uid))
 
-    # step 5: update agents.user_id fields that referenced old ids
-    # map old numeric -> new numeric
     old_to_new = {old: new for old, new in mapping.items() if old != new}
     for aid in list(r.smembers("agents")):
         try:
@@ -158,12 +149,10 @@ def compact_users() -> Dict[str, Any]:
         except Exception:
             continue
 
-    # step 6: set next_user_id correctly
     r.set("next_user_id", len(final_ids))
     return {"status": "ok", "users_before": len(ids), "users_after": len(final_ids)}
 
 def _collect_conversations_for_agent(agent_name: str) -> List[str]:
-    # returns conversation set entries like "agentN:phone" for this agent
     out = []
     for ck in r.smembers("conversations"):
         if not ck:
@@ -173,10 +162,6 @@ def _collect_conversations_for_agent(agent_name: str) -> List[str]:
     return out
 
 def compact_agents() -> Dict[str, Any]:
-    """
-    Make agent ids sequential from 1..N. Update conversation keys, meta, and the conversations set.
-    Return summary dict.
-    """
     ids = _all_numeric_suffix_ids("agent")
     if not ids:
         r.set("next_agent_id", 0)
@@ -189,8 +174,6 @@ def compact_agents() -> Dict[str, Any]:
 
     agent_uuid = uuid.uuid4().hex
 
-    # We'll perform per-agent renames using temporary agent names to avoid collisions.
-    # For each old->new where different:
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             continue
@@ -198,18 +181,15 @@ def compact_agents() -> Dict[str, Any]:
         new_name = _agent_name(new_id)
         temp_agent = f"tmp:rekey:agent:{agent_uuid}:{old_id}"
 
-        # rename agent hash to temp
         if r.exists(old_name):
             if r.exists(temp_agent):
                 r.delete(temp_agent)
             r.rename(old_name, temp_agent)
 
-        # update agents set: remove old_name, add temp_agent placeholder
         if r.sismember("agents", old_name):
             r.srem("agents", old_name)
             r.sadd("agents", temp_agent)
 
-        # rename conversation keys and meta that belong to old_name to temp_agent prefix
         convs = _collect_conversations_for_agent(old_name)
         for ck in convs:
             try:
@@ -229,28 +209,23 @@ def compact_agents() -> Dict[str, Any]:
                 if r.exists(temp_meta):
                     r.delete(temp_meta)
                 r.rename(old_meta, temp_meta)
-                # update agent_id field inside meta to temp_agent
                 try:
                     r.hset(temp_meta, "agent_id", temp_agent)
                 except Exception:
                     pass
 
-            # update conversations set entry to temp_agent:phone
             r.srem("conversations", ck)
             r.sadd("conversations", f"{temp_agent}:{phone}")
 
-        # finally rename temp_agent to final new_name
         if r.exists(temp_agent):
             if r.exists(new_name):
                 r.delete(new_name)
             r.rename(temp_agent, new_name)
 
-        # update agents set: remove temp_agent, add new_name
         if r.sismember("agents", temp_agent):
             r.srem("agents", temp_agent)
             r.sadd("agents", new_name)
 
-        # rename any temp conversation entries we created to final names
         convs_temp = _collect_conversations_for_agent(temp_agent)
         for tck in convs_temp:
             try:
@@ -275,12 +250,10 @@ def compact_agents() -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            # update conversations set entry from temp_agent:phone to new_name:phone
             if r.sismember("conversations", tck):
                 r.srem("conversations", tck)
                 r.sadd("conversations", f"{new_name}:{phone}")
 
-    # rebuild agents set so it contains only agentN names that actually exist
     r.delete("agents")
     final_agent_ids = []
     for new_idx in sorted(mapping.values()):
@@ -293,7 +266,7 @@ def compact_agents() -> Dict[str, Any]:
     return {"status": "ok", "agents_before": len(ids), "agents_after": len(final_agent_ids)}
 
 # ----------------------------------------------------------------------
-# Health endpoint
+# Health
 # ----------------------------------------------------------------------
 @app.get("/")
 def health():
@@ -305,7 +278,7 @@ def health():
     }
 
 # ----------------------------------------------------------------------
-# ADD endpoint
+# ADD
 # ----------------------------------------------------------------------
 @app.post("/add")
 def add_endpoint(req: AddRequest):
@@ -352,7 +325,7 @@ def add_endpoint(req: AddRequest):
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# FETCH endpoint
+# FETCH - optimized with Redis pipelines
 # ----------------------------------------------------------------------
 def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
     filters = {}
@@ -376,7 +349,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
     _require_redis()
     filt = _parse_filters(filters)
 
-    # USERS
+    # USERS - batch HGETALL via pipeline
     if table == "users":
         if id:
             try:
@@ -392,22 +365,37 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["created_at"] = int(rec.get("created_at", 0))
             return rec if _matches(rec, filt) else {}
 
-        out = {}
         max_id = _get_next_user_id()
-        for uid in range(1, max_id + 1):
-            key = _user_key(uid)
-            if not r.exists(key):
-                continue
-            rec = dict(r.hgetall(key))
-            if rec and _matches(rec, filt):
+        out: Dict[str, Any] = {}
+
+        # If max_id is reasonable, pipeline sequential keys 1..max_id
+        if max_id > 0 and max_id <= MAX_FETCH_KEYS:
+            keys = [_user_key(uid) for uid in range(1, max_id + 1)]
+        else:
+            # fallback: iterate over set 'users' to get actual keys (keeps pipeline smaller)
+            members = r.smembers("users")
+            keys = [_user_key(int(x)) for x in sorted([int(x) for x in members])]
+
+        if not keys:
+            return out
+
+        pipe = r.pipeline()
+        for k in keys:
+            pipe.hgetall(k)
+        results = pipe.execute()
+
+        # results correspond to keys; include only non-empty hgetall
+        for uid, rec in zip([int(k.split(":")[1]) for k in keys], results):
+            if rec:
                 rec.setdefault("name", "")
                 rec.setdefault("phone", "")
                 rec["last_active"] = int(rec.get("last_active", 0))
                 rec["created_at"] = int(rec.get("created_at", 0))
-                out[str(uid)] = rec
+                if _matches(rec, filt):
+                    out[str(uid)] = rec
         return out
 
-    # AGENTS
+    # AGENTS - batch HGETALL via pipeline
     if table == "agents":
         if id:
             aid = id if id.startswith("agent") else _agent_name(int(id))
@@ -420,23 +408,36 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["created_at"] = int(rec.get("created_at", 0))
             rec["updated_at"] = int(rec.get("updated_at", 0))
             return rec if _matches(rec, filt) else {}
-        out = {}
+
         max_agent = _get_next_agent_id()
-        for n in range(1, max_agent + 1):
-            aid = _agent_name(n)
-            if not r.exists(aid):
-                continue
-            rec = dict(r.hgetall(aid))
-            if rec and _matches(rec, filt):
+        out: Dict[str, Any] = {}
+
+        if max_agent > 0 and max_agent <= MAX_FETCH_KEYS:
+            agent_keys = [_agent_name(n) for n in range(1, max_agent + 1)]
+        else:
+            members = r.smembers("agents")
+            agent_keys = sorted(list(members))
+
+        if not agent_keys:
+            return out
+
+        pipe = r.pipeline()
+        for aid in agent_keys:
+            pipe.hgetall(aid)
+        results = pipe.execute()
+
+        for aid, rec in zip(agent_keys, results):
+            if rec:
                 rec.setdefault("prompt", "")
                 rec.setdefault("user_id", "")
                 rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
                 rec["created_at"] = int(rec.get("created_at", 0))
                 rec["updated_at"] = int(rec.get("updated_at", 0))
-                out[aid] = rec
+                if _matches(rec, filt):
+                    out[aid] = rec
         return out
 
-    # CONVERSATIONS
+    # CONVERSATIONS - batch LRANGE and HGETALL via pipeline
     if table == "conversations":
         if id:
             try:
@@ -459,31 +460,53 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
 
-        out = {}
-        for ck in r.smembers("conversations"):
-            if not ck:
+        out: Dict[str, Any] = {}
+        convs = list(r.smembers("conversations"))
+        if not convs:
+            return out
+
+        pipe = r.pipeline()
+        # for each conversation, queue LRANGE and HGETALL; store order
+        for ck in convs:
+            try:
+                agent_id, phone = ck.split(":", 1)
+            except ValueError:
+                # skip malformed entries
                 continue
+            msg_key = _convo_msg_key(agent_id, phone)
+            meta_key = _convo_meta_key(agent_id, phone)
+            pipe.lrange(msg_key, 0, -1)
+            pipe.hgetall(meta_key)
+
+        results = pipe.execute()
+        # results are in pairs [lrange1, hgetall1, lrange2, hgetall2, ...]
+        it = iter(results)
+        i = 0
+        for ck in convs:
             try:
                 agent_id, phone = ck.split(":", 1)
             except ValueError:
                 continue
-            key = _convo_msg_key(agent_id, phone)
-            msgs = [json.loads(m) for m in r.lrange(key, 0, -1)] if r.exists(key) else []
-            meta_key = _convo_meta_key(agent_id, phone)
-            meta = dict(r.hgetall(meta_key)) if r.exists(meta_key) else {}
-            if msgs or meta:
-                meta.setdefault("agent_id", agent_id)
-                meta.setdefault("phone", phone)
-                meta["created_at"] = int(meta.get("created_at", 0))
-                meta["updated_at"] = int(meta.get("updated_at", 0))
-                if not filt or any(_matches(m, filt) for m in msgs):
-                    out[ck] = {"messages": msgs, "meta": meta}
+            try:
+                msgs_raw = next(it)
+                meta_raw = next(it)
+            except StopIteration:
+                break
+            msgs = [json.loads(m) for m in msgs_raw] if msgs_raw else []
+            meta = meta_raw or {}
+            meta.setdefault("agent_id", agent_id)
+            meta.setdefault("phone", phone)
+            meta["created_at"] = int(meta.get("created_at", 0))
+            meta["updated_at"] = int(meta.get("updated_at", 0))
+            if not filt or any(_matches(m, filt) for m in msgs):
+                out[ck] = {"messages": msgs, "meta": meta}
+            i += 1
         return out
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# UPDATE endpoint
+# UPDATE
 # ----------------------------------------------------------------------
 @app.post("/update")
 def update_endpoint(req: UpdateRequest):
@@ -538,7 +561,6 @@ def update_endpoint(req: UpdateRequest):
 def delete_endpoint(table: str, id: str):
     _require_redis()
 
-    # USERS
     if table == "users":
         try:
             uid = int(id)
@@ -547,12 +569,10 @@ def delete_endpoint(table: str, id: str):
         key = _user_key(uid)
         if r.delete(key):
             r.srem("users", str(uid))
-            # compact to remove gaps and keep sequence contiguous
             compact_users()
             return {"status": "deleted", "id": str(uid)}
         raise HTTPException(status_code=404, detail="User not found")
 
-    # AGENTS
     if table == "agents":
         if id.startswith("agent"):
             try:
@@ -568,12 +588,10 @@ def delete_endpoint(table: str, id: str):
         aid_name = _agent_name(idx)
         if r.delete(aid_name):
             r.srem("agents", aid_name)
-            # compact agents and update conversation keys/meta
             compact_agents()
             return {"status": "deleted", "id": aid_name}
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # CONVERSATIONS
     if table == "conversations":
         try:
             agent_id, phone = id.split(":", 1)
@@ -590,8 +608,7 @@ def delete_endpoint(table: str, id: str):
     raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# Admin - manual compaction endpoint
-# Use POST /admin/compact with optional json body {"table": "users"|"agents"|"all"}
+# Admin compaction endpoint
 # ----------------------------------------------------------------------
 @app.post("/admin/compact")
 def admin_compact(payload: Optional[Dict[str, Any]] = None):
