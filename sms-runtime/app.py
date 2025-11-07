@@ -1,6 +1,5 @@
 # sms-runtime/app.py
 import os
-import sys
 import json
 import time
 from typing import Dict, Any, Optional, Union
@@ -10,20 +9,22 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+
 # ----------------------------------------------------------------------
-# Redis connection – Render supplies REDIS_URL; fallback to the KV instance
+# Redis connection – uses Render's REDIS_URL or fallback KV instance
 # ----------------------------------------------------------------------
 redis_url = os.getenv("REDIS_URL", "redis://red-d44f17jipnbc73dqs2k0:6379")
 try:
     r = redis.from_url(redis_url, decode_responses=True)
-    r.ping()                     # confirm connectivity
+    r.ping()
 except redis.ConnectionError as e:
     print(f"Redis connection failed: {e}")
-    r = None                     # routes will raise a clear error
+    r = None
+
 
 app = FastAPI(title="SMS Runtime Backend")
 
-# CORS – allow any origin (tighten in prod if needed)
+# CORS – allow any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,8 +33,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ----------------------------------------------------------------------
-# Pydantic request models
+# Request Models
 # ----------------------------------------------------------------------
 class AddRequest(BaseModel):
     table: str
@@ -44,16 +46,14 @@ class UpdateRequest(BaseModel):
     id: str
     updates: Dict[str, Any]
 
-class DeleteRequest(BaseModel):
-    table: str
-    id: str
 
 # ----------------------------------------------------------------------
-# Helper: raise if Redis is unavailable
+# Helper
 # ----------------------------------------------------------------------
 def _require_redis():
     if not r:
         raise HTTPException(status_code=503, detail="Redis not available")
+
 
 # ----------------------------------------------------------------------
 # HEALTH CHECK
@@ -64,8 +64,9 @@ def health():
     return {
         "message": "SMS Runtime Backend Live!",
         "redis": redis_status,
-        "endpoints": ["/add", "/fetch", "/update", /delete"]
+        "endpoints": ["/add", "/fetch", "/update", "/delete"]
     }
+
 
 # ----------------------------------------------------------------------
 # ADD
@@ -107,15 +108,16 @@ def add_endpoint(req: AddRequest):
         r.delete(key)
         for m in messages:
             r.rpush(key, json.dumps(m))
-        r.expire(key, 30 * 86400)               # 30 days
+        r.expire(key, 30 * 86400)  # 30 days
         r.hset(meta_key, mapping=data)
         r.sadd("conversations", f"{agent_id}:{phone}")
         return {"id": f"{agent_id}:{phone}", "status": "success"}
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
+
 # ----------------------------------------------------------------------
-# FETCH (supports id + filters)
+# FETCH
 # ----------------------------------------------------------------------
 def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
     filters = {}
@@ -126,6 +128,7 @@ def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
                 filters[k.strip()] = v.strip()
     return filters
 
+
 def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
     if not filters:
         return True
@@ -134,12 +137,13 @@ def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
             return False
     return True
 
+
 @app.get("/fetch")
 def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
     _require_redis()
     filt = _parse_filters(filters)
 
-    # ---------- USERS ----------
+    # USERS
     if table == "users":
         if id:
             rec = dict(r.hgetall(f"user:{id}"))
@@ -150,7 +154,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["last_active"] = int(rec.get("last_active", 0))
             rec["created_at"] = int(rec.get("created_at", 0))
             return rec if _matches(rec, filt) else {}
-        # all users
         out = {}
         for uid in r.smembers("users"):
             rec = dict(r.hgetall(f"user:{uid}"))
@@ -162,7 +165,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 out[uid] = rec
         return out
 
-    # ---------- AGENTS ----------
+    # AGENTS
     if table == "agents":
         if id:
             rec = dict(r.hgetall(id))
@@ -174,7 +177,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["created_at"] = int(rec.get("created_at", 0))
             rec["updated_at"] = int(rec.get("updated_at", 0))
             return rec if _matches(rec, filt) else {}
-        # all agents
         out = {}
         for aid in r.smembers("agents"):
             rec = dict(r.hgetall(aid))
@@ -187,7 +189,7 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 out[aid] = rec
         return out
 
-    # ---------- CONVERSATIONS ----------
+    # CONVERSATIONS
     if table == "conversations":
         if id:
             try:
@@ -207,11 +209,10 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 if not msgs:
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
-        # all conversations
         out = {}
         for ck in r.smembers("conversations"):
             agent_id, phone = ck.split(":", 1)
-            key = f"convo:{agent_id}:{phone}"
+            key = f"convo:{agent_id cég}:{phone}"
             msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
             meta_key = f"convo_meta:{agent_id}:{phone}"
             meta = dict(r.hgetall(meta_key))
@@ -226,8 +227,9 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
+
 # ----------------------------------------------------------------------
-# UPDATE (including message append)
+# UPDATE
 # ----------------------------------------------------------------------
 @app.post("/update")
 def update_endpoint(req: UpdateRequest):
@@ -261,16 +263,15 @@ def update_endpoint(req: UpdateRequest):
         if not r.exists(meta_key) and not r.exists(msg_key):
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        # Append new messages if `append` is supplied
         if "append" in updates:
             for m in updates.pop("append"):
                 r.rpush(msg_key, json.dumps(m))
-        # Update meta fields
         if updates:
             r.hset(meta_key, mapping=updates)
         return {"status": "success"}
 
     raise HTTPException(status_code=400, detail="Invalid table")
+
 
 # ----------------------------------------------------------------------
 # DELETE
@@ -307,8 +308,9 @@ def delete_endpoint(table: str, id: str):
 
     raise HTTPException(status_code=400, detail="Invalid table")
 
+
 # ----------------------------------------------------------------------
-# Entry point (Render uses `uvicorn sms-runtime.app:app`)
+# Run (Render uses: uvicorn sms-runtime.app:app)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
