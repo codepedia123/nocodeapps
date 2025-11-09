@@ -383,6 +383,51 @@ def delete_endpoint(table: str, id: str):
             return {"status": "deleted"}
         raise HTTPException(status_code=404, detail="Conversation not found")
     raise HTTPException(status_code=400, detail="Invalid table")
+# ---------------------------
+# Table creation endpoint
+# ---------------------------
+class CreateTableRequest(BaseModel):
+    name: str
+
+@app.post("/createtable")
+def create_table(req: CreateTableRequest):
+    """
+    Create a new logical table in Redis.
+    Creates a metadata hash at "table_meta:<name>" and an id counter "next_<name>_id".
+    Table names are restricted to letters, numbers and underscore to avoid injection.
+    """
+    name = req.name.strip()
+    # validate simple, safe name
+    if not name or not re.match(r'^[A-Za-z0-9_]+$', name):
+        raise HTTPException(status_code=400, detail="Invalid table name. Use letters, numbers and underscores only.")
+
+    # reserve meta and counter keys
+    meta_key = f"table_meta:{name}"
+    counter_key = f"next_{name}_id"
+
+    # ensure Redis is available
+    _require_redis()
+
+    try:
+        # If metadata already exists, treat as existing table
+        if r.exists(meta_key) or r.exists(counter_key):
+            return {"status": "exists", "table": name}
+
+        # Create metadata and counter. We do not have to create an empty set for members;
+        # presence of meta + counter is sufficient to consider the table created.
+        now = int(time.time())
+        r.hset(meta_key, mapping={
+            "name": name,
+            "created_at": now,
+            "created_by": "api",
+        })
+        r.set(counter_key, 0)
+
+        return {"status": "created", "table": name, "meta_key": meta_key, "counter_key": counter_key}
+    except Exception as e:
+        # keep error message concise and useful for debugging
+        print(f"Error creating table {name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create table: {str(e)}")
 
 # ----------------------------------------------------------------------
 # FUNCTION MANAGEMENT (Updated to handle Redis unavailability gracefully)
