@@ -23,7 +23,6 @@ MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 # ----------------------------------------------------------------------
 try:
     r = redis.from_url(redis_url, decode_responses=True)
-    r.ping()
 except Exception as e:
     print(f"Redis connection failed: {e}")
     r = None
