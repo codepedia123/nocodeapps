@@ -13,7 +13,12 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-redis_url = os.getenv("REDIS_URL", "redis://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379")
+# NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
+# You can override by setting the REDIS_URL environment variable on the server.
+redis_url = os.getenv(
+    "REDIS_URL",
+    "rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
+)
 # Maximum number of sequential ids to pipeline directly. If next_id is larger,
 # we fall back to scanning the membership set to avoid huge pipelines.
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
@@ -26,15 +31,22 @@ def _init_redis() -> Optional[redis.Redis]:
     Initialize Redis client with short timeouts so import/startup does not hang
     if Redis is unreachable. Returns a connected client or None.
     """
+    kwargs = {
+        "decode_responses": True,
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+        "health_check_interval": 30,
+    }
+
+    # prefer rediss for TLS if provided
     try:
-        # set short connect and socket timeouts to avoid blocking import
-        client = redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-            health_check_interval=30
-        )
+        if redis_url.startswith("rediss://") or redis_url.startswith("redis+ssl://"):
+            # when using TLS with ElastiCache, many environments do not provide CA certs,
+            # so set ssl_cert_reqs to None to avoid certificate verification failures.
+            # If you have proper CA certs, set ssl_cert_reqs to 'required' and provide ssl_ca_certs.
+            client = redis.from_url(redis_url, ssl=True, ssl_cert_reqs=None, **kwargs)
+        else:
+            client = redis.from_url(redis_url, **kwargs)
     except Exception as e:
         print(f"Redis init failed: {e}")
         return None
