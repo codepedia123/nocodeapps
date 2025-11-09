@@ -17,8 +17,9 @@ from pydantic import BaseModel
 # You can override by setting the REDIS_URL environment variable on the server.
 redis_url = os.getenv(
     "REDIS_URL",
-    "rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
+    "rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
 )
+
 # Maximum number of sequential ids to pipeline directly. If next_id is larger,
 # we fall back to scanning the membership set to avoid huge pipelines.
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
