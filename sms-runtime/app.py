@@ -304,20 +304,27 @@ def compact_agents() -> Dict[str, Any]:
 # Health
 # ----------------------------------------------------------------------
 @app.get("/")
+@app.get("/")
 def health():
     redis_status = "Failed"
+    redis_error = ""
     if r:
         try:
-            # ping using the configured socket timeout so it does not block long
             r.ping()
             redis_status = "Connected"
-        except Exception:
+        except Exception as e:
             redis_status = "Failed"
+            redis_error = str(e)
+    else:
+        redis_error = "Redis client not initialized"
+
     return {
         "message": "SMS Runtime Backend Live!",
         "redis": redis_status,
+        "redis_error": redis_error,
         "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
     }
+
 
 # ----------------------------------------------------------------------
 # ADD
