@@ -19,13 +19,37 @@ redis_url = os.getenv("REDIS_URL", "redis://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 
 # ----------------------------------------------------------------------
-# Redis connection
+# Redis connection (safe, non-blocking)
 # ----------------------------------------------------------------------
-try:
-    r = redis.from_url(redis_url, decode_responses=True)
-except Exception as e:
-    print(f"Redis connection failed: {e}")
-    r = None
+def _init_redis() -> Optional[redis.Redis]:
+    """
+    Initialize Redis client with short timeouts so import/startup does not hang
+    if Redis is unreachable. Returns a connected client or None.
+    """
+    try:
+        # set short connect and socket timeouts to avoid blocking import
+        client = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            health_check_interval=30
+        )
+    except Exception as e:
+        print(f"Redis init failed: {e}")
+        return None
+
+    try:
+        # attempt a quick ping to verify connectivity
+        client.ping()
+        print("✅ Redis connected.")
+        return client
+    except Exception as e:
+        print(f"⚠️ Redis ping failed (will proceed with r=None): {e}")
+        return None
+
+# initialize once at import time but with safe timeouts
+r = _init_redis()
 
 app = FastAPI(title="SMS Runtime Backend")
 
@@ -269,7 +293,14 @@ def compact_agents() -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 @app.get("/")
 def health():
-    redis_status = "Connected" if r and r.ping() else "Failed"
+    redis_status = "Failed"
+    if r:
+        try:
+            # ping using the configured socket timeout so it does not block long
+            r.ping()
+            redis_status = "Connected"
+        except Exception:
+            redis_status = "Failed"
     return {
         "message": "SMS Runtime Backend Live!",
         "redis": redis_status,
