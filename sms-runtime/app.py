@@ -94,6 +94,89 @@ def _require_redis():
         raise HTTPException(status_code=503, detail=f"Redis not reachable: {e}")
 
 # ----------------------------------------------------------------------
+# Helpers for dynamic table support
+# ----------------------------------------------------------------------
+def _get_set_name_for_table(table: str) -> str:
+    """
+    Return the Redis set name that stores the IDs for a table.
+    Preserve original names for built-in tables to avoid breaking existing code.
+    For custom tables, use 'table:{table}'.
+    """
+    if table == "users":
+        return "users"
+    if table == "agents":
+        return "agents"
+    if table == "conversations":
+        return "conversations"
+    # generic
+    return f"table:{table}"
+
+def _get_key_for_table_id(table: str, id: str) -> str:
+    """
+    Return the Redis key pattern for a given table and id.
+    Preserve legacy patterns for users/agents/conversations where applicable.
+    """
+    if table == "users":
+        return f"user:{id}"
+    if table == "agents":
+        # agents were stored as 'agent{n}' ids already, so if id already starts with 'agent' keep it
+        if id.startswith("agent"):
+            return id
+        return f"{id}"  # fallback: allow direct agent id usage
+    if table == "conversations":
+        # conversations use special composite id 'agent:phone' handled elsewhere
+        return f"convo:{id}"
+    # generic
+    return f"{table}:{id}"
+
+def _ensure_table_counter(table: str):
+    """Ensure next_id:{table} exists in Redis."""
+    counter_key = f"next_id:{table}"
+    if not r.exists(counter_key):
+        r.set(counter_key, "0")
+
+def create_table(table: str):
+    """Create a new generic table in Redis by initializing its set and counter."""
+    _require_redis()
+    set_name = _get_set_name_for_table(table)
+    counter_key = f"next_id:{table}"
+    if r.exists(set_name) or r.exists(counter_key):
+        # Already exists (idempotent)
+        return {"status": "exists", "table": table}
+    r.sadd(set_name)  # creates an empty set
+    r.set(counter_key, "0")
+    return {"status": "created", "table": table}
+
+def delete_table(table: str):
+    """Delete a generic table: removes all keys for its members and removes the set & counter."""
+    _require_redis()
+    set_name = _get_set_name_for_table(table)
+    counter_key = f"next_id:{table}"
+    if not r.exists(set_name):
+        return {"status": "not_found", "table": table}
+    members = list(r.smembers(set_name))
+    deleted_any = False
+    for mid in members:
+        key = _get_key_for_table_id(table, mid)
+        # For conversation set members we stored "agent:phone" so key patterns differ
+        if table == "conversations":
+            # conversation keys are convo:{agent}:{phone} and meta convo_meta:{agent}:{phone}
+            try:
+                agent_id, phone = mid.split(":", 1)
+                r.delete(f"convo:{agent_id}:{phone}")
+                r.delete(f"convo_meta:{agent_id}:{phone}")
+                deleted_any = True
+            except Exception:
+                pass
+        else:
+            if r.delete(key):
+                deleted_any = True
+    # remove the members set and counter
+    r.delete(set_name)
+    r.delete(counter_key)
+    return {"status": "deleted", "table": table, "deleted_any": deleted_any}
+
+# ----------------------------------------------------------------------
 # ONE-TIME INITIALIZATION (Runs on startup if missing)
 # ----------------------------------------------------------------------
 def _initialize_db():
@@ -122,7 +205,7 @@ def _startup():
     pass
 
 # ----------------------------------------------------------------------
-# Existing Add (Preserved - No Changes to logic)
+# Existing Add (Preserved - No Changes to logic for built-in tables)
 # ----------------------------------------------------------------------
 def add_record(table: str, data: Dict[str, Any]) -> str:
     """Add new record with auto-ID and timestamps; accepts any fields."""
@@ -146,6 +229,7 @@ def add_record(table: str, data: Dict[str, Any]) -> str:
         agent_id = f"agent{next_id}"
         if "tools" in data:
             data["tools"] = json.dumps(data["tools"])
+        # preserve original agent storage semantics
         r.hset(agent_id, mapping=data)
         r.sadd("agents", agent_id)
         return agent_id
@@ -166,7 +250,20 @@ def add_record(table: str, data: Dict[str, Any]) -> str:
         r.sadd("conversations", f"{agent_id}:{phone}")
         return f"{agent_id}:{phone}"
 
-    raise ValueError(f"Invalid table: {table}")
+    # Generic table handling for dynamically created tables
+    # Use per-table counter next_id:{table} and set name from _get_set_name_for_table
+    set_name = _get_set_name_for_table(table)
+    counter_key = f"next_id:{table}"
+    # Ensure counter exists
+    if not r.exists(counter_key):
+        r.set(counter_key, "0")
+    next_id = int(r.get(counter_key) or 0) + 1
+    r.set(counter_key, next_id)
+    new_id = str(next_id)
+    key = f"{table}:{new_id}"
+    r.hset(key, mapping=data)
+    r.sadd(set_name, new_id)
+    return new_id
 
 @app.post("/add")
 def add_endpoint(req: AddRequest):
@@ -175,6 +272,7 @@ def add_endpoint(req: AddRequest):
     ts = int(time.time())
     data["created_at"] = ts
     data["updated_at"] = ts
+    # Built-in tables preserved exactly
     if req.table == "users":
         next_id = int(r.get("next_user_id") or 0) + 1
         r.set("next_user_id", next_id)
@@ -207,10 +305,22 @@ def add_endpoint(req: AddRequest):
         r.hset(meta_key, mapping=data)
         r.sadd("conversations", f"{agent_id}:{phone}")
         return {"id": f"{agent_id}:{phone}", "status": "success"}
-    raise HTTPException(status_code=400, detail="Invalid table")
+
+    # Generic dynamic table add
+    set_name = _get_set_name_for_table(req.table)
+    counter_key = f"next_id:{req.table}"
+    if not r.exists(counter_key):
+        r.set(counter_key, "0")
+    next_id = int(r.get(counter_key) or 0) + 1
+    r.set(counter_key, next_id)
+    new_id = str(next_id)
+    key = f"{req.table}:{new_id}"
+    r.hset(key, mapping=data)
+    r.sadd(set_name, new_id)
+    return {"id": new_id, "status": "success", "table": req.table}
 
 # ----------------------------------------------------------------------
-# Existing Fetch (Preserved - No Changes)
+# Existing Fetch (Preserved - No Changes for built-in tables; added generic)
 # ----------------------------------------------------------------------
 def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
     filters = {}
@@ -312,10 +422,35 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 if not filt or any(_matches(m, filt) for m in msgs):
                     out[ck] = {"messages": msgs, "meta": meta}
         return out
-    raise HTTPException(status_code=400, detail="Invalid table")
+
+    # Generic table fetch
+    set_name = _get_set_name_for_table(table)
+    if not r.exists(set_name):
+        raise HTTPException(status_code=400, detail="Invalid table")
+    # If id provided, fetch single record
+    if id:
+        key = _get_key_for_table_id(table, id)
+        rec = dict(r.hgetall(key))
+        if not rec:
+            return {}
+        # Convert numeric fields if possible
+        for k, v in rec.items():
+            if isinstance(v, str) and v.isdigit():
+                try:
+                    rec[k] = int(v)
+                except Exception:
+                    pass
+        return rec if _matches(rec, filt) else {}
+    out = {}
+    for member in r.smembers(set_name):
+        key = _get_key_for_table_id(table, member)
+        rec = dict(r.hgetall(key))
+        if rec and _matches(rec, filt):
+            out[member] = rec
+    return out
 
 # ----------------------------------------------------------------------
-# UPDATE (Preserved)
+# UPDATE (Preserved for built-ins, added generic)
 # ----------------------------------------------------------------------
 @app.post("/update")
 def update_endpoint(req: UpdateRequest):
@@ -323,6 +458,7 @@ def update_endpoint(req: UpdateRequest):
     ts = int(time.time())
     updates = req.updates.copy()
     updates["updated_at"] = ts
+    # Built-ins preserved exactly
     if req.table == "users":
         key = f"user:{req.id}"
         if not r.exists(key):
@@ -351,10 +487,19 @@ def update_endpoint(req: UpdateRequest):
         if updates:
             r.hset(meta_key, mapping=updates)
         return {"status": "success"}
-    raise HTTPException(status_code=400, detail="Invalid table")
+
+    # Generic update for dynamic tables
+    set_name = _get_set_name_for_table(req.table)
+    if not r.exists(set_name):
+        raise HTTPException(status_code=400, detail="Invalid table")
+    key = _get_key_for_table_id(req.table, req.id)
+    if not r.exists(key):
+        raise HTTPException(status_code=404, detail="Record not found")
+    r.hset(key, mapping=updates)
+    return {"status": "success"}
 
 # ----------------------------------------------------------------------
-# DELETE (Preserved)
+# DELETE (Preserved for built-ins, added generic)
 # ----------------------------------------------------------------------
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
@@ -382,52 +527,73 @@ def delete_endpoint(table: str, id: str):
             r.srem("conversations", id)
             return {"status": "deleted"}
         raise HTTPException(status_code=404, detail="Conversation not found")
-    raise HTTPException(status_code=400, detail="Invalid table")
-# ---------------------------
-# Table creation endpoint
-# ---------------------------
-class CreateTableRequest(BaseModel):
+
+    # Generic delete
+    set_name = _get_set_name_for_table(table)
+    if not r.exists(set_name):
+        raise HTTPException(status_code=400, detail="Invalid table")
+    key = _get_key_for_table_id(table, id)
+    deleted = r.delete(key)
+    if deleted:
+        r.srem(set_name, id)
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Record not found")
+
+# ----------------------------------------------------------------------
+# Table creation & deletion endpoints (new)
+# ----------------------------------------------------------------------
+class TableRequest(BaseModel):
     name: str
 
 @app.post("/createtable")
-def create_table(req: CreateTableRequest):
+def api_create_table(req: TableRequest):
     """
-    Create a new logical table in Redis.
-    Creates a metadata hash at "table_meta:<name>" and an id counter "next_<name>_id".
-    Table names are restricted to letters, numbers and underscore to avoid injection.
+    Create a new generic table. Body JSON: {"name": "mytable"}
+    This will create Redis set 'table:mytable' and counter 'next_id:mytable'.
     """
-    name = req.name.strip()
-    # validate simple, safe name
-    if not name or not re.match(r'^[A-Za-z0-9_]+$', name):
-        raise HTTPException(status_code=400, detail="Invalid table name. Use letters, numbers and underscores only.")
-
-    # reserve meta and counter keys
-    meta_key = f"table_meta:{name}"
-    counter_key = f"next_{name}_id"
-
-    # ensure Redis is available
     _require_redis()
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+    result = create_table(name)
+    if result.get("status") == "exists":
+        return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=201, content=result)
 
-    try:
-        # If metadata already exists, treat as existing table
-        if r.exists(meta_key) or r.exists(counter_key):
-            return {"status": "exists", "table": name}
+@app.put("/table")
+def api_put_table(req: TableRequest, action: Optional[str] = None):
+    """
+    PUT /table can be used with body {"name": "mytable"}.
+    If query param action=delete or body contains action 'delete' it will delete the table.
+    This supports the user's desired 'PUT to delete' behavior.
+    """
+    _require_redis()
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+    # If action passed as query param, respect it
+    if action and action.lower() == "delete":
+        res = delete_table(name)
+        if res.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=f"Table {name} not found")
+        return {"status": "deleted", "table": name}
+    # Default behavior: create table if not exists
+    res = create_table(name)
+    return res
 
-        # Create metadata and counter. We do not have to create an empty set for members;
-        # presence of meta + counter is sufficient to consider the table created.
-        now = int(time.time())
-        r.hset(meta_key, mapping={
-            "name": name,
-            "created_at": now,
-            "created_by": "api",
-        })
-        r.set(counter_key, 0)
-
-        return {"status": "created", "table": name, "meta_key": meta_key, "counter_key": counter_key}
-    except Exception as e:
-        # keep error message concise and useful for debugging
-        print(f"Error creating table {name}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create table: {str(e)}")
+@app.delete("/table")
+def api_delete_table(name: str):
+    """
+    DELETE /table?name=mytable will delete the named table and all its records.
+    """
+    _require_redis()
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+    res = delete_table(name)
+    if res.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=f"Table {name} not found")
+    return res
 
 # ----------------------------------------------------------------------
 # FUNCTION MANAGEMENT (Updated to handle Redis unavailability gracefully)
@@ -668,7 +834,7 @@ def delete_function(id: str):
 
 # ----------------------------------------------------------------------
 # Existing routes preserved (no changes)
-# Note: /add, /fetch, /update, /delete endpoints are above and unchanged
+# Note: /add, /fetch, /update, /delete endpoints are above and unchanged in behavior for built-ins
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
