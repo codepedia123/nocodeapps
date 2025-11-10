@@ -1,58 +1,71 @@
+# sms-runtime/app.py
 import os
 import json
 import time
-import re
-import traceback
-from typing import Dict, Any, Optional, Union
+import uuid
+from typing import Dict, Any, Optional, List, Tuple
+
 import redis
-from fastapi import FastAPI, HTTPException, Request, UploadFile, Form, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-import tempfile
-import sys
-from io import StringIO
-from pathlib import Path
 
 # ----------------------------------------------------------------------
-# Config & Redis connection (Render env or local fallback)
+# Config
 # ----------------------------------------------------------------------
-# Use provided default if REDIS_URL not set in env
-redis_url = os.getenv('REDIS_URL', 'redis://red-d44f17jipnbc73dqs2k0:6379')
+# NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
+# You can override by setting the REDIS_URL environment variable on the server.
+redis_url = os.getenv(
+    "REDIS_URL",
+    "rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
+)
 
-# Global redis client (may be None if connection fails)
-r = None
-
-def _connect_redis(url: str, attempts: int = 2, timeout: float = 2.0):
-    global r
-    last_err = None
-    for i in range(attempts):
-        try:
-            # decode_responses True so we get string responses
-            r_candidate = redis.from_url(url, decode_responses=True, socket_connect_timeout=timeout)
-            r_candidate.ping()
-            r = r_candidate
-            print(f"Connected to Redis at {url}")
-            return
-        except Exception as e:
-            last_err = e
-            print(f"Redis connect attempt {i+1}/{attempts} failed: {e}")
-            time.sleep(0.2)
-    print(f"Redis connection failed after {attempts} attempts: {last_err}")
-    r = None
-
-_connect_redis(redis_url)
-
-# Local fallback storage for functions when Redis is not available.
-LOCAL_FUNC_DIR = Path(os.getenv("LOCAL_FUNC_DIR", "./local_functions"))
-LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+# Maximum number of sequential ids to pipeline directly. If next_id is larger,
+# we fall back to scanning the membership set to avoid huge pipelines.
+MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 
 # ----------------------------------------------------------------------
-# FastAPI app & CORS
+# Redis connection (safe, non-blocking)
 # ----------------------------------------------------------------------
+def _init_redis() -> Optional[redis.Redis]:
+    """
+    Initialize Redis client with short timeouts so import/startup does not hang
+    if Redis is unreachable. Returns a connected client or None.
+    """
+    kwargs = {
+        "decode_responses": True,
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+        "health_check_interval": 30,
+    }
+
+    # prefer rediss for TLS if provided
+    try:
+        if redis_url.startswith("rediss://") or redis_url.startswith("redis+ssl://"):
+            # when using TLS with ElastiCache, many environments do not provide CA certs,
+            # so set ssl_cert_reqs to None to avoid certificate verification failures.
+            # If you have proper CA certs, set ssl_cert_reqs to 'required' and provide ssl_ca_certs.
+            client = redis.from_url(redis_url, ssl=True, ssl_cert_reqs=None, **kwargs)
+        else:
+            client = redis.from_url(redis_url, **kwargs)
+    except Exception as e:
+        print(f"Redis init failed: {e}")
+        return None
+
+    try:
+        # attempt a quick ping to verify connectivity
+        client.ping()
+        print("✅ Redis connected.")
+        return client
+    except Exception as e:
+        print(f"⚠️ Redis ping failed (will proceed with r=None): {e}")
+        return None
+
+# initialize once at import time but with safe timeouts
+r = _init_redis()
+
 app = FastAPI(title="SMS Runtime Backend")
 
-# CORS for frontend (allows all origins; tighten in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,7 +75,7 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------------------------
-# Existing Request Models (Preserved - No Changes)
+# Request models
 # ----------------------------------------------------------------------
 class AddRequest(BaseModel):
     table: str
@@ -73,198 +86,250 @@ class UpdateRequest(BaseModel):
     id: str
     updates: Dict[str, Any]
 
-# New Request Models for Function Management
-class FetchFunctionRequest(BaseModel):
-    id: str
-    input: Dict[str, Any]
-
-class DeleteFunctionRequest(BaseModel):
-    id: str
-
 # ----------------------------------------------------------------------
-# Helper: Redis Check
+# Key utilities and helpers
 # ----------------------------------------------------------------------
 def _require_redis():
     if not r:
-        raise HTTPException(status_code=503, detail="Redis not available. Set REDIS_URL or start Redis.")
-    # ping to ensure connection alive
-    try:
-        r.ping()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Redis not reachable: {e}")
+        raise HTTPException(status_code=503, detail="Redis not available")
+
+def _get_next_user_id() -> int:
+    return int(r.get("next_user_id") or 0)
+
+def _get_next_agent_id() -> int:
+    return int(r.get("next_agent_id") or 0)
+
+def _user_key(uid: int) -> str:
+    return f"user:{uid}"
+
+def _agent_name(aid_num: int) -> str:
+    return f"agent{aid_num}"
+
+def _convo_msg_key(agent_name: str, phone: str) -> str:
+    return f"convo:{agent_name}:{phone}"
+
+def _convo_meta_key(agent_name: str, phone: str) -> str:
+    return f"convo_meta:{agent_name}:{phone}"
+
+# get numeric suffix ids for keys like user:N or agent:N
+def _all_numeric_suffix_ids(prefix: str) -> List[int]:
+    ids = []
+    pattern = f"{prefix}:*"
+    for key in r.scan_iter(match=pattern):
+        parts = key.split(":")
+        if len(parts) >= 2:
+            suffix = parts[1]
+            if suffix.isdigit():
+                ids.append(int(suffix))
+    return sorted(set(ids))
 
 # ----------------------------------------------------------------------
-# Helpers for dynamic table support
+# Compaction helpers (unchanged behavior but included)
 # ----------------------------------------------------------------------
-def _get_set_name_for_table(table: str) -> str:
-    """
-    Return the Redis set name that stores the IDs for a table.
-    Preserve original names for built-in tables to avoid breaking existing code.
-    For custom tables, use 'table:{table}'.
-    """
-    if table == "users":
-        return "users"
-    if table == "agents":
-        return "agents"
-    if table == "conversations":
-        return "conversations"
-    # generic
-    return f"table:{table}"
+def compact_users() -> Dict[str, Any]:
+    ids = _all_numeric_suffix_ids("user")
+    if not ids:
+        r.set("next_user_id", 0)
+        r.delete("users")
+        return {"status": "ok", "users_before": 0, "users_after": 0}
 
-def _get_key_for_table_id(table: str, id: str) -> str:
-    """
-    Return the Redis key pattern for a given table and id.
-    Preserve legacy patterns for users/agents/conversations where applicable.
-    """
-    if table == "users":
-        return f"user:{id}"
-    if table == "agents":
-        # agents were stored as 'agent{n}' ids already, so if id already starts with 'agent' keep it
-        if id.startswith("agent"):
-            return id
-        return f"{id}"  # fallback: allow direct agent id usage
-    if table == "conversations":
-        # conversations use special composite id 'agent:phone' handled elsewhere
-        return f"convo:{id}"
-    # generic
-    return f"{table}:{id}"
+    mapping: Dict[int, int] = {}
+    for new_idx, old_id in enumerate(ids, start=1):
+        mapping[old_id] = new_idx
 
-def _ensure_table_counter(table: str):
-    """Ensure next_id:{table} exists in Redis."""
-    counter_key = f"next_id:{table}"
-    if not r.exists(counter_key):
-        r.set(counter_key, "0")
+    temp_map: Dict[str, Tuple[int, int]] = {}
+    uid_uuid = uuid.uuid4().hex
 
-def create_table(table: str):
-    """Create a new generic table in Redis by initializing its set and counter."""
-    _require_redis()
-    set_name = _get_set_name_for_table(table)
-    counter_key = f"next_id:{table}"
-    if r.exists(set_name) or r.exists(counter_key):
-        # Already exists (idempotent)
-        return {"status": "exists", "table": table}
-    r.sadd(set_name)  # creates an empty set
-    r.set(counter_key, "0")
-    return {"status": "created", "table": table}
+    # rename to temp keys to avoid collisions
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            continue
+        old_key = _user_key(old_id)
+        if not r.exists(old_key):
+            continue
+        temp_key = f"tmp:rekey:user:{uid_uuid}:{old_id}"
+        if r.exists(temp_key):
+            r.delete(temp_key)
+        r.rename(old_key, temp_key)
+        temp_map[temp_key] = (old_id, new_id)
 
-def delete_table(table: str):
-    """Delete a generic table: removes all keys for its members and removes the set & counter."""
-    _require_redis()
-    set_name = _get_set_name_for_table(table)
-    counter_key = f"next_id:{table}"
-    if not r.exists(set_name):
-        return {"status": "not_found", "table": table}
-    members = list(r.smembers(set_name))
-    deleted_any = False
-    for mid in members:
-        key = _get_key_for_table_id(table, mid)
-        # For conversation set members we stored "agent:phone" so key patterns differ
-        if table == "conversations":
-            # conversation keys are convo:{agent}:{phone} and meta convo_meta:{agent}:{phone}
+    final_ids: List[int] = []
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            key = _user_key(old_id)
+            if r.exists(key):
+                final_ids.append(new_id)
+
+    for temp_key, (old_id, new_id) in temp_map.items():
+        final_key = _user_key(new_id)
+        if r.exists(final_key):
+            r.delete(final_key)
+        r.rename(temp_key, final_key)
+        final_ids.append(new_id)
+
+    final_ids = sorted(set(final_ids))
+    r.delete("users")
+    for uid in final_ids:
+        r.sadd("users", str(uid))
+
+    old_to_new = {old: new for old, new in mapping.items() if old != new}
+    for aid in list(r.smembers("agents")):
+        try:
+            user_id = r.hget(aid, "user_id")
+            if not user_id:
+                continue
+            if user_id.isdigit():
+                old_uid = int(user_id)
+                if old_uid in old_to_new:
+                    r.hset(aid, "user_id", str(old_to_new[old_uid]))
+        except Exception:
+            continue
+
+    r.set("next_user_id", len(final_ids))
+    return {"status": "ok", "users_before": len(ids), "users_after": len(final_ids)}
+
+def _collect_conversations_for_agent(agent_name: str) -> List[str]:
+    out = []
+    for ck in r.smembers("conversations"):
+        if not ck:
+            continue
+        if ck.startswith(agent_name + ":"):
+            out.append(ck)
+    return out
+
+def compact_agents() -> Dict[str, Any]:
+    ids = _all_numeric_suffix_ids("agent")
+    if not ids:
+        r.set("next_agent_id", 0)
+        r.delete("agents")
+        return {"status": "ok", "agents_before": 0, "agents_after": 0}
+
+    mapping: Dict[int, int] = {}
+    for new_idx, old_id in enumerate(ids, start=1):
+        mapping[old_id] = new_idx
+
+    agent_uuid = uuid.uuid4().hex
+
+    for old_id, new_id in mapping.items():
+        if old_id == new_id:
+            continue
+        old_name = _agent_name(old_id)
+        new_name = _agent_name(new_id)
+        temp_agent = f"tmp:rekey:agent:{agent_uuid}:{old_id}"
+
+        if r.exists(old_name):
+            if r.exists(temp_agent):
+                r.delete(temp_agent)
+            r.rename(old_name, temp_agent)
+
+        if r.sismember("agents", old_name):
+            r.srem("agents", old_name)
+            r.sadd("agents", temp_agent)
+
+        convs = _collect_conversations_for_agent(old_name)
+        for ck in convs:
             try:
-                agent_id, phone = mid.split(":", 1)
-                r.delete(f"convo:{agent_id}:{phone}")
-                r.delete(f"convo_meta:{agent_id}:{phone}")
-                deleted_any = True
-            except Exception:
-                pass
-        else:
-            if r.delete(key):
-                deleted_any = True
-    # remove the members set and counter
-    r.delete(set_name)
-    r.delete(counter_key)
-    return {"status": "deleted", "table": table, "deleted_any": deleted_any}
+                _, phone = ck.split(":", 1)
+            except ValueError:
+                continue
+            old_msg = _convo_msg_key(old_name, phone)
+            temp_msg = _convo_msg_key(temp_agent, phone)
+            if r.exists(old_msg):
+                if r.exists(temp_msg):
+                    r.delete(temp_msg)
+                r.rename(old_msg, temp_msg)
+
+            old_meta = _convo_meta_key(old_name, phone)
+            temp_meta = _convo_meta_key(temp_agent, phone)
+            if r.exists(old_meta):
+                if r.exists(temp_meta):
+                    r.delete(temp_meta)
+                r.rename(old_meta, temp_meta)
+                try:
+                    r.hset(temp_meta, "agent_id", temp_agent)
+                except Exception:
+                    pass
+
+            r.srem("conversations", ck)
+            r.sadd("conversations", f"{temp_agent}:{phone}")
+
+        if r.exists(temp_agent):
+            if r.exists(new_name):
+                r.delete(new_name)
+            r.rename(temp_agent, new_name)
+
+        if r.sismember("agents", temp_agent):
+            r.srem("agents", temp_agent)
+            r.sadd("agents", new_name)
+
+        convs_temp = _collect_conversations_for_agent(temp_agent)
+        for tck in convs_temp:
+            try:
+                _, phone = tck.split(":", 1)
+            except ValueError:
+                continue
+            temp_msg = _convo_msg_key(temp_agent, phone)
+            final_msg = _convo_msg_key(new_name, phone)
+            if r.exists(temp_msg):
+                if r.exists(final_msg):
+                    r.delete(final_msg)
+                r.rename(temp_msg, final_msg)
+
+            temp_meta = _convo_meta_key(temp_agent, phone)
+            final_meta = _convo_meta_key(new_name, phone)
+            if r.exists(temp_meta):
+                if r.exists(final_meta):
+                    r.delete(final_meta)
+                r.rename(temp_meta, final_meta)
+                try:
+                    r.hset(final_meta, "agent_id", new_name)
+                except Exception:
+                    pass
+
+            if r.sismember("conversations", tck):
+                r.srem("conversations", tck)
+                r.sadd("conversations", f"{new_name}:{phone}")
+
+    r.delete("agents")
+    final_agent_ids = []
+    for new_idx in sorted(mapping.values()):
+        name = _agent_name(new_idx)
+        if r.exists(name):
+            r.sadd("agents", name)
+            final_agent_ids.append(new_idx)
+
+    r.set("next_agent_id", len(final_agent_ids))
+    return {"status": "ok", "agents_before": len(ids), "agents_after": len(final_agent_ids)}
 
 # ----------------------------------------------------------------------
-# ONE-TIME INITIALIZATION (Runs on startup if missing)
+# Health
 # ----------------------------------------------------------------------
-def _initialize_db():
-    """Check and initialize counters/sets if Redis exists."""
-    try:
-        if not r:
-            print("Redis not initialized; skipping DB initialization")
-            return
-        if not r.exists("next_user_id"):
-            r.set("next_user_id", "0")
-            print("Initialized next_user_id")
-        if not r.exists("next_agent_id"):
-            r.set("next_agent_id", "0")
-            print("Initialized next_agent_id")
-        # Sets are lazy - no need to create empty
-        print("DB initialized successfully")
-    except Exception as e:
-        print(f"DB init error: {e}")
+@app.get("/")
+@app.get("/")
+def health():
+    redis_status = "Failed"
+    redis_error = ""
+    if r:
+        try:
+            r.ping()
+            redis_status = "Connected"
+        except Exception as e:
+            redis_status = "Failed"
+            redis_error = str(e)
+    else:
+        redis_error = "Redis client not initialized"
 
-# Call initialization now
-_initialize_db()
+    return {
+        "message": "SMS Runtime Backend Live!",
+        "redis": redis_status,
+        "redis_error": redis_error,
+        "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
+    }
 
-@app.on_event("startup")
-def _startup():
-    # Reserved for any startup tasks. DB initialization already attempted above.
-    pass
 
 # ----------------------------------------------------------------------
-# Existing Add (Preserved - No Changes to logic for built-in tables)
+# ADD
 # ----------------------------------------------------------------------
-def add_record(table: str, data: Dict[str, Any]) -> str:
-    """Add new record with auto-ID and timestamps; accepts any fields."""
-    if not r:
-        raise ValueError("Redis not connected")
-    data["created_at"] = int(time.time())
-    data["updated_at"] = data["created_at"]
-
-    if table == "users":
-        next_id = int(r.get("next_user_id") or 0) + 1
-        r.set("next_user_id", next_id)
-        user_id = str(next_id)
-        key = f"user:{user_id}"
-        r.hset(key, mapping=data)
-        r.sadd("users", user_id)
-        return user_id
-
-    elif table == "agents":
-        next_id = int(r.get("next_agent_id") or 0) + 1
-        r.set("next_agent_id", next_id)
-        agent_id = f"agent{next_id}"
-        if "tools" in data:
-            data["tools"] = json.dumps(data["tools"])
-        # preserve original agent storage semantics
-        r.hset(agent_id, mapping=data)
-        r.sadd("agents", agent_id)
-        return agent_id
-
-    elif table == "conversations":
-        agent_id = data.get("agent_id")
-        phone = data.get("phone")
-        if not agent_id or not phone:
-            raise ValueError("agent_id and phone required for conversations")
-        key = f"convo:{agent_id}:{phone}"
-        meta_key = f"convo_meta:{agent_id}:{phone}"
-        messages = data.pop("messages", [])
-        r.delete(key)
-        for msg in messages:
-            r.rpush(key, json.dumps(msg))
-        r.expire(key, 86400 * 30)
-        r.hset(meta_key, mapping=data)
-        r.sadd("conversations", f"{agent_id}:{phone}")
-        return f"{agent_id}:{phone}"
-
-    # Generic table handling for dynamically created tables
-    # Use per-table counter next_id:{table} and set name from _get_set_name_for_table
-    set_name = _get_set_name_for_table(table)
-    counter_key = f"next_id:{table}"
-    # Ensure counter exists
-    if not r.exists(counter_key):
-        r.set(counter_key, "0")
-    next_id = int(r.get(counter_key) or 0) + 1
-    r.set(counter_key, next_id)
-    new_id = str(next_id)
-    key = f"{table}:{new_id}"
-    r.hset(key, mapping=data)
-    r.sadd(set_name, new_id)
-    return new_id
-
 @app.post("/add")
 def add_endpoint(req: AddRequest):
     _require_redis()
@@ -272,55 +337,45 @@ def add_endpoint(req: AddRequest):
     ts = int(time.time())
     data["created_at"] = ts
     data["updated_at"] = ts
-    # Built-in tables preserved exactly
+
     if req.table == "users":
-        next_id = int(r.get("next_user_id") or 0) + 1
-        r.set("next_user_id", next_id)
-        user_id = str(next_id)
-        key = f"user:{user_id}"
-        r.hset(key, mapping=data)
-        r.sadd("users", user_id)
-        return {"id": user_id, "status": "success"}
+        nxt = _get_next_user_id() + 1
+        r.set("next_user_id", nxt)
+        uid = nxt
+        r.hset(_user_key(uid), mapping=data)
+        r.sadd("users", str(uid))
+        return {"id": str(uid), "status": "success"}
+
     if req.table == "agents":
-        next_id = int(r.get("next_agent_id") or 0) + 1
-        r.set("next_agent_id", next_id)
-        agent_id = f"agent{next_id}"
+        nxt = _get_next_agent_id() + 1
+        r.set("next_agent_id", nxt)
+        aid_name = _agent_name(nxt)
         if "tools" in data:
             data["tools"] = json.dumps(data["tools"])
-        r.hset(agent_id, mapping=data)
-        r.sadd("agents", agent_id)
-        return {"id": agent_id, "status": "success"}
+        r.hset(aid_name, mapping=data)
+        r.sadd("agents", aid_name)
+        return {"id": aid_name, "status": "success"}
+
     if req.table == "conversations":
         agent_id = data.get("agent_id")
         phone = data.get("phone")
         if not agent_id or not phone:
             raise HTTPException(status_code=400, detail="agent_id and phone required")
-        key = f"convo:{agent_id}:{phone}"
-        meta_key = f"convo_meta:{agent_id}:{phone}"
+        key = _convo_msg_key(agent_id, phone)
+        meta_key = _convo_meta_key(agent_id, phone)
         messages = data.pop("messages", [])
         r.delete(key)
-        for msg in messages:
-            r.rpush(key, json.dumps(msg))
-        r.expire(key, 30 * 86400) # 30 days
+        for m in messages:
+            r.rpush(key, json.dumps(m))
+        r.expire(key, 30 * 86400)
         r.hset(meta_key, mapping=data)
         r.sadd("conversations", f"{agent_id}:{phone}")
         return {"id": f"{agent_id}:{phone}", "status": "success"}
 
-    # Generic dynamic table add
-    set_name = _get_set_name_for_table(req.table)
-    counter_key = f"next_id:{req.table}"
-    if not r.exists(counter_key):
-        r.set(counter_key, "0")
-    next_id = int(r.get(counter_key) or 0) + 1
-    r.set(counter_key, next_id)
-    new_id = str(next_id)
-    key = f"{req.table}:{new_id}"
-    r.hset(key, mapping=data)
-    r.sadd(set_name, new_id)
-    return {"id": new_id, "status": "success", "table": req.table}
+    raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# Existing Fetch (Preserved - No Changes for built-in tables; added generic)
+# FETCH - optimized with Redis pipelines
 # ----------------------------------------------------------------------
 def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
     filters = {}
@@ -343,10 +398,15 @@ def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
 def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
     _require_redis()
     filt = _parse_filters(filters)
-    # USERS
+
+    # USERS - batch HGETALL via pipeline
     if table == "users":
         if id:
-            rec = dict(r.hgetall(f"user:{id}"))
+            try:
+                uid = int(id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid user id")
+            rec = dict(r.hgetall(_user_key(uid)))
             if not rec:
                 return {}
             rec.setdefault("name", "")
@@ -354,49 +414,91 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["last_active"] = int(rec.get("last_active", 0))
             rec["created_at"] = int(rec.get("created_at", 0))
             return rec if _matches(rec, filt) else {}
-        out = {}
-        for uid in r.smembers("users"):
-            rec = dict(r.hgetall(f"user:{uid}"))
-            if rec and _matches(rec, filt):
+
+        max_id = _get_next_user_id()
+        out: Dict[str, Any] = {}
+
+        # If max_id is reasonable, pipeline sequential keys 1..max_id
+        if max_id > 0 and max_id <= MAX_FETCH_KEYS:
+            keys = [_user_key(uid) for uid in range(1, max_id + 1)]
+        else:
+            # fallback: iterate over set 'users' to get actual keys (keeps pipeline smaller)
+            members = r.smembers("users")
+            keys = [_user_key(int(x)) for x in sorted([int(x) for x in members])]
+
+        if not keys:
+            return out
+
+        pipe = r.pipeline()
+        for k in keys:
+            pipe.hgetall(k)
+        results = pipe.execute()
+
+        # results correspond to keys; include only non-empty hgetall
+        for uid, rec in zip([int(k.split(":")[1]) for k in keys], results):
+            if rec:
                 rec.setdefault("name", "")
                 rec.setdefault("phone", "")
                 rec["last_active"] = int(rec.get("last_active", 0))
                 rec["created_at"] = int(rec.get("created_at", 0))
-                out[uid] = rec
+                if _matches(rec, filt):
+                    out[str(uid)] = rec
         return out
-    # AGENTS
+
+    # AGENTS - batch HGETALL via pipeline
     if table == "agents":
         if id:
-            rec = dict(r.hgetall(id))
+            aid = id if id.startswith("agent") else _agent_name(int(id))
+            rec = dict(r.hgetall(aid))
             if not rec:
                 return {}
             rec.setdefault("prompt", "")
             rec.setdefault("user_id", "")
-            rec["tools"] = json.loads(rec["tools"]) if "tools" in rec else []
+            rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
             rec["created_at"] = int(rec.get("created_at", 0))
             rec["updated_at"] = int(rec.get("updated_at", 0))
             return rec if _matches(rec, filt) else {}
-        out = {}
-        for aid in r.smembers("agents"):
-            rec = dict(r.hgetall(aid))
-            if rec and _matches(rec, filt):
+
+        max_agent = _get_next_agent_id()
+        out: Dict[str, Any] = {}
+
+        if max_agent > 0 and max_agent <= MAX_FETCH_KEYS:
+            agent_keys = [_agent_name(n) for n in range(1, max_agent + 1)]
+        else:
+            members = r.smembers("agents")
+            agent_keys = sorted(list(members))
+
+        if not agent_keys:
+            return out
+
+        pipe = r.pipeline()
+        for aid in agent_keys:
+            pipe.hgetall(aid)
+        results = pipe.execute()
+
+        for aid, rec in zip(agent_keys, results):
+            if rec:
                 rec.setdefault("prompt", "")
                 rec.setdefault("user_id", "")
-                rec["tools"] = json.loads(rec["tools"]) if "tools" in rec else []
+                rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
                 rec["created_at"] = int(rec.get("created_at", 0))
                 rec["updated_at"] = int(rec.get("updated_at", 0))
-                out[aid] = rec
+                if _matches(rec, filt):
+                    out[aid] = rec
         return out
-    # CONVERSATIONS
+
+    # CONVERSATIONS - batch LRANGE and HGETALL via pipeline
     if table == "conversations":
         if id:
             try:
                 agent_id, phone = id.split(":", 1)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid conversation id")
-            key = f"convo:{agent_id}:{phone}"
-            msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
-            meta_key = f"convo_meta:{agent_id}:{phone}"
+            key = _convo_msg_key(agent_id, phone)
+            msgs = []
+            if r.exists(key):
+                msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
+            meta_key = _convo_meta_key(agent_id, phone)
             meta = dict(r.hgetall(meta_key))
             meta.setdefault("agent_id", agent_id)
             meta.setdefault("phone", phone)
@@ -407,50 +509,54 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 if not msgs:
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
-        out = {}
-        for ck in r.smembers("conversations"):
-            agent_id, phone = ck.split(":", 1)
-            key = f"convo:{agent_id}:{phone}"
-            msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
-            meta_key = f"convo_meta:{agent_id}:{phone}"
-            meta = dict(r.hgetall(meta_key))
-            if msgs or meta:
-                meta.setdefault("agent_id", agent_id)
-                meta.setdefault("phone", phone)
-                meta["created_at"] = int(meta.get("created_at", 0))
-                meta["updated_at"] = int(meta.get("updated_at", 0))
-                if not filt or any(_matches(m, filt) for m in msgs):
-                    out[ck] = {"messages": msgs, "meta": meta}
+
+        out: Dict[str, Any] = {}
+        convs = list(r.smembers("conversations"))
+        if not convs:
+            return out
+
+        pipe = r.pipeline()
+        # for each conversation, queue LRANGE and HGETALL; store order
+        for ck in convs:
+            try:
+                agent_id, phone = ck.split(":", 1)
+            except ValueError:
+                # skip malformed entries
+                continue
+            msg_key = _convo_msg_key(agent_id, phone)
+            meta_key = _convo_meta_key(agent_id, phone)
+            pipe.lrange(msg_key, 0, -1)
+            pipe.hgetall(meta_key)
+
+        results = pipe.execute()
+        # results are in pairs [lrange1, hgetall1, lrange2, hgetall2, ...]
+        it = iter(results)
+        i = 0
+        for ck in convs:
+            try:
+                agent_id, phone = ck.split(":", 1)
+            except ValueError:
+                continue
+            try:
+                msgs_raw = next(it)
+                meta_raw = next(it)
+            except StopIteration:
+                break
+            msgs = [json.loads(m) for m in msgs_raw] if msgs_raw else []
+            meta = meta_raw or {}
+            meta.setdefault("agent_id", agent_id)
+            meta.setdefault("phone", phone)
+            meta["created_at"] = int(meta.get("created_at", 0))
+            meta["updated_at"] = int(meta.get("updated_at", 0))
+            if not filt or any(_matches(m, filt) for m in msgs):
+                out[ck] = {"messages": msgs, "meta": meta}
+            i += 1
         return out
 
-    # Generic table fetch
-    set_name = _get_set_name_for_table(table)
-    if not r.exists(set_name):
-        raise HTTPException(status_code=400, detail="Invalid table")
-    # If id provided, fetch single record
-    if id:
-        key = _get_key_for_table_id(table, id)
-        rec = dict(r.hgetall(key))
-        if not rec:
-            return {}
-        # Convert numeric fields if possible
-        for k, v in rec.items():
-            if isinstance(v, str) and v.isdigit():
-                try:
-                    rec[k] = int(v)
-                except Exception:
-                    pass
-        return rec if _matches(rec, filt) else {}
-    out = {}
-    for member in r.smembers(set_name):
-        key = _get_key_for_table_id(table, member)
-        rec = dict(r.hgetall(key))
-        if rec and _matches(rec, filt):
-            out[member] = rec
-    return out
+    raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# UPDATE (Preserved for built-ins, added generic)
+# UPDATE
 # ----------------------------------------------------------------------
 @app.post("/update")
 def update_endpoint(req: UpdateRequest):
@@ -458,29 +564,37 @@ def update_endpoint(req: UpdateRequest):
     ts = int(time.time())
     updates = req.updates.copy()
     updates["updated_at"] = ts
-    # Built-ins preserved exactly
+
     if req.table == "users":
-        key = f"user:{req.id}"
+        try:
+            uid = int(req.id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid user id")
+        key = _user_key(uid)
         if not r.exists(key):
             raise HTTPException(status_code=404, detail="User not found")
         r.hset(key, mapping=updates)
         return {"status": "success"}
+
     if req.table == "agents":
-        if not r.exists(req.id):
+        aid = req.id if req.id.startswith("agent") else _agent_name(int(req.id))
+        if not r.exists(aid):
             raise HTTPException(status_code=404, detail="Agent not found")
         if "tools" in updates:
             updates["tools"] = json.dumps(updates["tools"])
-        r.hset(req.id, mapping=updates)
+        r.hset(aid, mapping=updates)
         return {"status": "success"}
+
     if req.table == "conversations":
         try:
             agent_id, phone = req.id.split(":", 1)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation id")
-        meta_key = f"convo_meta:{agent_id}:{phone}"
-        msg_key = f"convo:{agent_id}:{phone}"
+        meta_key = _convo_meta_key(agent_id, phone)
+        msg_key = _convo_msg_key(agent_id, phone)
         if not r.exists(meta_key) and not r.exists(msg_key):
             raise HTTPException(status_code=404, detail="Conversation not found")
+
         if "append" in updates:
             for m in updates.pop("append"):
                 r.rpush(msg_key, json.dumps(m))
@@ -488,355 +602,80 @@ def update_endpoint(req: UpdateRequest):
             r.hset(meta_key, mapping=updates)
         return {"status": "success"}
 
-    # Generic update for dynamic tables
-    set_name = _get_set_name_for_table(req.table)
-    if not r.exists(set_name):
-        raise HTTPException(status_code=400, detail="Invalid table")
-    key = _get_key_for_table_id(req.table, req.id)
-    if not r.exists(key):
-        raise HTTPException(status_code=404, detail="Record not found")
-    r.hset(key, mapping=updates)
-    return {"status": "success"}
+    raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# DELETE (Preserved for built-ins, added generic)
+# DELETE with automatic compaction
 # ----------------------------------------------------------------------
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
     _require_redis()
+
     if table == "users":
-        key = f"user:{id}"
+        try:
+            uid = int(id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid user id")
+        key = _user_key(uid)
         if r.delete(key):
-            r.srem("users", id)
-            return {"status": "deleted"}
+            r.srem("users", str(uid))
+            compact_users()
+            return {"status": "deleted", "id": str(uid)}
         raise HTTPException(status_code=404, detail="User not found")
+
     if table == "agents":
-        if r.delete(id):
-            r.srem("agents", id)
-            return {"status": "deleted"}
+        if id.startswith("agent"):
+            try:
+                idx = int(id[len("agent"):])
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid agent id")
+        else:
+            try:
+                idx = int(id)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid agent id")
+
+        aid_name = _agent_name(idx)
+        if r.delete(aid_name):
+            r.srem("agents", aid_name)
+            compact_agents()
+            return {"status": "deleted", "id": aid_name}
         raise HTTPException(status_code=404, detail="Agent not found")
+
     if table == "conversations":
         try:
             agent_id, phone = id.split(":", 1)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation id")
-        msg_key = f"convo:{agent_id}:{phone}"
-        meta_key = f"convo_meta:{agent_id}:{phone}"
+        msg_key = _convo_msg_key(agent_id, phone)
+        meta_key = _convo_meta_key(agent_id, phone)
         deleted = r.delete(msg_key, meta_key)
         if deleted:
             r.srem("conversations", id)
-            return {"status": "deleted"}
+            return {"status": "deleted", "id": id}
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Generic delete
-    set_name = _get_set_name_for_table(table)
-    if not r.exists(set_name):
-        raise HTTPException(status_code=400, detail="Invalid table")
-    key = _get_key_for_table_id(table, id)
-    deleted = r.delete(key)
-    if deleted:
-        r.srem(set_name, id)
-        return {"status": "deleted"}
-    raise HTTPException(status_code=404, detail="Record not found")
+    raise HTTPException(status_code=400, detail="Invalid table")
 
 # ----------------------------------------------------------------------
-# Table creation & deletion endpoints (new)
+# Admin compaction endpoint
 # ----------------------------------------------------------------------
-class TableRequest(BaseModel):
-    name: str
-
-@app.post("/createtable")
-def api_create_table(req: TableRequest):
-    """
-    Create a new generic table. Body JSON: {"name": "mytable"}
-    This will create Redis set 'table:mytable' and counter 'next_id:mytable'.
-    """
+@app.post("/admin/compact")
+def admin_compact(payload: Optional[Dict[str, Any]] = None):
     _require_redis()
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-    result = create_table(name)
-    if result.get("status") == "exists":
-        return JSONResponse(status_code=200, content=result)
-    return JSONResponse(status_code=201, content=result)
-
-@app.put("/table")
-def api_put_table(req: TableRequest, action: Optional[str] = None):
-    """
-    PUT /table can be used with body {"name": "mytable"}.
-    If query param action=delete or body contains action 'delete' it will delete the table.
-    This supports the user's desired 'PUT to delete' behavior.
-    """
-    _require_redis()
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-    # If action passed as query param, respect it
-    if action and action.lower() == "delete":
-        res = delete_table(name)
-        if res.get("status") == "not_found":
-            raise HTTPException(status_code=404, detail=f"Table {name} not found")
-        return {"status": "deleted", "table": name}
-    # Default behavior: create table if not exists
-    res = create_table(name)
-    return res
-
-@app.delete("/table")
-def api_delete_table(name: str):
-    """
-    DELETE /table?name=mytable will delete the named table and all its records.
-    """
-    _require_redis()
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-    res = delete_table(name)
-    if res.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail=f"Table {name} not found")
-    return res
+    table = None
+    if payload and isinstance(payload, dict):
+        table = payload.get("table")
+    result = {}
+    if table is None or table == "users" or table == "all":
+        result["users"] = compact_users()
+    if table is None or table == "agents" or table == "all":
+        result["agents"] = compact_agents()
+    return {"status": "ok", "result": result}
 
 # ----------------------------------------------------------------------
-# FUNCTION MANAGEMENT (Updated to handle Redis unavailability gracefully)
+# Run
 # ----------------------------------------------------------------------
-def _sanitize_code(code: str) -> str:
-    """Basic code sanitization - block dangerous keywords."""
-    # Use word boundaries for tokens to reduce false positives
-    dangerous_tokens = [
-        r'\beval\b', r'\bexec\b', r'\bcompile\b', r'__import__', r'\bopen\b',
-        r'\bos\.system\b', r'\bsubprocess\b', r'\bimport \*\b', r'\bsocket\b'
-    ]
-    lowered = code.lower()
-    for token in dangerous_tokens:
-        if re.search(token, lowered):
-            raise ValueError(f"Unsafe code detected: {token}")
-    return code
-
-def _run_code(code: str, inputs: Dict[str, Any], language: str = "python") -> Dict[str, Any]:
-    """Run code safely. Python only."""
-    if language != "python":
-        raise ValueError("Only Python supported")
-
-    # Minimal builtins whitelist: allow basic builtins, but remove dangerous ones
-    safe_builtins = {}
-    for k, v in __builtins__.items():
-        # keep only commonly safe names (int, str, len, dict, list, etc.)
-        if k in ("abs", "all", "any", "bool", "dict", "float", "int", "len", "list", "max", "min", "range", "str", "sum", "print"):
-            safe_builtins[k] = v
-
-    globals_dict = {"__builtins__": safe_builtins}
-    locals_dict = inputs.copy() if isinstance(inputs, dict) else {}
-    try:
-        exec(code, globals_dict, locals_dict)
-        # Return only JSON-serializable items: attempt to convert non-serializable to str
-        def _serialize(o):
-            try:
-                json.dumps(o)
-                return o
-            except Exception:
-                return str(o)
-        serialized = {k: _serialize(v) for k, v in locals_dict.items()}
-        return {"locals": serialized}
-    except Exception as e:
-        tb = traceback.format_exc()
-        return {"error": str(e), "traceback": tb}
-
-def _save_local_function(fid: str, code: str, meta: Dict[str, Any]):
-    code_path = LOCAL_FUNC_DIR / f"{fid}.py"
-    meta_path = LOCAL_FUNC_DIR / f"{fid}.meta.json"
-    code_path.write_text(code, encoding="utf-8")
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
-
-def _load_local_function(fid: str):
-    code_path = LOCAL_FUNC_DIR / f"{fid}.py"
-    meta_path = LOCAL_FUNC_DIR / f"{fid}.meta.json"
-    if code_path.exists():
-        code = code_path.read_text(encoding="utf-8")
-        meta = {}
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-        return code, meta
-    return None, None
-
-@app.post("/createfunction")
-async def create_function(
-    file: UploadFile = File(...),
-    language: str = Form("python"),
-    name: str = Form(...)
-):
-    # NOTE: Do not require Redis here. Allow local fallback so user can upload even when Redis down.
-    if not file.filename.endswith('.py'):
-        raise HTTPException(400, detail="Only .py files supported")
-
-    content = await file.read()
-    code = content.decode('utf-8')
-    code = _sanitize_code(code)
-
-    # Analyze for libs (check imports, warn if unknown)
-    libs = []
-    for line in code.split('\n'):
-        l = line.strip()
-        if l.startswith('import ') or l.startswith('from '):
-            lib_match = re.match(r'(?:from|import)\s+([A-Za-z0-9_]+)', l)
-            if lib_match:
-                lib = lib_match.group(1)
-                if lib not in libs:
-                    libs.append(lib)
-                    if lib not in ['redis', 'json', 'time', 'typing', 'fastapi', 'pydantic']:
-                        print(f"Warning: Unknown lib '{lib}' - pre-install in requirements.txt")
-
-    # Generate ID
-    ts = int(time.time())
-    fid = f"func{ts}"
-
-    meta = {
-        "name": name,
-        "language": language,
-        "libs": libs,
-        "ts": ts
-    }
-
-    # Try to store in Redis; if Redis not available, store locally
-    if r:
-        try:
-            r.set(f"function:{fid}:code", code)
-            r.hset(f"function:{fid}:meta", mapping={
-                "name": name,
-                "language": language,
-                "libs": json.dumps(libs),
-                "ts": ts
-            })
-            return {"id": fid, "status": "created", "libs": libs}
-        except Exception as e:
-            # Log and fall back to local
-            print(f"Redis write failed while creating function {fid}: {e}")
-            _save_local_function(fid, code, meta)
-            return {"id": fid, "status": "created_local", "note": "Redis write failed; saved locally", "libs": libs}
-    else:
-        _save_local_function(fid, code, meta)
-        return {"id": fid, "status": "created_local", "note": "Redis not available; saved locally", "libs": libs}
-
-@app.post("/runfunction")
-async def run_function(request: Request):
-    # Allow running functions even if Redis is down, if saved locally
-    data = await request.json()
-    fid = data.get("id")
-    inputs = data.get("input", {})
-
-    if not fid:
-        raise HTTPException(400, detail="Missing 'id'")
-
-    code = None
-    meta = {}
-    if r:
-        try:
-            code = r.get(f"function:{fid}:code")
-            if code:
-                meta = dict(r.hgetall(f"function:{fid}:meta") or {})
-        except Exception as e:
-            print(f"Redis read error for {fid}: {e}")
-            code = None
-
-    if not code:
-        # Attempt local load
-        code_local, meta_local = _load_local_function(fid)
-        if code_local:
-            code = code_local
-            meta = meta_local or meta
-    if not code:
-        raise HTTPException(status_code=404, detail="Function not found")
-
-    language = meta.get("language", "python") if meta else "python"
-    result = _run_code(code, inputs, language)
-    return {"result": result, "status": "ran"}
-
-@app.post("/updatefunction")
-async def update_function(
-    id: str = Form(...),
-    file: UploadFile = File(...),
-    name: str = Form(...)
-):
-    if not file.filename.endswith('.py'):
-        raise HTTPException(400, detail="Only .py files supported")
-
-    content = await file.read()
-    code = content.decode('utf-8')
-    code = _sanitize_code(code)
-
-    # Analyze libs (same as create)
-    libs = []
-    for line in code.split('\n'):
-        l = line.strip()
-        if l.startswith('import ') or l.startswith('from '):
-            lib_match = re.match(r'(?:from|import)\s+([A-Za-z0-9_]+)', l)
-            if lib_match:
-                lib = lib_match.group(1)
-                if lib not in libs:
-                    libs.append(lib)
-                    if lib not in ['redis', 'json', 'time', 'typing', 'fastapi', 'pydantic']:
-                        print(f"Warning: New lib '{lib}' - add to requirements.txt and redeploy")
-
-    meta = {
-        "name": name,
-        "libs": libs,
-        "ts": int(time.time())
-    }
-
-    if r:
-        try:
-            r.set(f"function:{id}:code", code)
-            r.hset(f"function:{id}:meta", mapping={
-                "name": name,
-                "libs": json.dumps(libs),
-                "ts": int(time.time())
-            })
-            return {"id": id, "status": "updated", "libs": libs}
-        except Exception as e:
-            print(f"Redis update failed for {id}: {e}")
-            _save_local_function(id, code, meta)
-            return {"id": id, "status": "updated_local", "note": "Redis update failed; saved locally", "libs": libs}
-    else:
-        _save_local_function(id, code, meta)
-        return {"id": id, "status": "updated_local", "note": "Redis not available; saved locally", "libs": libs}
-
-@app.delete("/deletefunction")
-def delete_function(id: str):
-    # Delete from Redis if possible; otherwise delete local files
-    deleted = False
-    if r:
-        try:
-            r_deleted = r.delete(f"function:{id}:code")
-            r_meta_deleted = r.delete(f"function:{id}:meta")
-            deleted = bool(r_deleted or r_meta_deleted)
-        except Exception as e:
-            print(f"Redis delete error for {id}: {e}")
-            deleted = False
-
-    # Remove local fallback files
-    code_path = LOCAL_FUNC_DIR / f"{id}.py"
-    meta_path = LOCAL_FUNC_DIR / f"{id}.meta.json"
-    local_deleted = False
-    try:
-        if code_path.exists():
-            code_path.unlink()
-            local_deleted = True
-        if meta_path.exists():
-            meta_path.unlink()
-            local_deleted = True
-    except Exception as e:
-        print(f"Local delete error for {id}: {e}")
-
-    if deleted or local_deleted:
-        return {"id": id, "status": "deleted"}
-    raise HTTPException(status_code=404, detail="Function not found")
-
-# ----------------------------------------------------------------------
-# Existing routes preserved (no changes)
-# Note: /add, /fetch, /update, /delete endpoints are above and unchanged in behavior for built-ins
-# ----------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
