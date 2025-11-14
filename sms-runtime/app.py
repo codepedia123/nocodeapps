@@ -26,38 +26,25 @@ MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 # Redis connection (safe, non-blocking)
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
-    """
-    Initialize Redis client with short timeouts so import/startup does not hang
-    if Redis is unreachable. Returns a connected client or None.
-    """
-    kwargs = {
-        "decode_responses": True,
-        "socket_connect_timeout": 2,
-        "socket_timeout": 2,
-        "health_check_interval": 30,
-    }
-
-    # prefer rediss for TLS if provided
     try:
-        if redis_url.startswith("rediss://") or redis_url.startswith("redis+ssl://"):
-            # when using TLS with ElastiCache, many environments do not provide CA certs,
-            # so set ssl_cert_reqs to None to avoid certificate verification failures.
-            # If you have proper CA certs, set ssl_cert_reqs to 'required' and provide ssl_ca_certs.
-            client = redis.from_url(redis_url, ssl=True, ssl_cert_reqs=None, **kwargs)
-        else:
-            client = redis.from_url(redis_url, **kwargs)
-    except Exception as e:
-        print(f"Redis init failed: {e}")
-        return None
-
-    try:
-        # attempt a quick ping to verify connectivity
+        client = redis.StrictRedis(
+            host="clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com",
+            port=6379,
+            username="default",                    # the default user in AWS ElastiCache
+            password="<YOUR_REDIS_PASSWORD>",      # paste your Redis AUTH token here
+            ssl=True,
+            ssl_cert_reqs=None,                    # skip certificate validation
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5
+        )
         client.ping()
-        print("✅ Redis connected.")
+        print("✅ Redis TLS connection successful")
         return client
     except Exception as e:
-        print(f"⚠️ Redis ping failed (will proceed with r=None): {e}")
+        print(f"⚠️ Redis TLS connection failed: {e}")
         return None
+
 
 # initialize once at import time but with safe timeouts
 r = _init_redis()
