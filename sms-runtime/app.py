@@ -27,12 +27,16 @@ MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        client = redis.Redis.from_url(
-            "rediss://default:<YOUR_REDIS_PASSWORD>@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
+        redis_url = (
+            "rediss://default:<YOUR_REDIS_PASSWORD>"
+            "@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
+        )
+        client = redis.from_url(
+            redis_url,
             decode_responses=True,
             socket_connect_timeout=5,
             socket_timeout=5,
-            ssl_cert_reqs=None
+            ssl_cert_reqs=None,   # skip cert validation
         )
         client.ping()
         print("✅ Redis TLS connection successful")
@@ -40,6 +44,7 @@ def _init_redis() -> Optional[redis.Redis]:
     except Exception as e:
         print(f"⚠️ Redis TLS connection failed: {e}")
         return None
+
 
 
 # initialize once at import time but with safe timeouts
