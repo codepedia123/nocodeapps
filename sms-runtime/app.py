@@ -15,9 +15,7 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
 # You can override by setting the REDIS_URL environment variable on the server.
-redis_url = os.getenv(
-    "REDIS_URL",
-    "rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
+redis_url ="rediss://default:MCBSKQGovtRMYogRwmeZqAhIVGJ5@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
 )
 
 # Maximum number of sequential ids to pipeline directly. If next_id is larger,
