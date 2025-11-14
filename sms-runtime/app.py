@@ -27,16 +27,12 @@ MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        client = redis.StrictRedis(
-            host="clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com",
-            port=6379,
-            username="default",                    # the default user in AWS ElastiCache
-            password="<YOUR_REDIS_PASSWORD>",      # paste your Redis AUTH token here
-            ssl=True,
-            ssl_cert_reqs=None,                    # skip certificate validation
+        client = redis.Redis.from_url(
+            "rediss://default:<YOUR_REDIS_PASSWORD>@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
             decode_responses=True,
             socket_connect_timeout=5,
-            socket_timeout=5
+            socket_timeout=5,
+            ssl_cert_reqs=None
         )
         client.ping()
         print("✅ Redis TLS connection successful")
