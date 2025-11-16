@@ -15,9 +15,12 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
 # You can override by setting the REDIS_URL environment variable on the server.
-redis_url = (
-    "rediss://default:7004578947%40Pn%21July7"
-    "@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
+r = redis.Redis.from_url(
+    "rediss://new1:MyStrongPass2025%21@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=10,
+    retry_on_timeout=True,
 )
 
 
