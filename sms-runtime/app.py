@@ -5,6 +5,8 @@ import time
 import uuid
 from typing import Dict, Any, Optional, List, Tuple
 
+# --- Redis Cluster Support ---
+from redis.cluster import RedisCluster  # <-- only this import changed!
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,46 +17,40 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
 # You can override by setting the REDIS_URL environment variable on the server.
-r = redis.Redis.from_url(
-    "rediss://new1:MyStrongPass2025%21@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379",
-    decode_responses=True,
-    socket_connect_timeout=5,
-    socket_timeout=10,
-    retry_on_timeout=True,
-)
 
-
-# Maximum number of sequential ids to pipeline directly. If next_id is larger,
-# we fall back to scanning the membership set to avoid huge pipelines.
-MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
+# REMOVE the old single-node client line:
+# r = redis.Redis.from_url(...)
 
 # ----------------------------------------------------------------------
-# Redis connection (safe, non-blocking)
+# Redis connection (safe, non-blocking) -- UPDATED FOR CLUSTER MODE
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
         redis_url = (
-            "rediss://default:<YOUR_REDIS_PASSWORD>"
+            "rediss://new1:MyStrongPass2025%21"
             "@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
         )
-        client = redis.from_url(
+        client = RedisCluster.from_url(
             redis_url,
             decode_responses=True,
+            ssl_cert_reqs=None,   # skip cert validation
             socket_connect_timeout=5,
             socket_timeout=5,
-            ssl_cert_reqs=None,   # skip cert validation
+            read_from_replicas=True
         )
         client.ping()
-        print("✅ Redis TLS connection successful")
+        print("✅ Redis Cluster TLS connection successful")
         return client
     except Exception as e:
-        print(f"⚠️ Redis TLS connection failed: {e}")
+        print(f"⚠️ Redis cluster connection failed: {e}")
         return None
-
-
 
 # initialize once at import time but with safe timeouts
 r = _init_redis()
+
+# Maximum number of sequential ids to pipeline directly. If next_id is larger,
+# we fall back to scanning the membership set to avoid huge pipelines.
+MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 
 app = FastAPI(title="SMS Runtime Backend")
 
@@ -317,7 +313,6 @@ def health():
         "redis_error": redis_error,
         "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
     }
-
 
 # ----------------------------------------------------------------------
 # ADD
