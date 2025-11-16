@@ -68,6 +68,10 @@ app.add_middleware(
 class AddRequest(BaseModel):
     table: str
     data: Dict[str, Any]
+    
+class TableRequest(BaseModel):
+    name: str
+
 
 class UpdateRequest(BaseModel):
     table: str
@@ -380,6 +384,48 @@ def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
         if str(record.get(k, "")).lower() != v.lower():
             return False
     return True
+
+def _table_key(name: str) -> str:
+    return f"table:{name}"
+
+def _table_exists(name: str) -> bool:
+    return r.sismember("tables", name)
+
+def _create_table(name: str):
+    if _table_exists(name):
+        raise HTTPException(status_code=400, detail="Table already exists")
+    r.sadd("tables", name)
+    r.hset(_table_key(name), mapping={"created_at": int(time.time())})
+    return True
+
+def _delete_table(name: str):
+    if not _table_exists(name):
+        raise HTTPException(status_code=404, detail="Table not found")
+    r.delete(_table_key(name))
+    r.srem("tables", name)
+    return True
+
+@app.post("/createtable")
+def createtable(req: TableRequest):
+    _require_redis()
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+
+    _create_table(name)
+    return {"status": "success", "table": name}
+
+@app.delete("/deletetable")
+def deletetable(name: str):
+    _require_redis()
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+
+    _delete_table(name)
+    return {"status": "deleted", "table": name}
+
+
 
 @app.get("/fetch")
 def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
