@@ -366,29 +366,48 @@ def _sanitize_code(code: str) -> str:
     return code
 
 def _run_code(code: str, inputs: dict) -> dict:
-    # construct a very restricted builtins set
-    allowed = ('abs', 'all', 'any', 'bool', 'dict', 'float', 'int', 'len', 'list', 'max', 'min', 'range', 'str', 'sum', 'print')
-    safe_builtins = {}
-    for name in allowed:
-        if hasattr(builtins, name):
-            safe_builtins[name] = getattr(builtins, name)
-    env = {"__builtins__": safe_builtins, **inputs}
-    # create a local namespace for execution and expose 'input' as provided
-    local_ns: Dict[str, Any] = {"input": inputs}
+    # Only safe builtins
+    safe_builtins = {
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "float": float,
+        "int": int,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "range": range,
+        "str": str,
+        "sum": sum,
+        "print": print,
+        "Exception": Exception,
+    }
+
+    # Execution environment
+    env = {
+        "__builtins__": safe_builtins,
+        **inputs  # x, y, body, json, etc.
+    }
+
     try:
-        # Execute user code with restricted builtins and local namespace.
-        # The user code is expected to define a function named `handler` that accepts 'input' dict
-        exec(code, env, local_ns)
-        if "handler" in local_ns and callable(local_ns["handler"]):
-            try:
-                output = local_ns["handler"](inputs)
-                return {"output": output}
-            except Exception as e:
-                return {"error": str(e), "traceback": traceback.format_exc()}
-        # If no handler found, return locals for inspection (stringified)
-        return {"locals": {k: str(v) for k, v in local_ns.items()}}
+        exec(code, env)
     except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        return {"error": str(e)}
+
+    # Return ONLY result object
+    if "result" in env:
+        try:
+            # Ensure it's JSON serializable
+            json.dumps(env["result"])
+            return {"result": env["result"]}
+        except Exception:
+            return {"error": "Function returned a non-JSON-serializable value"}
+
+    return {"error": "No result returned from function"}
+
 
 def _save_local_function(fid: str, code: str, meta: dict):
     (LOCAL_FUNC_DIR / f"{fid}.py").write_text(code)
