@@ -8,9 +8,14 @@ from typing import Dict, Any, Optional, List, Tuple
 # --- Redis Cluster Support ---
 from redis.cluster import RedisCluster
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from pathlib import Path
+import traceback
+import re
+import builtins
 
 # ----------------------------------------------------------------------
 # Config
@@ -107,7 +112,8 @@ def _create_table(name: str):
         raise HTTPException(status_code=400, detail="Table already exists")
     r.sadd("tables", name)
     r.hset(_table_meta_key(name), mapping={"created_at": int(time.time())})
-    r.sadd(_table_ids_key(name), "_meta")  # ensures type consistency
+    # use a dedicated set for ids and add a sentinel value to ensure set type
+    r.sadd(_table_ids_key(name), "_meta")
     r.set(f"nextid:{name}", 0)
     return True
 
@@ -336,6 +342,144 @@ def deletetable(name: str):
         raise HTTPException(status_code=400, detail="Table name required")
     _delete_table(name)
     return {"status": "deleted", "table": name}
+
+# ----------------------------------------------------------------------
+# Function management module (plug-and-play)
+# ----------------------------------------------------------------------
+LOCAL_FUNC_DIR = Path("./local_functions")
+LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
+# simple unsafe token blacklist (adjust as needed)
+def _sanitize_code(code: str) -> str:
+    blocked = [r'\beval\b', r'\bexec\b', r'__import__', r'\bcompile\b', r'\bopen\b', r'\bos\.system\b', r'\bsubprocess\b', r'\bshlex\b', r'\bsocket\b']
+    for token in blocked:
+        if re.search(token, code):
+            raise ValueError(f"Blocked keyword used: {token}")
+    return code
+
+def _run_code(code: str, inputs: dict) -> dict:
+    # construct a very restricted builtins set
+    allowed = ('abs', 'all', 'any', 'bool', 'dict', 'float', 'int', 'len', 'list', 'max', 'min', 'range', 'str', 'sum', 'print')
+    safe_builtins = {}
+    for name in allowed:
+        if hasattr(builtins, name):
+            safe_builtins[name] = getattr(builtins, name)
+    env = {"__builtins__": safe_builtins}
+    # create a local namespace for execution and expose 'input' as provided
+    local_ns: Dict[str, Any] = {"input": inputs}
+    try:
+        # Execute user code with restricted builtins and local namespace.
+        # The user code is expected to define a function named `handler` that accepts 'input' dict
+        exec(code, env, local_ns)
+        if "handler" in local_ns and callable(local_ns["handler"]):
+            try:
+                output = local_ns["handler"](inputs)
+                return {"output": output}
+            except Exception as e:
+                return {"error": str(e), "traceback": traceback.format_exc()}
+        # If no handler found, return locals for inspection (stringified)
+        return {"locals": {k: str(v) for k, v in local_ns.items()}}
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+def _save_local_function(fid: str, code: str, meta: dict):
+    (LOCAL_FUNC_DIR / f"{fid}.py").write_text(code)
+    (LOCAL_FUNC_DIR / f"{fid}.meta.json").write_text(json.dumps(meta))
+
+def _load_local_function(fid: str):
+    code = None
+    meta = {}
+    code_path = LOCAL_FUNC_DIR / f"{fid}.py"
+    meta_path = LOCAL_FUNC_DIR / f"{fid}.meta.json"
+    if code_path.exists():
+        code = code_path.read_text()
+    try:
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+    except Exception:
+        meta = {}
+    return code, meta
+
+@app.post("/createfunction")
+async def create_function(file: UploadFile = File(...), name: str = Form(...)):
+    content = await file.read()
+    try:
+        code = _sanitize_code(content.decode())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    fid = f"func{int(time.time())}"
+    meta = {"name": name, "ts": int(time.time())}
+    if r:
+        try:
+            r.set(f"function:{fid}:code", code)
+            r.hset(f"function:{fid}:meta", mapping=meta)
+            return {"id": fid, "status": "created"}
+        except Exception:
+            # fallback to local
+            _save_local_function(fid, code, meta)
+            return {"id": fid, "status": "local"}
+    _save_local_function(fid, code, meta)
+    return {"id": fid, "status": "local"}
+
+@app.post("/runfunction")
+async def run_function(request: Request):
+    body = await request.json()
+    fid = body.get("id")
+    inputs = body.get("input", {})
+    if not fid:
+        raise HTTPException(status_code=400, detail="Function id required")
+    code = None
+    # Try Redis first
+    if r:
+        try:
+            code = r.get(f"function:{fid}:code")
+        except Exception:
+            code = None
+    if not code:
+        code, _ = _load_local_function(fid)
+    if not code:
+        return JSONResponse(status_code=404, content={"error": "Function not found"})
+    result = _run_code(code, inputs)
+    return {"result": result}
+
+@app.post("/updatefunction")
+async def update_function(id: str = Form(...), file: UploadFile = File(...), name: str = Form(...)):
+    content = await file.read()
+    try:
+        code = _sanitize_code(content.decode())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    meta = {"name": name, "ts": int(time.time())}
+    if r:
+        try:
+            r.set(f"function:{id}:code", code)
+            r.hset(f"function:{id}:meta", mapping=meta)
+            return {"id": id, "status": "updated"}
+        except Exception:
+            _save_local_function(id, code, meta)
+            return {"id": id, "status": "updated_local"}
+    _save_local_function(id, code, meta)
+    return {"id": id, "status": "updated_local"}
+
+@app.delete("/deletefunction")
+def delete_function(id: str):
+    deleted = False
+    if r:
+        try:
+            r.delete(f"function:{id}:code")
+            r.delete(f"function:{id}:meta")
+            deleted = True
+        except Exception:
+            pass
+    try:
+        (LOCAL_FUNC_DIR / f"{id}.py").unlink(missing_ok=True)
+        (LOCAL_FUNC_DIR / f"{id}.meta.json").unlink(missing_ok=True)
+        deleted = True
+    except Exception:
+        pass
+    if deleted:
+        return {"id": id, "status": "deleted"}
+    raise HTTPException(status_code=404, detail="Function not found")
 
 # ----------------------------------------------------------------------
 # ADD
