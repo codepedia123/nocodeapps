@@ -43,6 +43,14 @@ def _init_redis() -> Optional[redis.Redis]:
 
 r = _init_redis()
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
+safe_builtins = {
+    "abs": abs, "all": all, "any": any, "bool": bool,
+    "dict": dict, "float": float, "int": int, "len": len,
+    "list": list, "max": max, "min": min, "range": range,
+    "str": str, "sum": sum, "print": print,
+    "Exception": Exception
+}
+
 
 app = FastAPI(title="SMS Runtime Backend")
 
@@ -364,7 +372,7 @@ def _run_code(code: str, inputs: dict) -> dict:
     for name in allowed:
         if hasattr(builtins, name):
             safe_builtins[name] = getattr(builtins, name)
-    env = {"__builtins__": safe_builtins}
+    env = {"__builtins__": safe_builtins, **inputs}
     # create a local namespace for execution and expose 'input' as provided
     local_ns: Dict[str, Any] = {"input": inputs}
     try:
