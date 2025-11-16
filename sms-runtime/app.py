@@ -15,15 +15,6 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-# NOTE: default uses TLS (rediss) for ElastiCache with transit encryption enabled.
-# You can override by setting the REDIS_URL environment variable on the server.
-
-# REMOVE the old single-node client line:
-# r = redis.Redis.from_url(...)
-
-# ----------------------------------------------------------------------
-# Redis connection (safe, non-blocking) -- UPDATED FOR CLUSTER MODE
-# ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
         redis_url = (
@@ -33,7 +24,7 @@ def _init_redis() -> Optional[redis.Redis]:
         client = RedisCluster.from_url(
             redis_url,
             decode_responses=True,
-            ssl_cert_reqs=None,   # skip cert validation
+            ssl_cert_reqs=None,
             socket_connect_timeout=5,
             socket_timeout=5,
             read_from_replicas=True
@@ -45,11 +36,7 @@ def _init_redis() -> Optional[redis.Redis]:
         print(f"⚠️ Redis cluster connection failed: {e}")
         return None
 
-# initialize once at import time but with safe timeouts
 r = _init_redis()
-
-# Maximum number of sequential ids to pipeline directly. If next_id is larger,
-# we fall back to scanning the membership set to avoid huge pipelines.
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 
 app = FastAPI(title="SMS Runtime Backend")
@@ -71,7 +58,6 @@ class AddRequest(BaseModel):
     
 class TableRequest(BaseModel):
     name: str
-
 
 class UpdateRequest(BaseModel):
     table: str
@@ -103,6 +89,32 @@ def _convo_msg_key(agent_name: str, phone: str) -> str:
 def _convo_meta_key(agent_name: str, phone: str) -> str:
     return f"convo_meta:{agent_name}:{phone}"
 
+def _table_key(name: str) -> str:
+    return f"table:{name}"
+
+def _table_exists(name: str) -> bool:
+    return r.sismember("tables", name)
+
+def _create_table(name: str):
+    if _table_exists(name):
+        raise HTTPException(status_code=400, detail="Table already exists")
+    r.sadd("tables", name)
+    r.hset(_table_key(name), mapping={"created_at": int(time.time())})
+    return True
+
+def _delete_table(name: str):
+    if not _table_exists(name):
+        raise HTTPException(status_code=404, detail="Table not found")
+    # Delete all rows for this table
+    table_key = _table_key(name)
+    row_ids = r.smembers(table_key)
+    for row_id in row_ids:
+        r.delete(f"{table_key}:{row_id}")
+    r.delete(table_key)
+    r.srem("tables", name)
+    r.delete(f"nextid:{name}")
+    return True
+
 # get numeric suffix ids for keys like user:N or agent:N
 def _all_numeric_suffix_ids(prefix: str) -> List[int]:
     ids = []
@@ -124,15 +136,11 @@ def compact_users() -> Dict[str, Any]:
         r.set("next_user_id", 0)
         r.delete("users")
         return {"status": "ok", "users_before": 0, "users_after": 0}
-
     mapping: Dict[int, int] = {}
     for new_idx, old_id in enumerate(ids, start=1):
         mapping[old_id] = new_idx
-
     temp_map: Dict[str, Tuple[int, int]] = {}
     uid_uuid = uuid.uuid4().hex
-
-    # rename to temp keys to avoid collisions
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             continue
@@ -144,26 +152,22 @@ def compact_users() -> Dict[str, Any]:
             r.delete(temp_key)
         r.rename(old_key, temp_key)
         temp_map[temp_key] = (old_id, new_id)
-
     final_ids: List[int] = []
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             key = _user_key(old_id)
             if r.exists(key):
                 final_ids.append(new_id)
-
     for temp_key, (old_id, new_id) in temp_map.items():
         final_key = _user_key(new_id)
         if r.exists(final_key):
             r.delete(final_key)
         r.rename(temp_key, final_key)
         final_ids.append(new_id)
-
     final_ids = sorted(set(final_ids))
     r.delete("users")
     for uid in final_ids:
         r.sadd("users", str(uid))
-
     old_to_new = {old: new for old, new in mapping.items() if old != new}
     for aid in list(r.smembers("agents")):
         try:
@@ -176,7 +180,6 @@ def compact_users() -> Dict[str, Any]:
                     r.hset(aid, "user_id", str(old_to_new[old_uid]))
         except Exception:
             continue
-
     r.set("next_user_id", len(final_ids))
     return {"status": "ok", "users_before": len(ids), "users_after": len(final_ids)}
 
@@ -195,29 +198,23 @@ def compact_agents() -> Dict[str, Any]:
         r.set("next_agent_id", 0)
         r.delete("agents")
         return {"status": "ok", "agents_before": 0, "agents_after": 0}
-
     mapping: Dict[int, int] = {}
     for new_idx, old_id in enumerate(ids, start=1):
         mapping[old_id] = new_idx
-
     agent_uuid = uuid.uuid4().hex
-
     for old_id, new_id in mapping.items():
         if old_id == new_id:
             continue
         old_name = _agent_name(old_id)
         new_name = _agent_name(new_id)
         temp_agent = f"tmp:rekey:agent:{agent_uuid}:{old_id}"
-
         if r.exists(old_name):
             if r.exists(temp_agent):
                 r.delete(temp_agent)
             r.rename(old_name, temp_agent)
-
         if r.sismember("agents", old_name):
             r.srem("agents", old_name)
             r.sadd("agents", temp_agent)
-
         convs = _collect_conversations_for_agent(old_name)
         for ck in convs:
             try:
@@ -230,7 +227,6 @@ def compact_agents() -> Dict[str, Any]:
                 if r.exists(temp_msg):
                     r.delete(temp_msg)
                 r.rename(old_msg, temp_msg)
-
             old_meta = _convo_meta_key(old_name, phone)
             temp_meta = _convo_meta_key(temp_agent, phone)
             if r.exists(old_meta):
@@ -241,19 +237,15 @@ def compact_agents() -> Dict[str, Any]:
                     r.hset(temp_meta, "agent_id", temp_agent)
                 except Exception:
                     pass
-
             r.srem("conversations", ck)
             r.sadd("conversations", f"{temp_agent}:{phone}")
-
         if r.exists(temp_agent):
             if r.exists(new_name):
                 r.delete(new_name)
             r.rename(temp_agent, new_name)
-
         if r.sismember("agents", temp_agent):
             r.srem("agents", temp_agent)
             r.sadd("agents", new_name)
-
         convs_temp = _collect_conversations_for_agent(temp_agent)
         for tck in convs_temp:
             try:
@@ -266,7 +258,6 @@ def compact_agents() -> Dict[str, Any]:
                 if r.exists(final_msg):
                     r.delete(final_msg)
                 r.rename(temp_msg, final_msg)
-
             temp_meta = _convo_meta_key(temp_agent, phone)
             final_meta = _convo_meta_key(new_name, phone)
             if r.exists(temp_meta):
@@ -277,11 +268,9 @@ def compact_agents() -> Dict[str, Any]:
                     r.hset(final_meta, "agent_id", new_name)
                 except Exception:
                     pass
-
             if r.sismember("conversations", tck):
                 r.srem("conversations", tck)
                 r.sadd("conversations", f"{new_name}:{phone}")
-
     r.delete("agents")
     final_agent_ids = []
     for new_idx in sorted(mapping.values()):
@@ -289,7 +278,6 @@ def compact_agents() -> Dict[str, Any]:
         if r.exists(name):
             r.sadd("agents", name)
             final_agent_ids.append(new_idx)
-
     r.set("next_agent_id", len(final_agent_ids))
     return {"status": "ok", "agents_before": len(ids), "agents_after": len(final_agent_ids)}
 
@@ -310,13 +298,33 @@ def health():
             redis_error = str(e)
     else:
         redis_error = "Redis client not initialized"
-
     return {
         "message": "SMS Runtime Backend Live!",
         "redis": redis_status,
         "redis_error": redis_error,
         "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
     }
+
+# ----------------------------------------------------------------------
+# TABLE CREATE/DELETE ENDPOINTS
+# ----------------------------------------------------------------------
+@app.post("/createtable")
+def createtable(req: TableRequest):
+    _require_redis()
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+    _create_table(name)
+    return {"status": "success", "table": name}
+
+@app.delete("/deletetable")
+def deletetable(name: str):
+    _require_redis()
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+    _delete_table(name)
+    return {"status": "deleted", "table": name}
 
 # ----------------------------------------------------------------------
 # ADD
@@ -328,6 +336,19 @@ def add_endpoint(req: AddRequest):
     ts = int(time.time())
     data["created_at"] = ts
     data["updated_at"] = ts
+
+    # --- Dynamic Table Support ---
+    if req.table not in ["users", "agents", "conversations"]:
+        if not _table_exists(req.table):
+            raise HTTPException(status_code=404, detail="Table does not exist")
+        table_key = _table_key(req.table)
+        next_id_key = f"nextid:{req.table}"
+        next_id = int(r.get(next_id_key) or 0) + 1
+        r.set(next_id_key, next_id)
+        row_key = f"{table_key}:{next_id}"
+        r.hset(row_key, mapping=data)
+        r.sadd(table_key, next_id)  # Track row IDs
+        return {"id": str(next_id), "table": req.table, "status": "success"}
 
     if req.table == "users":
         nxt = _get_next_user_id() + 1
@@ -385,52 +406,28 @@ def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
             return False
     return True
 
-def _table_key(name: str) -> str:
-    return f"table:{name}"
-
-def _table_exists(name: str) -> bool:
-    return r.sismember("tables", name)
-
-def _create_table(name: str):
-    if _table_exists(name):
-        raise HTTPException(status_code=400, detail="Table already exists")
-    r.sadd("tables", name)
-    r.hset(_table_key(name), mapping={"created_at": int(time.time())})
-    return True
-
-def _delete_table(name: str):
-    if not _table_exists(name):
-        raise HTTPException(status_code=404, detail="Table not found")
-    r.delete(_table_key(name))
-    r.srem("tables", name)
-    return True
-
-@app.post("/createtable")
-def createtable(req: TableRequest):
-    _require_redis()
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-
-    _create_table(name)
-    return {"status": "success", "table": name}
-
-@app.delete("/deletetable")
-def deletetable(name: str):
-    _require_redis()
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-
-    _delete_table(name)
-    return {"status": "deleted", "table": name}
-
-
-
 @app.get("/fetch")
 def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
     _require_redis()
     filt = _parse_filters(filters)
+
+    # --- Dynamic Table Fetch ---
+    if table not in ["users", "agents", "conversations"]:
+        if not _table_exists(table):
+            raise HTTPException(status_code=404, detail="Table does not exist")
+        table_key = _table_key(table)
+        ids = r.smembers(table_key)
+        out = {}
+        if id:
+            row_key = f"{table_key}:{id}"
+            rec = r.hgetall(row_key)
+            return rec if rec else {}
+        for row_id in ids:
+            row_key = f"{table_key}:{row_id}"
+            rec = r.hgetall(row_key)
+            if rec:
+                out[row_id] = rec
+        return out
 
     # USERS - batch HGETALL via pipeline
     if table == "users":
@@ -447,27 +444,19 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["last_active"] = int(rec.get("last_active", 0))
             rec["created_at"] = int(rec.get("created_at", 0))
             return rec if _matches(rec, filt) else {}
-
         max_id = _get_next_user_id()
         out: Dict[str, Any] = {}
-
-        # If max_id is reasonable, pipeline sequential keys 1..max_id
         if max_id > 0 and max_id <= MAX_FETCH_KEYS:
             keys = [_user_key(uid) for uid in range(1, max_id + 1)]
         else:
-            # fallback: iterate over set 'users' to get actual keys (keeps pipeline smaller)
             members = r.smembers("users")
             keys = [_user_key(int(x)) for x in sorted([int(x) for x in members])]
-
         if not keys:
             return out
-
         pipe = r.pipeline()
         for k in keys:
             pipe.hgetall(k)
         results = pipe.execute()
-
-        # results correspond to keys; include only non-empty hgetall
         for uid, rec in zip([int(k.split(":")[1]) for k in keys], results):
             if rec:
                 rec.setdefault("name", "")
@@ -491,24 +480,19 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             rec["created_at"] = int(rec.get("created_at", 0))
             rec["updated_at"] = int(rec.get("updated_at", 0))
             return rec if _matches(rec, filt) else {}
-
         max_agent = _get_next_agent_id()
         out: Dict[str, Any] = {}
-
         if max_agent > 0 and max_agent <= MAX_FETCH_KEYS:
             agent_keys = [_agent_name(n) for n in range(1, max_agent + 1)]
         else:
             members = r.smembers("agents")
             agent_keys = sorted(list(members))
-
         if not agent_keys:
             return out
-
         pipe = r.pipeline()
         for aid in agent_keys:
             pipe.hgetall(aid)
         results = pipe.execute()
-
         for aid, rec in zip(agent_keys, results):
             if rec:
                 rec.setdefault("prompt", "")
@@ -542,27 +526,21 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                 if not msgs:
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
-
         out: Dict[str, Any] = {}
         convs = list(r.smembers("conversations"))
         if not convs:
             return out
-
         pipe = r.pipeline()
-        # for each conversation, queue LRANGE and HGETALL; store order
         for ck in convs:
             try:
                 agent_id, phone = ck.split(":", 1)
             except ValueError:
-                # skip malformed entries
                 continue
             msg_key = _convo_msg_key(agent_id, phone)
             meta_key = _convo_meta_key(agent_id, phone)
             pipe.lrange(msg_key, 0, -1)
             pipe.hgetall(meta_key)
-
         results = pipe.execute()
-        # results are in pairs [lrange1, hgetall1, lrange2, hgetall2, ...]
         it = iter(results)
         i = 0
         for ck in convs:
@@ -598,6 +576,17 @@ def update_endpoint(req: UpdateRequest):
     updates = req.updates.copy()
     updates["updated_at"] = ts
 
+    # --- Dynamic Table Update ---
+    if req.table not in ["users", "agents", "conversations"]:
+        if not _table_exists(req.table):
+            raise HTTPException(status_code=404, detail="Table does not exist")
+        table_key = _table_key(req.table)
+        row_key = f"{table_key}:{req.id}"
+        if not r.exists(row_key):
+            raise HTTPException(status_code=404, detail="Row not found")
+        r.hset(row_key, mapping=updates)
+        return {"status": "success", "id": req.id}
+
     if req.table == "users":
         try:
             uid = int(req.id)
@@ -627,7 +616,6 @@ def update_endpoint(req: UpdateRequest):
         msg_key = _convo_msg_key(agent_id, phone)
         if not r.exists(meta_key) and not r.exists(msg_key):
             raise HTTPException(status_code=404, detail="Conversation not found")
-
         if "append" in updates:
             for m in updates.pop("append"):
                 r.rpush(msg_key, json.dumps(m))
@@ -643,6 +631,18 @@ def update_endpoint(req: UpdateRequest):
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
     _require_redis()
+
+    # --- Dynamic Table Delete ---
+    if table not in ["users", "agents", "conversations"]:
+        if not _table_exists(table):
+            raise HTTPException(status_code=404, detail="Table does not exist")
+        table_key = _table_key(table)
+        row_key = f"{table_key}:{id}"
+        if r.exists(row_key):
+            r.delete(row_key)
+            r.srem(table_key, id)
+            return {"status": "deleted", "id": id}
+        raise HTTPException(status_code=404, detail="Row not found")
 
     if table == "users":
         try:
@@ -667,7 +667,6 @@ def delete_endpoint(table: str, id: str):
                 idx = int(id)
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid agent id")
-
         aid_name = _agent_name(idx)
         if r.delete(aid_name):
             r.srem("agents", aid_name)
