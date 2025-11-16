@@ -6,7 +6,7 @@ import uuid
 from typing import Dict, Any, Optional, List, Tuple
 
 # --- Redis Cluster Support ---
-from redis.cluster import RedisCluster  # <-- only this import changed!
+from redis.cluster import RedisCluster
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,8 +89,15 @@ def _convo_msg_key(agent_name: str, phone: str) -> str:
 def _convo_meta_key(agent_name: str, phone: str) -> str:
     return f"convo_meta:{agent_name}:{phone}"
 
-def _table_key(name: str) -> str:
-    return f"table:{name}"
+# --- NEW: Table helpers for correct Redis key management ---
+def _table_meta_key(name: str) -> str:
+    return f"table:{name}:meta"
+
+def _table_ids_key(name: str) -> str:
+    return f"table:{name}:ids"
+
+def _table_row_key(name: str, rowid: str) -> str:
+    return f"table:{name}:row:{rowid}"
 
 def _table_exists(name: str) -> bool:
     return r.sismember("tables", name)
@@ -99,18 +106,22 @@ def _create_table(name: str):
     if _table_exists(name):
         raise HTTPException(status_code=400, detail="Table already exists")
     r.sadd("tables", name)
-    r.hset(_table_key(name), mapping={"created_at": int(time.time())})
+    r.hset(_table_meta_key(name), mapping={"created_at": int(time.time())})
+    r.sadd(_table_ids_key(name), "_meta")  # ensures type consistency
+    r.set(f"nextid:{name}", 0)
     return True
 
 def _delete_table(name: str):
     if not _table_exists(name):
         raise HTTPException(status_code=404, detail="Table not found")
     # Delete all rows for this table
-    table_key = _table_key(name)
-    row_ids = r.smembers(table_key)
+    ids_key = _table_ids_key(name)
+    row_ids = r.smembers(ids_key)
     for row_id in row_ids:
-        r.delete(f"{table_key}:{row_id}")
-    r.delete(table_key)
+        if row_id != "_meta":
+            r.delete(_table_row_key(name, row_id))
+    r.delete(_table_meta_key(name))
+    r.delete(ids_key)
     r.srem("tables", name)
     r.delete(f"nextid:{name}")
     return True
@@ -341,13 +352,13 @@ def add_endpoint(req: AddRequest):
     if req.table not in ["users", "agents", "conversations"]:
         if not _table_exists(req.table):
             raise HTTPException(status_code=404, detail="Table does not exist")
-        table_key = _table_key(req.table)
+        ids_key = _table_ids_key(req.table)
         next_id_key = f"nextid:{req.table}"
         next_id = int(r.get(next_id_key) or 0) + 1
         r.set(next_id_key, next_id)
-        row_key = f"{table_key}:{next_id}"
+        row_key = _table_row_key(req.table, next_id)
         r.hset(row_key, mapping=data)
-        r.sadd(table_key, next_id)  # Track row IDs
+        r.sadd(ids_key, next_id)
         return {"id": str(next_id), "table": req.table, "status": "success"}
 
     if req.table == "users":
@@ -415,15 +426,17 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
     if table not in ["users", "agents", "conversations"]:
         if not _table_exists(table):
             raise HTTPException(status_code=404, detail="Table does not exist")
-        table_key = _table_key(table)
-        ids = r.smembers(table_key)
+        ids_key = _table_ids_key(table)
+        ids = r.smembers(ids_key)
         out = {}
         if id:
-            row_key = f"{table_key}:{id}"
+            row_key = _table_row_key(table, id)
             rec = r.hgetall(row_key)
             return rec if rec else {}
         for row_id in ids:
-            row_key = f"{table_key}:{row_id}"
+            if row_id == "_meta":
+                continue
+            row_key = _table_row_key(table, row_id)
             rec = r.hgetall(row_key)
             if rec:
                 out[row_id] = rec
@@ -580,8 +593,7 @@ def update_endpoint(req: UpdateRequest):
     if req.table not in ["users", "agents", "conversations"]:
         if not _table_exists(req.table):
             raise HTTPException(status_code=404, detail="Table does not exist")
-        table_key = _table_key(req.table)
-        row_key = f"{table_key}:{req.id}"
+        row_key = _table_row_key(req.table, req.id)
         if not r.exists(row_key):
             raise HTTPException(status_code=404, detail="Row not found")
         r.hset(row_key, mapping=updates)
@@ -636,11 +648,11 @@ def delete_endpoint(table: str, id: str):
     if table not in ["users", "agents", "conversations"]:
         if not _table_exists(table):
             raise HTTPException(status_code=404, detail="Table does not exist")
-        table_key = _table_key(table)
-        row_key = f"{table_key}:{id}"
+        ids_key = _table_ids_key(table)
+        row_key = _table_row_key(table, id)
         if r.exists(row_key):
             r.delete(row_key)
-            r.srem(table_key, id)
+            r.srem(ids_key, id)
             return {"status": "deleted", "id": id}
         raise HTTPException(status_code=404, detail="Row not found")
 
