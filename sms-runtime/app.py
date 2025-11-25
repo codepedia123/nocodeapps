@@ -359,14 +359,39 @@ LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 
 # simple unsafe token blacklist (adjust as needed)
 def _sanitize_code(code: str) -> str:
-    blocked = [r'\beval\b', r'\bexec\b', r'__import__', r'\bcompile\b', r'\bopen\b', r'\bos\.system\b', r'\bsubprocess\b', r'\bshlex\b', r'\bsocket\b']
+    blocked = [
+        r'\beval\b',
+        r'\bexec\b',
+        r'\bcompile\b',
+        r'\bopen\b',
+        r'\bos\b',
+        r'\bsys\b',
+        r'\bsubprocess\b',
+        r'\bsocket\b',
+        r'\bthreading\b',
+        r'\bmultiprocessing\b',
+        r'\bimportlib\b'
+    ]
     for token in blocked:
         if re.search(token, code):
             raise ValueError(f"Blocked keyword used: {token}")
     return code
 
+
 def _run_code(code: str, inputs: dict) -> dict:
-    # Only safe builtins
+    # Allowed modules
+    allowed_modules = {
+        "json": __import__("json"),
+        "time": __import__("time"),
+        "datetime": __import__("datetime"),
+        "math": __import__("math"),
+        "re": __import__("re"),
+        "uuid": __import__("uuid"),
+        "random": __import__("random"),
+        "requests": __import__("requests"),
+    }
+
+    # Safe builtins
     safe_builtins = {
         "abs": abs,
         "all": all,
@@ -384,12 +409,15 @@ def _run_code(code: str, inputs: dict) -> dict:
         "sum": sum,
         "print": print,
         "Exception": Exception,
+        "__import__": lambda name: allowed_modules[name]
+            if name in allowed_modules
+            else (_ for _ in ()).throw(Exception(f"Import '{name}' not allowed")),
     }
 
-    # Execution environment
     env = {
         "__builtins__": safe_builtins,
-        **inputs  # x, y, body, json, etc.
+        **allowed_modules,
+        **inputs
     }
 
     try:
@@ -397,16 +425,15 @@ def _run_code(code: str, inputs: dict) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-    # Return ONLY result object
     if "result" in env:
         try:
-            # Ensure it's JSON serializable
             json.dumps(env["result"])
             return {"result": env["result"]}
         except Exception:
             return {"error": "Function returned a non-JSON-serializable value"}
 
     return {"error": "No result returned from function"}
+
 
 
 def _save_local_function(fid: str, code: str, meta: dict):
