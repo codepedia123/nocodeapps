@@ -409,7 +409,10 @@ def _run_code(code: str, inputs: dict) -> dict:
         "sum": sum,
         "print": print,
         "Exception": Exception,
-        "__import__": lambda name: allowed_modules[name]
+        "__import__": lambda name, globals=None, locals=None, fromlist=None, level=0:
+    allowed_modules[name] if name in allowed_modules
+    else (_ for _ in ()).throw(Exception(f"Import '{name}' not allowed"))
+
             if name in allowed_modules
             else (_ for _ in ()).throw(Exception(f"Import '{name}' not allowed")),
     }
