@@ -51,7 +51,6 @@ safe_builtins = {
     "Exception": Exception
 }
 
-
 app = FastAPI(title="SMS Runtime Backend")
 
 app.add_middleware(
@@ -391,6 +390,11 @@ def _run_code(code: str, inputs: dict) -> dict:
         "requests": __import__("requests"),
     }
 
+    def restricted_import(name, globals=None, locals=None, fromlist=None, level=0):
+        if name in allowed_modules:
+            return allowed_modules[name]
+        raise Exception(f"Import '{name}' not allowed")
+
     # Safe builtins
     safe_builtins = {
         "abs": abs,
@@ -409,12 +413,8 @@ def _run_code(code: str, inputs: dict) -> dict:
         "sum": sum,
         "print": print,
         "Exception": Exception,
-        "__import__": lambda name, globals=None, locals=None, fromlist=None, level=0:
-    allowed_modules[name] if name in allowed_modules
-    else (_ for _ in ()).throw(Exception(f"Import '{name}' not allowed"))
-
-            if name in allowed_modules
-            else (_ for _ in ()).throw(Exception(f"Import '{name}' not allowed")),
+        "isinstance": isinstance,
+        "__import__": restricted_import,
     }
 
     env = {
@@ -431,12 +431,11 @@ def _run_code(code: str, inputs: dict) -> dict:
     if "result" in env:
         try:
             json.dumps(env["result"])
-            return {"result": env["result"]}
+            return env["result"]
         except Exception:
             return {"error": "Function returned a non-JSON-serializable value"}
 
     return {"error": "No result returned from function"}
-
 
 
 def _save_local_function(fid: str, code: str, meta: dict):
@@ -479,12 +478,35 @@ async def create_function(file: UploadFile = File(...), name: str = Form(...)):
     return {"id": fid, "status": "local"}
 
 @app.post("/runfunction")
-async def run_function(request: Request):
-    body = await request.json()
+async def run_function(request: Request, id: Optional[str] = None):
+    # Parse body, but be tolerant if body is missing or not JSON
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if not isinstance(body, dict):
+        body = {}
+
+    # Primary: get function id from body["id"]
     fid = body.get("id")
-    inputs = body.get("input", {})
+
+    # Secondary: if no id in body, use query parameter ?id=...
+    if not fid:
+        fid = id
+
     if not fid:
         raise HTTPException(status_code=400, detail="Function id required")
+
+    # Primary: if body.input exists and is a non-empty dict, use that
+    inputs: Dict[str, Any] = {}
+    input_obj = body.get("input")
+    if isinstance(input_obj, dict) and len(input_obj) > 0:
+        inputs = input_obj
+    else:
+        # Secondary: use entire body as input, optionally dropping "id"
+        inputs = {k: v for k, v in body.items() if k != "id"}
+
     code = None
     # Try Redis first
     if r:
@@ -496,6 +518,7 @@ async def run_function(request: Request):
         code, _ = _load_local_function(fid)
     if not code:
         return JSONResponse(status_code=404, content={"error": "Function not found"})
+
     result = _run_code(code, inputs)
     return {"result": result}
 
@@ -756,7 +779,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             pipe.hgetall(meta_key)
         results = pipe.execute()
         it = iter(results)
-        i = 0
         for ck in convs:
             try:
                 agent_id, phone = ck.split(":", 1)
@@ -775,7 +797,6 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             meta["updated_at"] = int(meta.get("updated_at", 0))
             if not filt or any(_matches(m, filt) for m in msgs):
                 out[ck] = {"messages": msgs, "meta": meta}
-            i += 1
         return out
 
     raise HTTPException(status_code=400, detail="Invalid table")
