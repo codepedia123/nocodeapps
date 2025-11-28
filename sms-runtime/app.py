@@ -22,24 +22,25 @@ import builtins
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        redis_url = (
-            "rediss://new1:MyStrongPass2025%21"
-            "@clustercfg.nocodeapps-redis.sm3cdo.use1.cache.amazonaws.com:6379"
-        )
+        redis_url = "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379"
+
         client = RedisCluster.from_url(
             redis_url,
             decode_responses=True,
-            ssl_cert_reqs=None,
-            socket_connect_timeout=5,
-            socket_timeout=5,
+            ssl_cert_reqs=None,           # serverless does not require cert validation
+            socket_connect_timeout=3,
+            socket_timeout=3,
             read_from_replicas=True
         )
+
         client.ping()
-        print("✅ Redis Cluster TLS connection successful")
+        print("✅ Connected to Valkey Serverless")
         return client
+
     except Exception as e:
-        print(f"⚠️ Redis cluster connection failed: {e}")
+        print(f"❌ Redis connection failed: {e}")
         return None
+
 
 r = _init_redis()
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
