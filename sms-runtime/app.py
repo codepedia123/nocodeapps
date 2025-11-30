@@ -16,6 +16,7 @@ from pathlib import Path
 import traceback
 import re
 import builtins
+import threading
 
 # ----------------------------------------------------------------------
 # Config
@@ -354,6 +355,8 @@ def deletetable(name: str):
 # ----------------------------------------------------------------------
 # Function management module (plug-and-play)
 # ----------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
 LOCAL_FUNC_DIR = Path("./local_functions")
 LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -456,6 +459,18 @@ def _load_local_function(fid: str):
     except Exception:
         meta = {}
     return code, meta
+
+def _find_project_file(filename: str) -> Optional[Path]:
+    # Normalize to a .py filename
+    if not filename.endswith(".py"):
+        filename = f"{filename}.py"
+    try:
+        for p in BASE_DIR.rglob(filename):
+            if p.name == filename:
+                return p
+    except Exception as e:
+        print(f"Error scanning project files: {e}")
+    return None
 
 @app.post("/createfunction")
 async def create_function(file: UploadFile = File(...), name: str = Form(...)):
@@ -561,6 +576,45 @@ def delete_function(id: str):
     if deleted:
         return {"id": id, "status": "deleted"}
     raise HTTPException(status_code=404, detail="Function not found")
+
+# ----------------------------------------------------------------------
+# NEW: /int endpoint to run project Python files by name
+# ----------------------------------------------------------------------
+@app.api_route("/int", methods=["GET", "POST"])
+async def int_endpoint(file: str):
+    """
+    Trigger execution of a project-level Python file.
+
+    Example:
+      POST /int?file=a2p_brand_full_regis
+      will search for a2p_brand_full_regis.py under sms-runtime/ and run it.
+    """
+    target = _find_project_file(file)
+    if not target:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+    def runner():
+        try:
+            code = target.read_text()
+            env = {
+                "__name__": "__main__",
+                "__file__": str(target),
+            }
+            exec(compile(code, str(target), "exec"), env)
+        except Exception as e:
+            print(f"Error running job {job_id} for {target}: {e}")
+            traceback.print_exc()
+
+    threading.Thread(target=runner, daemon=True).start()
+
+    return {
+        "status": "started",
+        "file": target.name,
+        "path": str(target),
+        "job_id": job_id,
+    }
 
 # ----------------------------------------------------------------------
 # ADD
