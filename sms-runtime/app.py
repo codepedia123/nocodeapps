@@ -917,6 +917,57 @@ def update_endpoint(req: UpdateRequest):
 # ----------------------------------------------------------------------
 # DELETE with automatic compaction
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# DELETE ALL RECORDS OF A DYNAMIC TABLE (but keep the table itself)
+# ----------------------------------------------------------------------
+@app.delete("/table/clear")
+def clear_dynamic_table(name: str):
+    """
+    Deletes ALL rows inside a dynamic table but keeps the table definition.
+    Does NOT remove the table from the global 'tables' set.
+    Example:
+        DELETE /table/clear?name=log
+    """
+    _require_redis()
+    name = name.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+
+    if name in ["users", "agents", "conversations"]:
+        raise HTTPException(status_code=400, detail="Cannot clear system tables")
+
+    # Validate table exists
+    if not _table_exists(name):
+        raise HTTPException(status_code=404, detail="Table does not exist")
+
+    ids_key = _table_ids_key(name)
+    row_ids = r.smembers(ids_key)
+
+    # Delete all rows
+    deleted_count = 0
+    for rid in row_ids:
+        if rid == "_meta":
+            continue
+        r.delete(_table_row_key(name, rid))
+        deleted_count += 1
+
+    # Reset table id set and nextid counter
+    r.delete(ids_key)
+    r.sadd(ids_key, "_meta")
+    r.set(f"nextid:{name}", 0)
+
+    # Optionally clear meta:
+    r.delete(_table_meta_key(name))
+    r.hset(_table_meta_key(name), mapping={"created_at": int(time.time())})
+
+    return {
+        "status": "success",
+        "table": name,
+        "deleted_rows": deleted_count,
+        "message": f"All rows cleared for table '{name}'"
+    }
+
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
     _require_redis()
