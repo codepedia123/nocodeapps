@@ -4,6 +4,7 @@ import requests
 import time
 import threading
 import traceback
+import json
 from datetime import datetime
 
 # =====================================================================
@@ -56,23 +57,30 @@ FUNCTION_ID_AFTER_APPROVAL = "func1764069347"
 # =====================================================================
 # LOGGING (UNCHANGED)
 # =====================================================================
+
+
 def log(step, payload=None):
     try:
+        if payload is not None and not isinstance(payload, str):
+            payload = json.dumps(payload)  # FIX HERE
+
         body = {
             "table": LOG_TABLE,
             "data": {
                 "step": step,
-                "payload": payload or {},
+                "payload": payload or "{}",
                 "timestamp": datetime.utcnow().isoformat(),
             }
         }
+
         requests.post(
             BACKEND_BASE_URL + "/add",
             json=body,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_DEFAULT)
         )
     except Exception:
-        pass  # logging must NEVER break execution
+        pass
+
 
 
 
