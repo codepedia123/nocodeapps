@@ -5,6 +5,7 @@ import time
 import threading
 import traceback
 import json
+import base64
 from datetime import datetime
 
 # =====================================================================
@@ -53,16 +54,13 @@ TRUSTHUB_AUTH_HEADERS = {
 FUNCTION_ID_AFTER_APPROVAL = "func1764069347"
 
 
-
 # =====================================================================
 # LOGGING (UNCHANGED)
 # =====================================================================
-
-
 def log(step, payload=None):
     try:
         if payload is not None and not isinstance(payload, str):
-            payload = json.dumps(payload)  # FIX HERE
+            payload = json.dumps(payload)
 
         body = {
             "table": LOG_TABLE,
@@ -82,8 +80,6 @@ def log(step, payload=None):
         pass
 
 
-
-
 # =====================================================================
 # SAFE JSON PARSER (UNCHANGED)
 # =====================================================================
@@ -96,7 +92,6 @@ def safe_get_json(response, context):
         except Exception:
             status = "unknown"
         raise Exception(f"{context}: invalid JSON response (status {status})")
-
 
 
 # =====================================================================
@@ -165,24 +160,38 @@ def fetch_in_review_records():
     raise Exception("Unexpected fetch retry loop exit")
 
 
+# =====================================================================
+# PER RECORD TRUSTHUB AUTH HEADER (NEW)
+# =====================================================================
+def build_trusthub_auth_headers(account_sid, auth_token):
+    if not account_sid or not auth_token:
+        raise Exception("Missing Twilio account_sid or auth token for this record")
+    raw = f"{account_sid}:{auth_token}"
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {encoded}"}
+
 
 # =====================================================================
-# TWILIO CUSTOMER PROFILE STATUS (UNCHANGED)
+# TWILIO CUSTOMER PROFILE STATUS (UPDATED FOR PER RECORD AUTH)
 # =====================================================================
-def fetch_customer_profile_status(customer_profile_sid):
+def fetch_customer_profile_status(customer_profile_sid, account_sid, auth_token):
     if not customer_profile_sid:
         raise Exception("Customer profile SID is missing")
 
+    headers = build_trusthub_auth_headers(account_sid, auth_token)
     url = f"{TRUSTHUB_CUSTOMER_PROFILE_BASE}/{customer_profile_sid}"
-    log("twilio_request_sent", {"url": url})
+    log("twilio_request_sent", {"url": url, "account_sid": account_sid})
 
     try:
         resp = requests.get(
             url,
-            headers=TRUSTHUB_AUTH_HEADERS,
+            headers=headers,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT_DEFAULT),
         )
-        log("twilio_response_received", {"status": resp.status_code, "text": resp.text})
+        log(
+            "twilio_response_received",
+            {"status": resp.status_code, "text": resp.text, "account_sid": account_sid},
+        )
     except Exception as exc:
         raise Exception(
             f"Fetch Customer Profile {customer_profile_sid} request failed: {str(exc)}"
@@ -196,7 +205,6 @@ def fetch_customer_profile_status(customer_profile_sid):
         )
 
     return data.get("status")
-
 
 
 # =====================================================================
@@ -221,7 +229,6 @@ def delete_review_record(record_id):
             f"Delete review record {record_id} failed "
             f"(status {resp.status_code}): {resp.text}"
         )
-
 
 
 # =====================================================================
@@ -279,9 +286,8 @@ def trigger_post_approval_function(record):
     return safe_get_json(resp, "runfunction response")
 
 
-
 # =====================================================================
-# MAIN ORCHESTRATION (UNCHANGED)
+# MAIN ORCHESTRATION (UPDATED ONLY FOR PER RECORD TWILIO AUTH)
 # =====================================================================
 def main(_):
     log("job_main_start", {})
@@ -307,11 +313,25 @@ def main(_):
         except Exception:
             continue
 
-        sid = rec.get("customer_profile_sid")
-        if not sid:
+        customer_profile_sid = rec.get("customer_profile_sid")
+        if not customer_profile_sid:
             continue
 
-        status = fetch_customer_profile_status(sid)
+        account_sid = rec.get("sid")
+        auth_token = rec.get("auth")
+
+        if not account_sid or not auth_token:
+            log(
+                "missing_twilio_auth",
+                {"record_id": rec_id, "customer_profile_sid": customer_profile_sid},
+            )
+            continue
+
+        status = fetch_customer_profile_status(
+            customer_profile_sid,
+            account_sid,
+            auth_token,
+        )
 
         if status == "twilio-approved":
             approved_found = True
@@ -328,7 +348,6 @@ def main(_):
         "message": "Checked but none approved",
         "checked_record_ids": sorted_ids,
     }
-
 
 
 # =====================================================================
