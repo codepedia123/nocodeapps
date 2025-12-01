@@ -332,6 +332,14 @@ def main(_):
             account_sid,
             auth_token,
         )
+        if status == "APPROVED":
+            approved_found = True
+            delete_review_record(rec_id)
+            last_json = trigger_post_approval_function(rec)
+        if status == "approved":
+            approved_found = True
+            delete_review_record(rec_id)
+            last_json = trigger_post_approval_function(rec)
 
         if status == "twilio-approved":
             approved_found = True
