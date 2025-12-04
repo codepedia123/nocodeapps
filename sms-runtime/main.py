@@ -91,16 +91,16 @@ async def run_agent(request: Request):
 def health():
     return {"status": "SMS AI Runtime Live", "provider": LLM_PROVIDER}
 
-# ============= FINAL FIXED AUTO-RUN BLOCK =============
+# ============= FINAL WORKING AUTO-RUN BLOCK =============
 if "inputs" in globals():
     try:
         data = globals()["inputs"]  # This is combined_input from app.py
         
-        # CORRECTLY extract from your curl format
+        # Your curl sends everything inside "payload"
         payload = data.get("payload", {})
         if not isinstance(payload, dict):
-            payload = {}
-            
+            payload = data  # fallback if payload not nested
+        
         conversation = payload.get("conversation", [])
         message = payload.get("message", "").strip()
         
@@ -114,7 +114,6 @@ if "inputs" in globals():
                 "status": "success"
             }
         
-        # This makes /int return the real result
         globals()["result"] = result
         
     except Exception as e:
