@@ -2,6 +2,7 @@
 import os
 import json
 import requests
+import traceback
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -12,7 +13,7 @@ load_dotenv()
 # ============= CONFIG =============
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ============= TOOL: Get India Time =============
 def get_india_time():
@@ -22,29 +23,25 @@ def get_india_time():
         datetime_str = data["datetime"]
         time_only = datetime_str.split("T")[1][:8]  # HH:MM:SS
         return f"Current time in India (Kolkata): {time_only}"
-    except:
-        return "I couldn't fetch the time right now."
+    except Exception as e:
+        return f"Time fetch failed: {str(e)}"
 
-# ============= LLM CALL (Groq or OpenAI) =============
+# ============= LLM CALL WITH FULL RAW ERROR LOGGING =============
 def ask_llm(conversation_history: list, latest_message: str):
     india_time = get_india_time()
+
     # Build messages
     messages = [
         {"role": "system", "content": "You are a friendly SMS assistant. Always respond naturally and concisely. Use the current India time when relevant."}
     ]
     
-    # Add past conversation
     for msg in conversation_history:
         role = "user" if msg.get("role") == "user" else "assistant"
         messages.append({"role": role, "content": msg.get("content", "")})
     
-    # Add latest user message
     messages.append({"role": "user", "content": latest_message})
-    
-    # Add current time as system message
     messages.append({"role": "system", "content": india_time})
-    
-    # === CALL LLM ===
+
     url = "https://api.groq.com/openai/v1/chat/completions" if LLM_PROVIDER == "groq" else "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY if LLM_PROVIDER == 'groq' else OPENAI_API_KEY}",
@@ -56,12 +53,40 @@ def ask_llm(conversation_history: list, latest_message: str):
         "temperature": 0.7,
         "max_tokens": 150
     }
+
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
+
+        # === FULL RAW ERROR REPORTING FROM PROVIDER ===
+        if resp.status_code != 200:
+            raw_error = resp.text.strip()
+            try:
+                error_json = resp.json()
+                error_msg = error_json.get("error", {}).get("message", raw_error)
+                error_type = error_json.get("error", {}).get("type", "unknown")
+                return f"LLM ERROR ({resp.status_code}): {error_type} — {error_msg}"
+            except:
+                return f"LLM HTTP ERROR ({resp.status_code}): {raw_error[:200]}"
+
         result = resp.json()
+
+        # Handle missing/invalid structure
+        if "choices" not in result or not result["choices"]:
+            return f"LLM returned no choices. Raw: {json.dumps(result)[:300]}"
+
+        if "message" not in result["choices"][0] or "content" not in result["choices"][0]["message"]:
+            return f"LLM malformed response. Raw: {json.dumps(result)[:300]}"
+
         return result["choices"][0]["message"]["content"].strip()
+
+    except requests.exceptions.Timeout:
+        return "LLM request timed out (15s)"
+    except requests.exceptions.ConnectionError:
+        return "LLM connection failed (network/DNS issue)"
+    except requests.exceptions.RequestException as e:
+        return f"LLM request failed: {str(e)}"
     except Exception as e:
-        return f"Sorry, I'm having trouble replying right now. ({str(e)})"
+        return f"Unexpected LLM error: {str(e)} | Trace: {traceback.format_exc()[-200:]}"
 
 # ============= FASTAPI APP =============
 app = FastAPI()
@@ -84,19 +109,21 @@ async def run_agent(request: Request):
     return JSONResponse({
         "reply": reply,
         "india_time_used": get_india_time(),
-        "status": "success"
+        "status": "success" if "ERROR" not in reply and "failed" not in reply.lower() else "llm_error",
+        "provider": LLM_PROVIDER
     })
 
 @app.get("/")
 def health():
-    return {"status": "SMS AI Runtime Live", "provider": LLM_PROVIDER}
-
+    return {
+        "status": "SMS AI Runtime Live",
+        "provider": LLM_PROVIDER,
+        "model": "llama-3.3-70b-versatile" if LLM_PROVIDER == "groq" else "gpt-4o-mini"
+    }
 
 # ============= CRITICAL: Auto-run when called via /int (exec) =============
-# This block runs ONLY when executed via app.py's /int endpoint
 if "inputs" in globals():
     try:
-        # Extract data exactly like app.py's injection (inputs = combined_input = payload dict)
         data = globals().get("inputs", {})
         conversation = data.get("conversation", [])
         message = data.get("message", "")
@@ -108,11 +135,15 @@ if "inputs" in globals():
             result = {
                 "reply": reply,
                 "india_time_used": get_india_time(),
-                "status": "success"
+                "status": "success" if "ERROR" not in reply and "failed" not in reply.lower() else "llm_error",
+                "provider": LLM_PROVIDER
             }
         
-        # This makes /int return the real result
         globals()["result"] = result
         
     except Exception as e:
-        globals()["result"] = {"error": str(e), "traceback": traceback.format_exc()}
+        globals()["result"] = {
+            "error": "Fatal execution error in main.py",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }
