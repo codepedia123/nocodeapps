@@ -581,21 +581,32 @@ def delete_function(id: str):
 # NEW: /int endpoint to run project Python files by name
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
-# UPDATED /int endpoint — BLOCKING for ALL files EXCEPT a2p-profile-every-hour-check-runtime
+# FINAL /int endpoint — BLOCKING for all files EXCEPT the hourly A2P job
 # ----------------------------------------------------------------------
-from concurrent.futures import ThreadPoolExecutor
 import sys
 from io import StringIO
 
-executor = ThreadPoolExecutor(max_workers=8)
-
 @app.api_route("/int", methods=["GET", "POST"])
-async def int_endpoint(file: str):
+async def int_endpoint(request: Request, file: str):
     target = _find_project_file(file)
     if not target:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # === ONLY this file runs in background ===
+    # === Extract payload/input exactly like your old injection logic ===
+    try:
+        body = await request.json()
+    except:
+        body = {}
+
+    payload = body.get("payload", {})
+    input_data = body.get("input", {})
+    combined_input = {}
+    if isinstance(payload, dict):
+        combined_input.update(payload)
+    if isinstance(input_data, dict):
+        combined_input.update(input_data)
+
+    # === ONLY hourly A2P job runs in background ===
     if target.stem == "a2p-profile-every-hour-check-runtime":
         job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         def runner():
@@ -610,10 +621,10 @@ async def int_endpoint(file: str):
             "status": "started (background)",
             "file": target.name,
             "job_id": job_id,
-            "note": "Running hourly A2P check in background"
+            "note": "Hourly A2P check running"
         }
 
-    # === ALL OTHER FILES: Blocking + full result + error capture ===
+    # === ALL OTHER FILES: Full blocking execution with result ===
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     redirected_output = StringIO()
@@ -625,26 +636,21 @@ async def int_endpoint(file: str):
         env = {
             "__name__": "__main__",
             "__file__": str(target),
-            "inputs": combined_input,  # from your injection logic
+            "inputs": combined_input,        # ← now defined!
+            "payload": payload,
+            "input": input_data
         }
         exec(compile(code, str(target), "exec"), env)
 
-        # Try to get a `result` variable from the script
         result = env.get("result")
         if result is not None:
-            # If script returned a dict/list, return it directly
-            try:
-                json.dumps(result)  # validate serializable
-                return {"result": result, "output": redirected_output.getvalue().strip()}
-            except:
-                pass
+            return {"result": result, "output": redirected_output.getvalue().strip()}
 
-        # Fallback: return captured output
         output = redirected_output.getvalue().strip()
         return {
             "status": "completed",
             "file": target.name,
-            "output": output or "Script ran with no output"
+            "output": output or "No output"
         }
 
     except Exception as e:
