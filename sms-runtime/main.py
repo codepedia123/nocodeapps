@@ -6,16 +6,28 @@ import traceback
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ============= TOOL: Get India Time =============
 def get_india_time():
-    try:
-        resp = requests.get("https://worldtimeapi.org/api/timezone/Asia/Kolkata", timeout=5)
-        data = resp.json()
-        datetime_str = data["datetime"]
-        time_only = datetime_str.split("T")[1][:8]  # HH:MM:SS
-        return f"Current time in India (Kolkata): {time_only}"
-    except Exception as e:
-        return f"Time fetch failed: {str(e)}"
+    urls = [
+        "https://worldtimeapi.org/api/timezone/Asia/Kolkata",
+        "http://worldtimeapi.org/api/timezone/Asia/Kolkata",
+        "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Kolkata"
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=6)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "datetime" in data:
+                    dt = data["datetime"]
+                elif "dateTime" in data:
+                    dt = data["dateTime"]
+                else:
+                    continue
+                time_only = dt.split("T")[1][:8] if "T" in dt else dt.split(" ")[1][:8]
+                return f"Current time in India (Kolkata): {time_only}"
+        except:
+            continue
+    return "Time currently unavailable"
 
 # ============= LLM CALL WITH USER-PROVIDED API KEY + FULL RAW ERROR LOGGING =============
 def ask_llm(conversation_history: list, latest_message: str, api_key: str, provider: str = "groq"):
