@@ -581,13 +581,13 @@ def delete_function(id: str):
 # NEW: /int endpoint to run project Python files by name
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
-# NEW: /int endpoint — BLOCKING only for a2p-profile-every-hour-check-runtime
+# UPDATED /int endpoint — BLOCKING for ALL files EXCEPT a2p-profile-every-hour-check-runtime
 # ----------------------------------------------------------------------
 from concurrent.futures import ThreadPoolExecutor
 import sys
 from io import StringIO
 
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=8)
 
 @app.api_route("/int", methods=["GET", "POST"])
 async def int_endpoint(file: str):
@@ -595,41 +595,8 @@ async def int_endpoint(file: str):
     if not target:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Special blocking mode for your hourly A2P checker
+    # === ONLY this file runs in background ===
     if target.stem == "a2p-profile-every-hour-check-runtime":
-        # Capture stdout + stderr
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        redirected_output = StringIO()
-        sys.stdout = redirected_output
-        sys.stderr = redirected_output
-
-        try:
-            code = target.read_text()
-            env = {
-                "__name__": "__main__",
-                "__file__": str(target),
-                "inputs": combined_input,  # from your existing injection logic
-            }
-            exec(compile(code, str(target), "exec"), env)
-            
-            # If the script defines a `result` variable, return it
-            result = env.get("result", {"status": "completed", "output": redirected_output.getvalue().strip()})
-            return result
-
-        except Exception as e:
-            error_detail = {
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-                "output": redirected_output.getvalue().strip()
-            }
-            raise HTTPException(status_code=500, detail=error_detail)
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-
-    else:
-        # Old fire-and-forget behavior for all other files
         job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         def runner():
             try:
@@ -643,7 +610,53 @@ async def int_endpoint(file: str):
             "status": "started (background)",
             "file": target.name,
             "job_id": job_id,
+            "note": "Running hourly A2P check in background"
         }
+
+    # === ALL OTHER FILES: Blocking + full result + error capture ===
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    redirected_output = StringIO()
+    sys.stdout = redirected_output
+    sys.stderr = redirected_output
+
+    try:
+        code = target.read_text()
+        env = {
+            "__name__": "__main__",
+            "__file__": str(target),
+            "inputs": combined_input,  # from your injection logic
+        }
+        exec(compile(code, str(target), "exec"), env)
+
+        # Try to get a `result` variable from the script
+        result = env.get("result")
+        if result is not None:
+            # If script returned a dict/list, return it directly
+            try:
+                json.dumps(result)  # validate serializable
+                return {"result": result, "output": redirected_output.getvalue().strip()}
+            except:
+                pass
+
+        # Fallback: return captured output
+        output = redirected_output.getvalue().strip()
+        return {
+            "status": "completed",
+            "file": target.name,
+            "output": output or "Script ran with no output"
+        }
+
+    except Exception as e:
+        error_detail = {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "output": redirected_output.getvalue().strip()
+        }
+        raise HTTPException(status_code=500, detail=error_detail)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
 
 # ----------------------------------------------------------------------
 # ADD
