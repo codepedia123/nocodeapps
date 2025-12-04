@@ -6,28 +6,64 @@ import traceback
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-def get_india_time():
+ef get_india_time():
+    global _cached_time, _cached_at
+    now = time.time()
+
+    # Return cached result if less than 30 seconds old
+    if _cached_time and (now - _cached_at) < 30:
+        return _cached_time
+
+    # Multiple fallback APIs + direct JSON parsing
     urls = [
         "https://worldtimeapi.org/api/timezone/Asia/Kolkata",
-        "http://worldtimeapi.org/api/timezone/Asia/Kolkata",
-        "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Kolkata"
+        "http://worldtimeapi.org/api/timezone/Asia/Kolkata",  # HTTP fallback
+        "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Kolkata",
+        "https://worldclockapi.com/api/json/ist/now"
     ]
+
     for url in urls:
         try:
-            resp = requests.get(url, timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "datetime" in data:
-                    dt = data["datetime"]
-                elif "dateTime" in data:
-                    dt = data["dateTime"]
-                else:
-                    continue
-                time_only = dt.split("T")[1][:8] if "T" in dt else dt.split(" ")[1][:8]
-                return f"Current time in India (Kolkata): {time_only}"
+            resp = requests.get(url, timeout=7)
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+
+            # worldtimeapi.org format
+            if "datetime" in data:
+                dt = data["datetime"]
+                time_str = dt.split("T")[1][:8]
+                result = f"Current time in India (Kolkata): {time_str}"
+                _cached_time = result
+                _cached_at = now
+                return result
+
+            # timeapi.io format
+            if "dateTime" in data:
+                dt = data["dateTime"]
+                time_str = dt.split("T")[1][:8]
+                result = f"Current time in India (Kolkata): {time_str}"
+                _cached_time = result
+                _cached_at = now
+                return result
+
+            # worldclockapi.com format
+            if "currentDateTime" in data:
+                dt = data["currentDateTime"]
+                time_str = dt.split("T")[1][:8]
+                result = f"Current time in India (Kolkata): {time_str}"
+                _cached_time = result
+                _cached_at = now
+                return result
+
         except:
             continue
-    return "Time currently unavailable"
+
+    # Final fallback: use cached or static message
+    if _cached_time:
+        return _cached_time
+    return "Current time in India (Kolkata): [unavailable]"
 
 # ============= LLM CALL WITH USER-PROVIDED API KEY + FULL RAW ERROR LOGGING =============
 def ask_llm(conversation_history: list, latest_message: str, api_key: str, provider: str = "groq"):
