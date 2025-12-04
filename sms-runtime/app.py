@@ -3,6 +3,7 @@ import os
 import json
 import time
 import uuid
+from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List, Tuple
 
 # --- Redis Cluster Support ---
@@ -17,7 +18,7 @@ import traceback
 import re
 import builtins
 import threading
-
+load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
