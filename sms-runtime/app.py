@@ -580,41 +580,70 @@ def delete_function(id: str):
 # ----------------------------------------------------------------------
 # NEW: /int endpoint to run project Python files by name
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# NEW: /int endpoint — BLOCKING only for a2p-profile-every-hour-check-runtime
+# ----------------------------------------------------------------------
+from concurrent.futures import ThreadPoolExecutor
+import sys
+from io import StringIO
+
+executor = ThreadPoolExecutor(max_workers=4)
+
 @app.api_route("/int", methods=["GET", "POST"])
 async def int_endpoint(file: str):
-    """
-    Trigger execution of a project-level Python file.
-
-    Example:
-      POST /int?file=a2p_brand_full_regis
-      will search for a2p_brand_full_regis.py under sms-runtime/ and run it.
-    """
     target = _find_project_file(file)
     if not target:
         raise HTTPException(status_code=404, detail="File not found")
 
-    job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    # Special blocking mode for your hourly A2P checker
+    if target.stem == "a2p-profile-every-hour-check-runtime":
+        # Capture stdout + stderr
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        redirected_output = StringIO()
+        sys.stdout = redirected_output
+        sys.stderr = redirected_output
 
-    def runner():
         try:
             code = target.read_text()
             env = {
                 "__name__": "__main__",
                 "__file__": str(target),
+                "inputs": combined_input,  # from your existing injection logic
             }
             exec(compile(code, str(target), "exec"), env)
+            
+            # If the script defines a `result` variable, return it
+            result = env.get("result", {"status": "completed", "output": redirected_output.getvalue().strip()})
+            return result
+
         except Exception as e:
-            print(f"Error running job {job_id} for {target}: {e}")
-            traceback.print_exc()
+            error_detail = {
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "output": redirected_output.getvalue().strip()
+            }
+            raise HTTPException(status_code=500, detail=error_detail)
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
-    threading.Thread(target=runner, daemon=True).start()
-
-    return {
-        "status": "started",
-        "file": target.name,
-        "path": str(target),
-        "job_id": job_id,
-    }
+    else:
+        # Old fire-and-forget behavior for all other files
+        job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        def runner():
+            try:
+                code = target.read_text()
+                env = {"__name__": "__main__", "__file__": str(target)}
+                exec(compile(code, str(target), "exec"), env)
+            except Exception:
+                traceback.print_exc()
+        threading.Thread(target=runner, daemon=True).start()
+        return {
+            "status": "started (background)",
+            "file": target.name,
+            "job_id": job_id,
+        }
 
 # ----------------------------------------------------------------------
 # ADD
