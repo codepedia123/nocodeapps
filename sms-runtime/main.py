@@ -12,7 +12,7 @@ load_dotenv()
 # ============= CONFIG =============
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = "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"
 
 # ============= TOOL: Get India Time =============
 def get_india_time():
@@ -94,13 +94,12 @@ def health():
 
 # ============= CRITICAL: Auto-run when called via /int (exec) =============
 # This block runs ONLY when executed via app.py's /int endpoint
-if "inputs" in globals() or __name__ != "__main__":
+if "inputs" in globals():
     try:
-        # Extract data exactly like your /int injection
+        # Extract data exactly like app.py's injection (inputs = combined_input = payload dict)
         data = globals().get("inputs", {})
-        payload = data.get("payload", {}) if isinstance(data.get("payload"), dict) else {}
-        conversation = payload.get("conversation", [])
-        message = payload.get("message", "")
+        conversation = data.get("conversation", [])
+        message = data.get("message", "")
         
         if not message:
             result = {"error": "No message provided in payload"}
