@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 load_dotenv()
 
 # ============= CONFIG =============
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENAI_API_KEY = "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"
 
@@ -91,18 +91,15 @@ async def run_agent(request: Request):
 def health():
     return {"status": "SMS AI Runtime Live", "provider": LLM_PROVIDER}
 
-# ============= FINAL WORKING AUTO-RUN BLOCK =============
+
+# ============= CRITICAL: Auto-run when called via /int (exec) =============
+# This block runs ONLY when executed via app.py's /int endpoint
 if "inputs" in globals():
     try:
-        data = globals()["inputs"]  # This is combined_input from app.py
-        
-        # Your curl sends everything inside "payload"
-        payload = data.get("payload", {})
-        if not isinstance(payload, dict):
-            payload = data  # fallback if payload not nested
-        
-        conversation = payload.get("conversation", [])
-        message = payload.get("message", "").strip()
+        # Extract data exactly like app.py's injection (inputs = combined_input = payload dict)
+        data = globals().get("inputs", {})
+        conversation = data.get("conversation", [])
+        message = data.get("message", "")
         
         if not message:
             result = {"error": "No message provided in payload"}
@@ -114,6 +111,7 @@ if "inputs" in globals():
                 "status": "success"
             }
         
+        # This makes /int return the real result
         globals()["result"] = result
         
     except Exception as e:
