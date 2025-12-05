@@ -65,7 +65,7 @@ try:
                 return f"Current time in {timezone}: {time_str}"
             return "Time unavailable for that zone"
         except:
-            return get_india_time()  # fallback to India time
+            return get_india_time()
 
     class WeatherInput(BaseModel):
         location: str = Field(..., description="City name, e.g., Mumbai, Delhi")
@@ -73,7 +73,6 @@ try:
     @tool(args_schema=WeatherInput)
     def get_weather(location: str) -> str:
         """Get current weather. Trigger only when user asks about weather, temperature, or climate."""
-        # Replace with your real API key or make it user-provided
         API_KEY = os.getenv("OPENWEATHER_KEY", "your_key_here")
         url = "https://api.openweathermap.org/data/2.5/weather"
         try:
@@ -89,11 +88,8 @@ try:
 
     tools = [get_current_time, get_weather]
 except ImportError as e:
-    # Fallback if LangChain not installed
     print(f"LangChain not available: {e} - Using simple LLM mode")
     tools = []
-
-# Add more tools as needed (news, calendar, etc.)
 
 # ============= LANGCHAIN AGENT SETUP (ReAct + Conditional Tool Use) =============
 agent_executor = None
@@ -111,20 +107,15 @@ try:
 
         prompt = PromptTemplate.from_template("""
 You are a friendly, natural SMS chatbot. Respond concisely.
-
 You have access to tools. Use them ONLY when needed:
 - get_current_time: When user asks about time in any location
 - get_weather: When user asks about weather, temperature, or climate
-
 Thought: Always think: "Do I need a tool? If not, just reply normally."
-
 Example:
 User: "Hey what's up?" → No tool → Just chat
 User: "What's the time in London?" → Use get_current_time
 User: "Is it raining in Mumbai?" → Use get_weather
-
 Respond naturally. Never mention tools.
-
 {tools}
 {agent_scratchpad}
 """)
@@ -132,17 +123,13 @@ Respond naturally. Never mention tools.
         agent = create_react_agent(llm, tools, prompt)
         return AgentExecutor(agent=agent, tools=tools, verbose=False, handle_parsing_errors=True)
 
-    # Global for reuse
-    agent_executor = None  # Will be created per call
-
+    agent_executor = "available"  # marker
 except ImportError as e:
     print(f"LangChain agent setup failed: {e}")
 
 # ============= FALLBACK SIMPLE LLM (if LangChain not available) =============
 def simple_llm_reply(conversation_history: list, latest_message: str, api_key: str, provider: str = "groq"):
-    """Fallback LLM call without tools (for when LangChain not installed)"""
     india_time = get_india_time()
-
     messages = [
         {"role": "system", "content": "You are a friendly SMS assistant. Always respond naturally and concisely. Use the current India time when relevant."}
     ]
@@ -174,7 +161,6 @@ def simple_llm_reply(conversation_history: list, latest_message: str, api_key: s
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
-
         if resp.status_code != 200:
             raw_error = resp.text.strip()
             try:
@@ -184,15 +170,12 @@ def simple_llm_reply(conversation_history: list, latest_message: str, api_key: s
                 return f"LLM ERROR ({resp.status_code}): {err_type} — {err_msg}"
             except:
                 return f"LLM HTTP ERROR ({resp.status_code}): {raw_error[:300]}"
-
         result = resp.json()
         if "choices" not in result or not result["choices"]:
             return f"LLM returned no choices. Raw: {json.dumps(result)[:300]}"
         if "message" not in result["choices"][0] or "content" not in result["choices"][0]["message"]:
             return f"LLM malformed response. Raw: {json.dumps(result)[:300]}"
-
         return result["choices"][0]["message"]["content"].strip()
-
     except requests.exceptions.Timeout:
         return "LLM request timed out (15s)"
     except requests.exceptions.ConnectionError:
@@ -212,10 +195,13 @@ async def run_agent(request: Request):
     except:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    conversation = body.get("conversation", [])
-    message = body.get("message", "").strip()
-    api_key = body.get("api_key", "").strip()
-    provider = body.get("provider", "groq").lower()
+    # Accept both root level AND payload wrapper
+    data = body.get("payload", body) if isinstance(body, dict) else body
+
+    conversation = data.get("conversation", [])
+    message = data.get("message", "").strip()
+    api_key = data.get("api_key", "").strip()
+    provider = data.get("provider", "groq").lower()
 
     if not message:
         return JSONResponse({"error": "Missing 'message'"}, status_code=400)
@@ -231,7 +217,7 @@ async def run_agent(request: Request):
         history.append({"role": role, "content": msg.get("content", "")})
 
     try:
-        if agent_executor:
+        if agent_executor:  # LangChain available
             agent = create_agent(api_key, provider)
             response = agent.invoke({
                 "input": message,
@@ -248,23 +234,27 @@ async def run_agent(request: Request):
         "india_time_used": get_india_time(),
         "status": "success",
         "provider": provider,
-        "tools_used": "conditional (only when needed)" if agent_executor else "simple mode (LangChain not available)"
+        "tools_used": "conditional (only when needed)" if agent_executor else "simple mode"
     })
 
 @app.get("/")
 def health():
     return {"status": "LangChain SMS Agent Live", "mode": "case-based tool calling", "langchain_available": bool(agent_executor)}
 
-# ============= /int EXEC SUPPORT =============
+# ============= /int EXEC SUPPORT (WORKS WITH YOUR CURL — ROOT OR PAYLOAD) =============
 if "inputs" in globals():
     try:
         data = globals().get("inputs", {})
+        # Accept both payload wrapper and direct root
+        if isinstance(data, dict) and "payload" in data:
+            data = data["payload"]
+
         conversation = data.get("conversation", [])
         message = data.get("message", "")
         api_key = data.get("api_key", "")
         provider = data.get("provider", "groq").lower()
 
-        if not all([message, api_key]):
+        if not message or not api_key:
             result = {"error": "Missing message or api_key"}
         elif provider not in ["groq", "openai"]:
             result = {"error": "Invalid provider"}
