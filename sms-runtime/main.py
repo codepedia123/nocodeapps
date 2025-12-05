@@ -9,12 +9,11 @@ from fastapi.responses import JSONResponse
 
 # LangChain
 from langchain_core.tools import tool
-from langchain.agents import create_react_agent, AgentExecutor, AgentType
-from langchain.memory import ConversationBufferMemory
+from langchain.agents import create_react_agent, AgentExecutor
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
 
 # ============= DYNAMIC API LIST (you control this) =============
 # Add as many as you want — just URL + description
@@ -59,7 +58,7 @@ def call_api(api_name: str) -> str:
 
 tools = [call_api]
 
-# ============= PROMPT — TELLS LLM ABOUT ALL APIS (FIXED WITH CHAT_HISTORY) =============
+# ============= PROMPT — TELLS LLM ABOUT ALL APIS (FIXED WITH REQUIRED VARS + ESCAPING) =============
 api_descriptions = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
 REACT_PROMPT = PromptTemplate.from_template(f"""
 You are a helpful SMS assistant.
@@ -75,12 +74,11 @@ Rules:
 - If no API is needed (general chat), just respond normally
 - Never make up data
 
-Chat history:
-{{chat_history}}
+Chat history: {{chat_history}}
 
 Thought: Always reason step by step
 Action: call_api
-Action Input: {{"api_name": "api_name_here"}}
+Action Input: {{"api_name": "api_name_here"}}  # Example: {{"api_name": "get_india_time"}}
 Observation: [result]
 ... (repeat until done)
 Final Answer: [your reply]
@@ -89,37 +87,22 @@ Question: {{input}}
 {{agent_scratchpad}}
 """)
 
-# ============= AGENT WITH MEMORY (Pure LangChain + History) =============
+# ============= AGENT (Pure LangChain) =============
 def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
     llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
           else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
-    
-    # Format history as string for conversational prompt
-    chat_history_str = ""
-    for msg in conversation_history:
-        role = "Human" if msg.get("role") == "user" else "AI"
-        chat_history_str += f"{role}: {msg.get('content', '')}\n"
-    
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    memory.chat_memory.add_messages([
-        HumanMessage(content=msg["content"]) if msg["role"] == "user" else AIMessage(content=msg["content"])
-        for msg in conversation_history
-    ])
-    
     agent = create_react_agent(llm, tools, REACT_PROMPT)
     executor = AgentExecutor(
         agent=agent,
         tools=tools,
         handle_parsing_errors=True,
         max_iterations=3,
-        verbose=False,
-        memory=memory  # Built-in memory for history
+        verbose=False
     )
     try:
         response = executor.invoke({
-            "input": message,
-            "chat_history": chat_history_str  # String format for prompt
-        })
+            "input": message
+        })  # No chat_history in invoke—handled in prompt via {chat_history}
         return response["output"]
     except Exception as e:
         return f"Agent error: {str(e)}"
