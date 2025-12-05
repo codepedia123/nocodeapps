@@ -1,20 +1,11 @@
-# main.py - Real-time SMS AI Runtime (called from app.py via /int OR run as server)
+# main.py - Real-time SMS AI Runtime (FINAL VERSION - NO MORE LOOPS)
 import os
 import json
 import requests
-import traceback
 import time
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-
-# LangChain imports
-from langchain_core.tools import tool
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 # ============= CACHED INDIA TIME (Never fails) =============
 _cached_time = None
@@ -23,7 +14,6 @@ _cached_at = 0
 def get_india_time():
     global _cached_time, _cached_at
     now = time.time()
-    
     if _cached_time and (now - _cached_at) < 60:
         return _cached_time
 
@@ -48,101 +38,137 @@ def get_india_time():
         except:
             continue
 
-    if _cached_time:
-        return _cached_time
-    return "Current time in India: unavailable"
+    return _cached_time or "Current time in India: unavailable"
 
-# ============= TOOLS =============
-@tool
-def get_time(timezone: str = "Asia/Kolkata") -> str:
-    """Get current time in a timezone. Use only when user asks for time."""
-    return get_india_time()
+# ============= TOOL DEFINITIONS (OpenAI Function Calling) =============
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get current time in India. Use when user asks for time.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city. Use only for weather queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"}
+                },
+                "required": ["location"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_news",
+            "description": "Search latest news. Use only for news queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "News topic"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
 
-@tool
-def get_weather(location: str) -> str:
-    """Get current weather for a city. Use only for weather/location queries."""
-    return "Weather in Mumbai: 28°C, partly cloudy"  # Replace with real API later
+# ============= TOOL IMPLEMENTATIONS =============
+def execute_tool(name: str, args: dict):
+    if name == "get_time":
+        return get_india_time()
+    if name == "get_weather":
+        return "Weather in Mumbai: 28°C, partly cloudy"
+    if name == "search_news":
+        return "Latest news: India wins cricket match!"
+    return "Unknown tool"
 
-@tool
-def search_news(query: str) -> str:
-    """Search latest news. Use only for news/current events questions."""
-    return "Latest news: India wins cricket match!"
-
-tools = [get_time, get_weather, search_news]
-
-# ============= LLM =============
-def get_llm(api_key: str, provider: str):
-    if provider == "groq":
-        return ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key, temperature=0.7)
-    return ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0.7)
-
-# ============= PROMPT (Fixed: Now has {tool_names} and {tools}) =============
-REACT_PROMPT = PromptTemplate.from_template(
-    """You are a helpful SMS assistant. Answer naturally and concisely.
-
-Available tools: {tool_names}
-{tools}
-
-Use tools ONLY when needed:
-- get_time → for time queries
-- get_weather → for weather queries
-- search_news → for news queries
-
-Thought: Always think step by step. If no tool is needed, just respond.
-
-Format:
-Thought: [reasoning]
-Action: tool_name
-Action Input: {{"param": "value"}}
-Observation: [tool result]
-Final Answer: [your reply]
-
-Question: {input}
-{agent_scratchpad}"""
-)
-
-# ============= AGENT (With parsing error handling) =============
-def run_agent_with_tools(conversation_history: list, latest_message: str, api_key: str, provider: str = "groq"):
-    llm = get_llm(api_key, provider)
+# ============= LLM CALL (OpenAI/Groq Function Calling) =============
+def run_agent(conversation_history: list, latest_message: str, api_key: str, provider: str):
+    messages = [{"role": "system", "content": "You are a helpful SMS assistant. Be concise. Use tools only when needed."}]
     
-    agent = create_react_agent(llm, tools, REACT_PROMPT)
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        handle_parsing_errors=True,
-        max_iterations=3,
-        verbose=False
-    )
+    for msg in conversation_history:
+        messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
     
+    messages.append({"role": "user", "content": latest_message})
+
+    url = "https://api.groq.com/openai/v1/chat/completions" if provider == "groq" else "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini",
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0.7,
+        "max_tokens": 150
+    }
+
     try:
-        response = executor.invoke({
-            "input": latest_message,
-            "chat_history": [HumanMessage(content=m["content"]) for m in conversation_history if m.get("content")]
-        })
-        return response["output"]
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        data = resp.json()
+
+        if resp.status_code != 200:
+            return f"LLM ERROR: {data.get('error', {}).get('message', 'Unknown')}"
+
+        message = data["choices"][0]["message"]
+
+        # If tool call
+        if message.get("tool_calls"):
+            tool_call = message["tool_calls"][0]
+            name = tool_call["function"]["name"]
+            args = json.loads(tool_call["function"]["arguments"] or "{}")
+            tool_result = execute_tool(name, args)
+            
+            # Second call with result
+            messages.append(message)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "name": name,
+                "content": tool_result
+            })
+            
+            second_resp = requests.post(url, json={**payload, "messages": messages}, headers=headers, timeout=15)
+            second_data = second_resp.json()
+            return second_data["choices"][0]["message"]["content"].strip()
+
+        # Direct reply
+        return message["content"].strip()
+
     except Exception as e:
-        return f"Agent error: {str(e)}"
+        return f"Agent failed: {str(e)}"
 
 # ============= FASTAPI =============
 app = FastAPI()
 
 @app.post("/run-agent")
-async def run_agent(request: Request):
+async def run_agent_endpoint(request: Request):
     try:
         body = await request.json()
     except:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    
+
     conversation = body.get("conversation", [])
     message = body.get("message", "").strip()
     api_key = body.get("api_key", "").strip()
     provider = body.get("provider", "groq").lower()
-    
+
     if not message or not api_key or provider not in ["groq", "openai"]:
         return JSONResponse({"error": "Invalid request"}, status_code=400)
-    
-    reply = run_agent_with_tools(conversation, message, api_key, provider)
-    
+
+    reply = run_agent(conversation, message, api_key, provider)
+
     return JSONResponse({
         "reply": reply,
         "india_time_used": get_india_time(),
@@ -154,7 +180,7 @@ async def run_agent(request: Request):
 def health():
     return {"status": "AI SMS Runtime LIVE", "time": get_india_time()}
 
-# ============= /int EXECUTION (Auto-run) =============
+# ============= /int EXECUTION =============
 if "inputs" in globals():
     try:
         data = globals().get("inputs", {})
@@ -162,18 +188,17 @@ if "inputs" in globals():
         message = data.get("message", "")
         api_key = data.get("api_key", "")
         provider = data.get("provider", "groq").lower()
-        
+
         if not message or not api_key:
-            result = {"error": "Missing message or api_key"}
+            result = {"error": "Missing data"}
         else:
-            reply = run_agent_with_tools(conversation, message, api_key, provider)
+            reply = run_agent(conversation, message, api_key, provider)
             result = {
                 "reply": reply,
                 "india_time_used": get_india_time(),
-                "status": "success",
-                "provider": provider
+                "status": "success"
             }
-        
+
         globals()["result"] = result
     except Exception as e:
-        globals()["result"] = {"error": str(e), "traceback": traceback.format_exc()}
+        globals()["result"] = {"error": str(e)}
