@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 # ============= CONFIG =============
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
+
 # ============= TOOL DEFINITIONS (API Requests with Descriptions for Conditional Triggering) =============
 # These tools are evaluated by LangChain ReAct agent — LLM decides when to call based on query (case-based, not always)
 # Descriptions guide triggering: e.g., time tool only for time queries, weather only for location/weather mentions
@@ -82,11 +83,12 @@ def get_llm(api_key: str, provider: str):
     else:  # openai
         return ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0.7)
 
-# Prompt for conditional tool triggering (case-based, not always)
+# Prompt for conditional tool triggering (case-based, not always) — FIXED with {tool_names}
 REACT_PROMPT = PromptTemplate.from_template("""
 You are a friendly SMS assistant. Answer naturally and concisely. Use current India time when relevant.
 
-Available tools: {tools}
+Available tools: {tool_names}
+Tool descriptions: {tools}
 
 Use tools ONLY when needed:
 - get_time for time queries (e.g., 'What time is it?')
