@@ -1,4 +1,4 @@
-# main.py - PURE LANGCHAIN DYNAMIC API TOOL (exactly what you want)
+# main.py - PURE LANGCHAIN DYNAMIC API TOOL (updated to fix PromptTemplate variable issues)
 import os
 import json
 import requests
@@ -58,23 +58,25 @@ def call_api(api_name: str) -> str:
 
 tools = [call_api]
 
-# ============= PROMPT — TELLS LLM ABOUT ALL APIS (FIXED WITH REQUIRED VARS + ESCAPING) =============
+# ============= PROMPT — TELLS LLM ABOUT ALL APIS (fixed escaping and variables) =============
 api_descriptions = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
-REACT_PROMPT = PromptTemplate.from_template(f"""
+
+# Use a normal non f-string template and ensure any literal braces in the example JSON are escaped
+# by using double curly braces so PromptTemplate does not interpret them as variables.
+REACT_PROMPT = PromptTemplate.from_template(
+    """
 You are a helpful SMS assistant.
 
-Available tools: {{tool_names}}
-{{tools}}
+Available tools: {tool_names}
+{tools}
 
 API options (call using call_api):
-{api_descriptions}
+""" + api_descriptions + """
 
 Rules:
 - Only call an API if the user query clearly matches its description
 - If no API is needed (general chat), just respond normally
 - Never make up data
-
-Chat history: {{chat_history}}
 
 Thought: Always reason step by step
 Action: call_api
@@ -83,14 +85,18 @@ Observation: [result]
 ... (repeat until done)
 Final Answer: [your reply]
 
-Question: {{input}}
-{{agent_scratchpad}}
-""")
+Question: {input}
+{agent_scratchpad}
+"""
+)
 
 # ============= AGENT (Pure LangChain) =============
 def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
+    # Prepare LLM
     llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
           else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
+
+    # Create agent using the prompt and tools
     agent = create_react_agent(llm, tools, REACT_PROMPT)
     executor = AgentExecutor(
         agent=agent,
@@ -99,15 +105,48 @@ def run_agent(conversation_history: list, message: str, api_key: str, provider: 
         max_iterations=3,
         verbose=False
     )
-    try:
-        response = executor.invoke({
-            "input": message
-        })  # No chat_history in invoke—handled in prompt via {chat_history}
-        return response["output"]
-    except Exception as e:
-        return f"Agent error: {str(e)}"
 
-# ============= FASTAPI + /int =============
+    # Safely format conversation history into a plain text block so the prompt's {input} receives it
+    try:
+        if conversation_history and isinstance(conversation_history, list):
+            parts = []
+            for item in conversation_history:
+                role = item.get("role", "user")
+                content = item.get("content", "")
+                parts.append(f"{role}: {content}")
+            conv_text = "\n".join(parts)
+        else:
+            conv_text = ""
+
+        combined_input = f"Conversation history:\n{conv_text}\n\nUser question: {message}"
+
+        # Invoke the agent. Different langchain versions may return strings or dict-like results
+        response = executor.invoke({
+            "input": combined_input
+        })
+
+        # Normalize output from possible response shapes
+        try:
+            if isinstance(response, dict):
+                # Common keys used by different LangChain runtimes
+                if "output" in response:
+                    return response["output"]
+                if "result" in response:
+                    return response["result"]
+                # fallback to string conversion
+                return json.dumps(response, default=str)
+            elif isinstance(response, str):
+                return response
+            else:
+                return str(response)
+        except Exception:
+            return f"Agent returned unrecognized response type: {repr(response)}"
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        return f"Agent error: {str(e)}\nTraceback:\n{tb}"
+
+# ============= FASTAPI + /run-agent =============
 app = FastAPI()
 
 @app.post("/run-agent")
