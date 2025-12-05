@@ -1,4 +1,4 @@
-# main.py - PURE LANGCHAIN DYNAMIC API TOOL (robustified to avoid iteration/time-limit stops)
+# main.py - PURE LANGCHAIN DYNAMIC API TOOL (robust invoke + response parsing)
 import os
 import json
 import requests
@@ -51,7 +51,8 @@ def call_api(api_name: str) -> str:
                     resp = requests.get(api["url"], timeout=10)
                     if resp.status_code == 200:
                         data = resp.json()
-                        return json.dumps(data, indent=2)[:2000]  # truncate but allow larger output
+                        # return a reasonable slice but allow more headroom than before
+                        return json.dumps(data, indent=2)[:4000]
                     return f"API error {resp.status_code}: {resp.text[:400]}"
                 except Exception as e:
                     return f"API call failed: {str(e)}"
@@ -64,7 +65,6 @@ tools = [call_api]
 # ============= PROMPT — TELLS LLM ABOUT ALL APIS (fixed escaping and variables) =============
 api_descriptions = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
 
-# The template must include {input} and {agent_scratchpad}. Any literal braces used in examples must be escaped.
 REACT_PROMPT = PromptTemplate.from_template(
     """
 You are a helpful SMS assistant.
@@ -92,66 +92,162 @@ Question: {input}
 """
 )
 
-# ============= Helper: safe executor constructor (handles langchain version differences) =============
+# ============= Executor constructor helper (version tolerant) =============
 def make_executor(agent_obj, tools_list, max_iterations=6, max_execution_time=None, verbose=False):
     """
-    Construct AgentExecutor with graceful fallback if a parameter is unsupported by the installed LangChain.
-    Returns the executor instance.
+    Construct AgentExecutor with fallback behavior depending on installed LangChain.
+    """
+    kwargs = dict(
+        agent=agent_obj,
+        tools=tools_list,
+        handle_parsing_errors=True,
+        max_iterations=max_iterations,
+        verbose=verbose
+    )
+    # only add max_execution_time when not None
+    if max_execution_time is not None:
+        kwargs["max_execution_time"] = max_execution_time
+    try:
+        return AgentExecutor(**kwargs)
+    except TypeError:
+        # older/newer langchain may not accept max_execution_time or different names
+        # try without it
+        fallback_kwargs = kwargs.copy()
+        fallback_kwargs.pop("max_execution_time", None)
+        try:
+            return AgentExecutor(**fallback_kwargs)
+        except Exception as e:
+            # last resort: minimal constructor
+            try:
+                return AgentExecutor(agent_obj, tools_list)
+            except Exception as final_exc:
+                raise final_exc
+
+# ============= Response extraction helper =============
+def extract_response_text(resp):
+    """
+    Given the raw object or dict returned by executor.invoke/invoke-like call,
+    attempt to extract the most meaningful text.
+    Handles:
+    - plain string
+    - dict with keys like 'output', 'result', 'text', 'answer', 'final_answer'
+    - object with attributes 'output' or 'return_values'
+    - lists
+    - nested structures
     """
     try:
-        # Try with max_execution_time if supported
-        if max_execution_time is not None:
-            return AgentExecutor(
-                agent=agent_obj,
-                tools=tools_list,
-                handle_parsing_errors=True,
-                max_iterations=max_iterations,
-                max_execution_time=max_execution_time,
-                verbose=verbose
-            )
-        else:
-            return AgentExecutor(
-                agent=agent_obj,
-                tools=tools_list,
-                handle_parsing_errors=True,
-                max_iterations=max_iterations,
-                verbose=verbose
-            )
-    except TypeError:
-        # Fallback: maybe constructor expects different keyword names or lacks max_execution_time
-        try:
-            return AgentExecutor(
-                agent=agent_obj,
-                tools=tools_list,
-                handle_parsing_errors=True,
-                max_iterations=max_iterations,
-                verbose=verbose
-            )
-        except Exception as e:
-            # As a last resort, call with minimal args
-            return AgentExecutor(agent=agent_obj, tools=tools_list)
+        if resp is None:
+            return None
+
+        # If it's already a string, return it
+        if isinstance(resp, str):
+            return resp
+
+        # If it's bytes
+        if isinstance(resp, (bytes, bytearray)):
+            try:
+                return resp.decode("utf-8", errors="replace")
+            except Exception:
+                return str(resp)
+
+        # If it's a dict, search known keys
+        if isinstance(resp, dict):
+            # common keys
+            for key in ("output", "result", "text", "answer", "final_answer", "final_output_text", "output_text", "response"):
+                if key in resp and resp[key]:
+                    return extract_response_text(resp[key])
+            # some LangChain versions store return values under 'return_values'
+            if "return_values" in resp and resp["return_values"]:
+                return extract_response_text(resp["return_values"])
+            # fallback: stringify relevant parts
+            try:
+                return json.dumps(resp, default=str)[:4000]
+            except Exception:
+                return str(resp)
+
+        # If it's a list, join elements
+        if isinstance(resp, (list, tuple)):
+            parts = []
+            for el in resp:
+                parts.append(extract_response_text(el) or "")
+            return "\n".join([p for p in parts if p])
+
+        # If it's an object with attributes
+        # try common attributes
+        for attr in ("output", "result", "text", "answer", "return_values"):
+            if hasattr(resp, attr):
+                try:
+                    val = getattr(resp, attr)
+                    return extract_response_text(val)
+                except Exception:
+                    continue
+
+        # If object has a .to_dict or .dict method
+        if hasattr(resp, "to_dict"):
+            try:
+                return extract_response_text(resp.to_dict())
+            except Exception:
+                pass
+        if hasattr(resp, "dict"):
+            try:
+                return extract_response_text(resp.dict())
+            except Exception:
+                pass
+
+        # Fallback to repr/string
+        return str(resp)[:4000]
+    except Exception as e:
+        return f"Failed to extract response text: {str(e)}"
+
+# ============= Helper: detect iteration/time-limit messages ============
+def indicates_iteration_or_time_limit(text_or_error):
+    """
+    Return True if the text or error message indicates the agent stopped due to iteration/time limits.
+    """
+    if text_or_error is None:
+        return False
+    text = str(text_or_error).lower()
+    checks = [
+        "iteration limit",
+        "time limit",
+        "stopped due to",
+        "agent stopped",
+        "stopped because",
+        "stopped after",
+        "exceeded max",
+        "iteration",
+        "max_iterations",
+        "max execution time",
+    ]
+    for token in checks:
+        if token in text:
+            return True
+    return False
 
 # ============= AGENT (Pure LangChain) =============
 def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
     """
-    Runs the LangChain React agent with the supplied conversation and message.
-    Implements robust execution and retries if the agent stops due to iteration or time limits.
+    Runs the LangChain React agent with robust invoke and response handling.
     """
-    # Build LLM (keep original provider logic unchanged)
+    # Build LLM exactly as before
     llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
           else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
 
-    # Create agent using the prompt and tools (preserve original function call style)
+    # Create agent using provided prompt and tools
     agent = create_react_agent(llm, tools, REACT_PROMPT)
 
-    # Prepare conversation text safely
+    # Prepare conversation history text
     try:
         if conversation_history and isinstance(conversation_history, list):
             parts = []
             for item in conversation_history:
-                role = item.get("role", "user") if isinstance(item, dict) else "user"
-                content = item.get("content", "") if isinstance(item, dict) else str(item)
-                # sanitize basic control characters
+                if isinstance(item, dict):
+                    role = item.get("role", "user")
+                    content = item.get("content", "")
+                else:
+                    role = "user"
+                    content = str(item)
+                # Basic sanitization
                 if isinstance(content, str):
                     content = content.replace("\x00", " ")
                 parts.append(f"{role}: {content}")
@@ -163,90 +259,80 @@ def run_agent(conversation_history: list, message: str, api_key: str, provider: 
 
     combined_input = f"Conversation history:\n{conv_text}\n\nUser question: {message}"
 
-    # Execution strategy:
-    # 1) Try with a moderate iteration budget and a guarded execution-time budget if supported.
-    # 2) If result indicates iteration/time limit stop, retry once with higher limits.
+    # Create executor with safe caps
     initial_max_iter = 6
-    initial_max_time = 20  # seconds, advisory; may be ignored by some langchain versions
-
+    initial_max_time = 20  # advisory
     executor = make_executor(agent, tools, max_iterations=initial_max_iter, max_execution_time=initial_max_time, verbose=False)
 
-    # Helper to actually run the executor and capture result or exception
-    def _execute_with_executor(exec_obj, inp):
+    # Try to invoke. Prefer invoke over run, and handle many return shapes.
+    def invoke_executor(exec_obj, inp):
+        # prefer 'invoke' if present
         try:
-            # prefer run(...) which returns final string in many LangChain versions
-            if hasattr(exec_obj, "run"):
-                return exec_obj.run(inp), None
-            # some runtimes expose invoke
             if hasattr(exec_obj, "invoke"):
                 resp = exec_obj.invoke({"input": inp})
-                # try to extract string
-                if isinstance(resp, dict):
-                    for key in ("output", "result"):
-                        if key in resp:
-                            return resp[key], None
-                    # if nothing extracted, return json dump
-                    return json.dumps(resp, default=str), None
-                return str(resp), None
-            # fallback: try calling as a callable
-            return str(exec_obj(inp)), None
-        except Exception as e:
-            return None, e
+                return resp, None
+            # older versions might expose 'arun' or callables; try calling the executor directly
+            if callable(exec_obj):
+                try:
+                    resp = exec_obj({"input": inp})
+                    return resp, None
+                except TypeError:
+                    # maybe it expects a string
+                    resp = exec_obj(inp)
+                    return resp, None
+            # Last fallback: try 'run' but only if present and not deprecated in this environment.
+            if hasattr(exec_obj, "run"):
+                try:
+                    resp = exec_obj.run(inp)
+                    return resp, None
+                except Exception as run_err:
+                    return None, run_err
+            return None, RuntimeError("Executor has no invoke/run/call method")
+        except Exception as top_e:
+            return None, top_e
 
-    # First attempt
-    response_text, error = _execute_with_executor(executor, combined_input)
+    # Execute first attempt
+    resp_raw, resp_err = invoke_executor(executor, combined_input)
+    resp_text = extract_response_text(resp_raw)
 
-    # If there was an exception, or the agent returned the known "stopped due to iteration/time limit" message, attempt a single retry
-    def _indicates_iteration_stop(res, err):
-        if err is not None:
-            msg = str(err).lower()
-            if "iteration" in msg or "time limit" in msg or "stopped" in msg:
-                return True
-        if isinstance(res, str):
-            low = res.lower()
-            if "iteration limit" in low or "time limit" in low or "agent stopped" in low or "stopped due to" in low:
-                return True
-        return False
-
-    if _indicates_iteration_stop(response_text, error):
-        # Log the event to stdout for debugging in the environment
-        print("Agent appears to have stopped due to iteration/time limit. Attempting one retry with higher limits.")
+    # If it looks like iteration/time-limit stop, retry once with higher caps
+    if indicates_iteration_or_time_limit(resp_text) or indicates_iteration_or_time_limit(resp_err):
+        # log for visibility
+        print("Detected iteration/time-limit stop on first attempt. Retrying once with higher caps.")
         try:
-            # escalate limits but keep them bounded to avoid runaway loops
             retry_max_iter = 12
             retry_max_time = 60
             executor_retry = make_executor(agent, tools, max_iterations=retry_max_iter, max_execution_time=retry_max_time, verbose=False)
-            response_text_retry, error_retry = _execute_with_executor(executor_retry, combined_input)
+            resp_raw_r, resp_err_r = invoke_executor(executor_retry, combined_input)
+            resp_text_r = extract_response_text(resp_raw_r)
 
-            # If retry succeeded, return it; otherwise prefer original failure with trace
-            if not _indicates_iteration_stop(response_text_retry, error_retry):
-                if error_retry:
-                    # return both text (if any) and error trace
-                    return f"{response_text_retry}\n\nNote: retry completed but produced an error: {str(error_retry)}"
-                return response_text_retry
+            # If retry produced a usable reply, return it
+            if not indicates_iteration_or_time_limit(resp_text_r) and not indicates_iteration_or_time_limit(resp_err_r):
+                # If retry had an error but produced text, include both
+                if resp_err_r:
+                    return f"{resp_text_r}\n\nNote: retry returned text but also an error: {repr(resp_err_r)}"
+                return resp_text_r or "Agent returned empty response on retry."
             else:
-                # both attempts failed; build informative message including tracebacks where available
-                err_msg = ""
-                if error:
-                    err_msg += f"First attempt error: {repr(error)}\n"
-                if error_retry:
-                    err_msg += f"Retry attempt error: {repr(error_retry)}\n"
-                # include the textual outputs if any
-                out_first = response_text or ""
-                out_retry = response_text_retry or ""
-                return ("Agent stopped due to iteration/time limit after retry. "
-                        "First output:\n" + out_first + "\n\nRetry output:\n" + out_retry + "\n\nErrors:\n" + err_msg)
+                # Both attempts indicated iteration/time-limit; return detailed diagnostics
+                diag = {
+                    "first_response_text": resp_text,
+                    "first_error_repr": repr(resp_err),
+                    "retry_response_text": resp_text_r,
+                    "retry_error_repr": repr(resp_err_r)
+                }
+                return "Agent stopped due to iteration/time limit after retry. Diagnostics: " + json.dumps(diag, default=str)
         except Exception as final_exc:
             tb = traceback.format_exc()
             return f"Agent retry failed with exception: {str(final_exc)}\nTraceback:\n{tb}"
 
-    # If original run produced an exception, return diagnostic
-    if error is not None:
+    # If first attempt had an error but not iteration/time-limit, return helpful diagnostics
+    if resp_err:
         tb = traceback.format_exc()
-        return f"Agent execution error: {str(error)}\nTraceback:\n{tb}"
+        # try to include any textual output we could extract
+        return f"Agent execution error: {repr(resp_err)}\nExtracted text (if any):\n{resp_text}\nTraceback:\n{tb}"
 
-    # Normal successful return
-    return response_text if response_text is not None else "Agent returned no output."
+    # Normal successful response
+    return resp_text or "Agent returned no output."
 
 # ============= FASTAPI + /run-agent =============
 app = FastAPI()
