@@ -93,7 +93,7 @@ def run_agent(conversation_history: list, message: str, api_key: str, provider: 
     executor = AgentExecutor(
         agent=agent,
         tools=tools,
-        handle_parsing_errors=True,  # Handles format errors
+        handle_parsing_errors=True,
         max_iterations=3,
         verbose=False
     )
@@ -118,23 +118,4 @@ async def run(request: Request):
     prov = body.get("provider", "groq")
     if not msg or not key:
         return JSONResponse({"error": "missing data"}, status_code=400)
-    reply = run_agent(conv, msg, key, prov)
-    return JSONResponse({
-        "reply": reply,
-        "status": "success",
-        "provider": prov
-    })
-
-# /int support
-if "inputs" in globals():
-    data = globals().get("inputs", {})
-    conv = data.get("conversation", [])
-    msg = data.get("message", "")
-    key = data.get("api_key", "")
-    prov = data.get("provider", "groq")
-    
-    if msg and key:
-        reply = run_agent(conv, msg, key, prov)
-        globals()["result"] = {"reply": reply, "status": "success"}
-    else:
-        globals()["result"] = {"error": "missing message or key"}
+    reply
