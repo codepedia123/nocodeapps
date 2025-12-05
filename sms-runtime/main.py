@@ -1,204 +1,140 @@
-# main.py - Real-time SMS AI Runtime (FINAL VERSION - NO MORE LOOPS)
+# main.py - PURE LANGCHAIN DYNAMIC API TOOL (exactly what you want)
 import os
 import json
 import requests
+import traceback
 import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-# ============= CACHED INDIA TIME (Never fails) =============
-_cached_time = None
-_cached_at = 0
+# LangChain
+from langchain_core.tools import tool
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
 
-def get_india_time():
-    global _cached_time, _cached_at
-    now = time.time()
-    if _cached_time and (now - _cached_at) < 60:
-        return _cached_time
-
-    urls = [
-        "https://worldtimeapi.org/api/timezone/Asia/Kolkata",
-        "http://worldtimeapi.org/api/timezone/Asia/Kolkata",
-        "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Kolkata"
-    ]
-
-    for url in urls:
-        try:
-            resp = requests.get(url, timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                dt = data.get("datetime") or data.get("dateTime")
-                if dt:
-                    time_str = dt.split("T")[1][:8] if "T" in dt else dt.split(" ")[1][:8]
-                    result = f"Current time in India (Kolkata): {time_str}"
-                    _cached_time = result
-                    _cached_at = now
-                    return result
-        except:
-            continue
-
-    return _cached_time or "Current time in India: unavailable"
-
-# ============= TOOL DEFINITIONS (OpenAI Function Calling) =============
-tools = [
+# ============= DYNAMIC API LIST (you control this) =============
+# Add as many as you want — just URL + description
+DYNAMIC_APIS = [
     {
-        "type": "function",
-        "function": {
-            "name": "get_time",
-            "description": "Get current time in India. Use when user asks for time.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
+        "name": "get_india_time",
+        "url": "https://worldtimeapi.org/api/timezone/Asia/Kolkata",
+        "description": "Get current time in India. Use when user asks for time in India or 'what time is it?'"
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city. Use only for weather queries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City name"}
-                },
-                "required": ["location"]
-            }
-        }
+        "name": "get_delhi_weather",
+        "url": "https://api.open-meteo.com/v1/forecast?latitude=28.66&longitude=77.23&current_weather=true",
+        "description": "Get current weather in Delhi. Use only for weather queries about Delhi."
     },
     {
-        "type": "function",
-        "function": {
-            "name": "search_news",
-            "description": "Search latest news. Use only for news queries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "News topic"}
-                },
-                "required": ["query"]
-            }
-        }
+        "name": "get_mumbai_weather",
+        "url": "https://api.open-meteo.com/v1/forecast?latitude=19.07&longitude=72.87&current_weather=true",
+        "description": "Get current weather in Mumbai. Use only for weather queries about Mumbai."
+    },
+    {
+        "name": "get_news",
+        "url": "https://newsapi.org/v2/top-headlines?country=in&apiKey=your_key",
+        "description": "Get latest news in India. Use for news or current events questions."
     }
 ]
 
-# ============= TOOL IMPLEMENTATIONS =============
-def execute_tool(name: str, args: dict):
-    if name == "get_time":
-        return get_india_time()
-    if name == "get_weather":
-        return "Weather in Mumbai: 28°C, partly cloudy"
-    if name == "search_news":
-        return "Latest news: India wins cricket match!"
-    return "Unknown tool"
+# ============= UNIVERSAL TOOL — CALL ANY API =============
+@tool
+def call_api(api_name: str) -> str:
+    """Call any registered API by name. Only use if user query matches the description."""
+    for api in DYNAMIC_APIS:
+        if api["name"] == api_name:
+            try:
+                resp = requests.get(api["url"], timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return json.dumps(data, indent=2)[:1000]  # Truncate if huge
+                return f"API error {resp.status_code}: {resp.text[:200]}"
+            except Exception as e:
+                return f"API call failed: {str(e)}"
+    return f"Unknown API: {api_name}"
 
-# ============= LLM CALL (OpenAI/Groq Function Calling) =============
-def run_agent(conversation_history: list, latest_message: str, api_key: str, provider: str):
-    messages = [{"role": "system", "content": "You are a helpful SMS assistant. Be concise. Use tools only when needed."}]
-    
-    for msg in conversation_history:
-        messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-    
-    messages.append({"role": "user", "content": latest_message})
+tools = [call_api]
 
-    url = "https://api.groq.com/openai/v1/chat/completions" if provider == "groq" else "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini",
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
-        "temperature": 0.7,
-        "max_tokens": 150
-    }
+# ============= PROMPT — TELLS LLM ABOUT ALL APIS (FIXED WITH REQUIRED VARS) =============
+api_descriptions = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
+REACT_PROMPT = PromptTemplate.from_template(f"""
+You are a helpful SMS assistant.
 
+Available tools: {{tool_names}}
+{{tools}}
+
+API options (call using call_api):
+{api_descriptions}
+
+Rules:
+- Only call an API if the user query clearly matches its description
+- If no API is needed (general chat), just respond normally
+- Never make up data
+
+Thought: Always reason step by step
+Action: call_api
+Action Input: {{"api_name": "api_name_here"}}  # Replace with actual name
+Observation: [result]
+... (repeat until done)
+Final Answer: [your reply]
+
+Question: {{input}}
+{{agent_scratchpad}}
+""")
+
+# ============= AGENT (Pure LangChain) =============
+def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
+    llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
+          else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
+    agent = create_react_agent(llm, tools, REACT_PROMPT)
+    executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        handle_parsing_errors=True,  # Handles format errors
+        max_iterations=3,
+        verbose=False
+    )
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        data = resp.json()
-
-        if resp.status_code != 200:
-            return f"LLM ERROR: {data.get('error', {}).get('message', 'Unknown')}"
-
-        message = data["choices"][0]["message"]
-
-        # If tool call
-        if message.get("tool_calls"):
-            tool_call = message["tool_calls"][0]
-            name = tool_call["function"]["name"]
-            args = json.loads(tool_call["function"]["arguments"] or "{}")
-            tool_result = execute_tool(name, args)
-            
-            # Second call with result
-            messages.append(message)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "name": name,
-                "content": tool_result
-            })
-            
-            second_resp = requests.post(url, json={**payload, "messages": messages}, headers=headers, timeout=15)
-            second_data = second_resp.json()
-            return second_data["choices"][0]["message"]["content"].strip()
-
-        # Direct reply
-        return message["content"].strip()
-
+        response = executor.invoke({
+            "input": message,
+            "chat_history": [HumanMessage(content=m["content"]) for m in conversation_history]
+        })
+        return response["output"]
     except Exception as e:
-        return f"Agent failed: {str(e)}"
+        return f"Agent error: {str(e)}"
 
-# ============= FASTAPI =============
+# ============= FASTAPI + /int =============
 app = FastAPI()
 
 @app.post("/run-agent")
-async def run_agent_endpoint(request: Request):
-    try:
-        body = await request.json()
-    except:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    conversation = body.get("conversation", [])
-    message = body.get("message", "").strip()
-    api_key = body.get("api_key", "").strip()
-    provider = body.get("provider", "groq").lower()
-
-    if not message or not api_key or provider not in ["groq", "openai"]:
-        return JSONResponse({"error": "Invalid request"}, status_code=400)
-
-    reply = run_agent(conversation, message, api_key, provider)
-
+async def run(request: Request):
+    body = await request.json()
+    conv = body.get("conversation", [])
+    msg = body.get("message", "")
+    key = body.get("api_key", "")
+    prov = body.get("provider", "groq")
+    if not msg or not key:
+        return JSONResponse({"error": "missing data"}, status_code=400)
+    reply = run_agent(conv, msg, key, prov)
     return JSONResponse({
         "reply": reply,
-        "india_time_used": get_india_time(),
         "status": "success",
-        "provider": provider
+        "provider": prov
     })
 
-@app.get("/")
-def health():
-    return {"status": "AI SMS Runtime LIVE", "time": get_india_time()}
-
-# ============= /int EXECUTION =============
+# /int support
 if "inputs" in globals():
-    try:
-        data = globals().get("inputs", {})
-        conversation = data.get("conversation", [])
-        message = data.get("message", "")
-        api_key = data.get("api_key", "")
-        provider = data.get("provider", "groq").lower()
-
-        if not message or not api_key:
-            result = {"error": "Missing data"}
-        else:
-            reply = run_agent(conversation, message, api_key, provider)
-            result = {
-                "reply": reply,
-                "india_time_used": get_india_time(),
-                "status": "success"
-            }
-
-        globals()["result"] = result
-    except Exception as e:
-        globals()["result"] = {"error": str(e)}
+    data = globals().get("inputs", {})
+    conv = data.get("conversation", [])
+    msg = data.get("message", "")
+    key = data.get("api_key", "")
+    prov = data.get("provider", "groq")
+    
+    if msg and key:
+        reply = run_agent(conv, msg, key, prov)
+        globals()["result"] = {"reply": reply, "status": "success"}
+    else:
+        globals()["result"] = {"error": "missing message or key"}
