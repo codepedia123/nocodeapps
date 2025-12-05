@@ -24,7 +24,6 @@ def get_india_time():
     global _cached_time, _cached_at
     now = time.time()
     
-    # Return cached if < 60 seconds old
     if _cached_time and (now - _cached_at) < 60:
         return _cached_time
 
@@ -49,7 +48,6 @@ def get_india_time():
         except:
             continue
 
-    # Final fallback
     if _cached_time:
         return _cached_time
     return "Current time in India: unavailable"
@@ -57,17 +55,17 @@ def get_india_time():
 # ============= TOOLS =============
 @tool
 def get_time(timezone: str = "Asia/Kolkata") -> str:
-    """Get current time in any timezone. Use for time queries."""
-    return get_india_time() if timezone == "Asia/Kolkata" else "Time tool used"
+    """Get current time in a timezone. Use only when user asks for time."""
+    return get_india_time()
 
 @tool
 def get_weather(location: str) -> str:
-    """Get weather for a city. Use only for weather queries."""
+    """Get current weather for a city. Use only for weather/location queries."""
     return "Weather in Mumbai: 28°C, partly cloudy"  # Replace with real API later
 
 @tool
 def search_news(query: str) -> str:
-    """Search news. Use only for news queries."""
+    """Search latest news. Use only for news/current events questions."""
     return "Latest news: India wins cricket match!"
 
 tools = [get_time, get_weather, search_news]
@@ -78,29 +76,30 @@ def get_llm(api_key: str, provider: str):
         return ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key, temperature=0.7)
     return ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0.7)
 
-# ============= PROMPT (Fixed for parsing) =============
-REACT_PROMPT = PromptTemplate.from_template("""
-You are a helpful SMS assistant.
+# ============= PROMPT (Fixed: Now has {tool_names} and {tools}) =============
+REACT_PROMPT = PromptTemplate.from_template(
+    """You are a helpful SMS assistant. Answer naturally and concisely.
 
-Tools: {tool_names}
+Available tools: {tool_names}
+{tools}
 
-Use tools only when needed:
-- get_time: for time queries
-- get_weather: for weather
-- search_news: for news
+Use tools ONLY when needed:
+- get_time → for time queries
+- get_weather → for weather queries
+- search_news → for news queries
 
-Thought: Reason step by step. If no tool needed, just respond.
+Thought: Always think step by step. If no tool is needed, just respond.
 
 Format:
-Thought: [your reasoning]
+Thought: [reasoning]
 Action: tool_name
-Action Input: {{"arg": "value"}}
-Observation: [result]
-Final Answer: [reply to user]
+Action Input: {{"param": "value"}}
+Observation: [tool result]
+Final Answer: [your reply]
 
 Question: {input}
-{agent_scratchpad}
-""")
+{agent_scratchpad}"""
+)
 
 # ============= AGENT (With parsing error handling) =============
 def run_agent_with_tools(conversation_history: list, latest_message: str, api_key: str, provider: str = "groq"):
@@ -110,7 +109,7 @@ def run_agent_with_tools(conversation_history: list, latest_message: str, api_ke
     executor = AgentExecutor(
         agent=agent,
         tools=tools,
-        handle_parsing_errors=True,  # ← THIS FIXES THE PARSING ERROR
+        handle_parsing_errors=True,
         max_iterations=3,
         verbose=False
     )
@@ -118,11 +117,11 @@ def run_agent_with_tools(conversation_history: list, latest_message: str, api_ke
     try:
         response = executor.invoke({
             "input": latest_message,
-            "chat_history": [HumanMessage(content=m["content"]) for m in conversation_history]
+            "chat_history": [HumanMessage(content=m["content"]) for m in conversation_history if m.get("content")]
         })
         return response["output"]
     except Exception as e:
-        return f"Agent failed: {str(e)}"
+        return f"Agent error: {str(e)}"
 
 # ============= FASTAPI =============
 app = FastAPI()
@@ -155,7 +154,7 @@ async def run_agent(request: Request):
 def health():
     return {"status": "AI SMS Runtime LIVE", "time": get_india_time()}
 
-# ============= /int EXECUTION =============
+# ============= /int EXECUTION (Auto-run) =============
 if "inputs" in globals():
     try:
         data = globals().get("inputs", {})
@@ -165,15 +164,16 @@ if "inputs" in globals():
         provider = data.get("provider", "groq").lower()
         
         if not message or not api_key:
-            result = {"error": "Missing data"}
+            result = {"error": "Missing message or api_key"}
         else:
             reply = run_agent_with_tools(conversation, message, api_key, provider)
             result = {
                 "reply": reply,
                 "india_time_used": get_india_time(),
-                "status": "success"
+                "status": "success",
+                "provider": provider
             }
         
         globals()["result"] = result
     except Exception as e:
-        globals()["result"] = {"error": str(e)}
+        globals()["result"] = {"error": str(e), "traceback": traceback.format_exc()}
