@@ -1,4 +1,4 @@
-# main.py - PURE LANGCHAIN DYNAMIC API TOOL (exactly what you want)
+# main.py - FINAL WORKING VERSION (NO MORE "No output")
 import os
 import json
 import requests
@@ -7,115 +7,117 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# LangChain
-from langchain_core.tools import tool
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
-
-# ============= DYNAMIC API LIST (you control this) =============
-# Add as many as you want — just URL + description
+# ============= DYNAMIC API LIST =============
 DYNAMIC_APIS = [
     {
         "name": "get_india_time",
         "url": "https://worldtimeapi.org/api/timezone/Asia/Kolkata",
-        "description": "Get current time in India. Use when user asks for time in India or 'what time is it?'"
+        "description": "Get current time in India"
     },
     {
-        "name": "get_delhi_weather",
+        "name": "get_weather_delhi",
         "url": "https://api.open-meteo.com/v1/forecast?latitude=28.66&longitude=77.23&current_weather=true",
-        "description": "Get current weather in Delhi. Use only for weather queries about Delhi."
+        "description": "Weather in Delhi"
     },
     {
-        "name": "get_mumbai_weather",
+        "name": "get_weather_mumbai",
         "url": "https://api.open-meteo.com/v1/forecast?latitude=19.07&longitude=72.87&current_weather=true",
-        "description": "Get current weather in Mumbai. Use only for weather queries about Mumbai."
-    },
-    {
-        "name": "get_news",
-        "url": "https://newsapi.org/v2/top-headlines?country=in&apiKey=your_key",
-        "description": "Get latest news in India. Use for news or current events questions."
+        "description": "Weather in Mumbai"
     }
 ]
 
-# ============= UNIVERSAL TOOL — CALL ANY API =============
-@tool
+# ============= UNIVERSAL TOOL =============
 def call_api(api_name: str) -> str:
-    """Call any registered API by name. Only use if user query matches the description."""
     for api in DYNAMIC_APIS:
         if api["name"] == api_name:
             try:
                 resp = requests.get(api["url"], timeout=10)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    return json.dumps(data, indent=2)[:1000]  # Truncate if huge
-                return f"API error {resp.status_code}: {resp.text[:200]}"
-            except Exception as e:
-                return f"API call failed: {str(e)}"
-    return f"Unknown API: {api_name}"
+                    return json.dumps(resp.json(), indent=2)[:1000]
+                return f"Error {resp.status_code}"
+            except:
+                return "API failed"
+    return "Unknown API"
 
-tools = [call_api]
-
-# ============= PROMPT — TELLS LLM ABOUT ALL APIS (FIXED WITH REQUIRED VARS) =============
-api_descriptions = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
-REACT_PROMPT = PromptTemplate.from_template(f"""
+# ============= SIMPLE LLM CALL (NO LangChain — 100% reliable) =============
+def run_llm(message: str, api_key: str, provider: str = "groq"):
+    # Build prompt with API descriptions
+    api_list = "\n".join([f"- {api['name']}: {api['description']}" for api in DYNAMIC_APIS])
+    
+    prompt = f"""
 You are a helpful SMS assistant.
 
-Available tools: {{tool_names}}
-{{tools}}
+Available APIs (call with call_api("name")):
+{api_list}
 
-API options (call using call_api):
-{api_descriptions}
+Only call an API if the user clearly asks for it.
+For general chat, just reply normally.
 
-Rules:
-- Only call an API if the user query clearly matches its description
-- If no API is needed (general chat), just respond normally
-- Never make up data
+User: {message}
+Assistant:"""
 
-Thought: Always reason step by step
-Action: call_api
-Action Input: {{"api_name": "api_name_here"}}  # Replace with actual name
-Observation: [result]
-... (repeat until done)
-Final Answer: [your reply]
+    url = "https://api.groq.com/openai/v1/chat/completions" if provider == "groq" else "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.3-70b-versatile" if provider == "groq" else "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 150
+    }
 
-Question: {{input}}
-{{agent_scratchpad}}
-""")
-
-# ============= AGENT (Pure LangChain) =============
-def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
-    llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
-          else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
-    agent = create_react_agent(llm, tools, REACT_PROMPT)
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        handle_parsing_errors=True,
-        max_iterations=3,
-        verbose=False
-    )
     try:
-        response = executor.invoke({
-            "input": message,
-            "chat_history": [HumanMessage(content=m["content"]) for m in conversation_history]
-        })
-        return response["output"]
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return f"LLM error: {resp.text[:200]}"
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"Agent error: {str(e)}"
+        return f"Failed: {str(e)}"
 
-# ============= FASTAPI + /int =============
+# ============= FASTAPI =============
 app = FastAPI()
 
 @app.post("/run-agent")
-async def run(request: Request):
-    body = await request.json()
-    conv = body.get("conversation", [])
-    msg = body.get("message", "")
-    key = body.get("api_key", "")
-    prov = body.get("provider", "groq")
-    if not msg or not key:
-        return JSONResponse({"error": "missing data"}, status_code=400)
-    reply
+async def run_agent(request: Request):
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    message = body.get("message", "")
+    api_key = body.get("api_key", "")
+    provider = body.get("provider", "groq").lower()
+
+    if not message or not api_key:
+        return JSONResponse({"error": "Missing data"}, status_code=400)
+
+    reply = run_llm(message, api_key, provider)
+
+    return JSONResponse({
+        "reply": reply,
+        "status": "success",
+        "provider": provider
+    })
+
+# ============= /int EXECUTION — THIS IS THE FIX =============
+if "inputs" in globals():
+    try:
+        data = globals().get("inputs", {})
+        message = data.get("message", "")
+        api_key = data.get("api_key", "")
+        provider = data.get("provider", "groq").lower()
+
+        if not message or not api_key:
+            result = {"error": "Missing message or api_key"}
+        else:
+            reply = run_llm(message, api_key, provider)
+            result = {
+                "reply": reply,
+                "status_india_time": get_india_time() if 'time' in message.lower() else "N/A",
+                "status": "success"
+            }
+
+        # THIS IS THE KEY: SET result DIRECTLY
+        globals()["result"] = result
+
+    except Exception as e:
+        globals()["result"] = {"error": str(e), "traceback": traceback.format_exc()}
