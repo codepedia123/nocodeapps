@@ -76,6 +76,17 @@ def search_news(query: str) -> str:
 # List of all tools (LangChain will evaluate conditionally)
 tools = [get_time, get_weather, search_news]
 
+# ============= TOOL: Get India Time (Legacy Fallback - Not a LangChain Tool) =============
+def get_india_time():
+    try:
+        resp = requests.get("https://worldtimeapi.org/api/timezone/Asia/Kolkata", timeout=5)
+        data = resp.json()
+        datetime_str = data["datetime"]
+        time_only = datetime_str.split("T")[1][:8]  # HH:MM:SS
+        return f"Current time in India (Kolkata): {time_only}"
+    except Exception as e:
+        return f"Time fetch failed: {str(e)}"
+
 # ============= LLM SETUP =============
 def get_llm(api_key: str, provider: str):
     if provider == "groq":
