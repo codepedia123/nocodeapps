@@ -1,5 +1,4 @@
-# main.py - PURE LANGCHAIN DYNAMIC API TOOL (updated with four direct GET tools:
-# get_india_time, genderize, agify, random_joke) and usage instructions in the prompt.
+# main.py - PURE LANGCHAIN DYNAMIC API TOOL (fixed PromptTemplate variable issue)
 import os
 import json
 import requests
@@ -16,14 +15,7 @@ from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 
-# ============= TOOLS (direct GET requests as requested) =============
-# Each tool performs a single direct GET request to the endpoint the user specified.
-# They return a short JSON/string slice so the agent can use them.
-# - get_india_time() : no args, returns the full worldtimeapi response for Asia/Kolkata
-# - genderize(name) : takes the name string the user asks about and returns genderize.io result
-# - agify(name)    : takes the name string the user asks about and returns agify.io result
-# - random_joke()  : no args, returns a random joke from official-joke-api.appspot.com
-
+# ============= TOOLS (direct GET requests) =============
 @tool
 def get_india_time() -> str:
     """Get current time in India (Asia/Kolkata). No arguments."""
@@ -31,14 +23,13 @@ def get_india_time() -> str:
         resp = requests.get("https://worldtimeapi.org/api/timezone/Asia/Kolkata", timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        # Return the full JSON as a string (bounded length)
         return json.dumps(data, indent=2)[:4000]
     except Exception as e:
         return f"get_india_time failed: {str(e)}"
 
 @tool
 def genderize(name: str) -> str:
-    """Guess gender for a given name using genderize.io. Example usage: genderize(name='ishita')"""
+    """Guess gender for a given name using genderize.io. Example: genderize('ishita')"""
     try:
         if not name:
             return "genderize: missing 'name' parameter"
@@ -51,7 +42,7 @@ def genderize(name: str) -> str:
 
 @tool
 def agify(name: str) -> str:
-    """Guess age for a given name using agify.io. Example usage: agify(name='meelad')"""
+    """Guess age for a given name using agify.io. Example: agify('meelad')"""
     try:
         if not name:
             return "agify: missing 'name' parameter"
@@ -73,43 +64,52 @@ def random_joke() -> str:
     except Exception as e:
         return f"random_joke failed: {str(e)}"
 
-# Register tools in a list used by the agent
 tools = [get_india_time, genderize, agify, random_joke]
 
-# ============= PROMPT — DESCRIBES AVAILABLE TOOLS + USAGE INSTRUCTIONS ============
-# Build usage descriptions programmatically so the prompt stays in sync with the tools.
+# ============= PROMPT — DESCRIBES AVAILABLE TOOLS and usage instructions ============
 api_descriptions = "\n".join([
-    "- get_india_time(): Get current time in India (Asia/Kolkata). Use when user asks 'what time is it in India' or 'current time Kolkata'.",
-    "- genderize(name): Provide the user's name as the 'name' parameter. Example: {\"name\": \"ishita\"}. Returns gender guess from genderize.io.",
-    "- agify(name): Provide the user's name as the 'name' parameter. Example: {\"name\": \"meelad\"}. Returns age guess from agify.io.",
-    "- random_joke(): Returns a random joke (setup + punchline). Use for light entertainment requests."
+    "- get_india_time(): Get current time in India (Asia/Kolkata). Use for questions like 'what time is it in India' or 'Kolkata time'.",
+    "- genderize(name): Provide the person's name as a single string. Example usage in agent actions: Action: genderize  Action Input: ishita",
+    "- agify(name): Provide the person's name as a single string. Example usage in agent actions: Action: agify  Action Input: meelad",
+    "- random_joke(): Returns a random joke with setup and punchline. Use for light entertainment requests."
 ])
 
-# Note: any literal JSON examples that include braces must be escaped using double braces {{ }} so PromptTemplate doesn't treat them as variables.
+# IMPORTANT: only these template variables appear: {tool_names}, {tools}, {input}, {agent_scratchpad}
+# Do not include any other {curly} tokens to avoid PromptTemplate variable errors.
 REACT_PROMPT = PromptTemplate.from_template(
     """
-You are a helpful SMS assistant with access to four external helper tools. Use them only when they clearly match the user's request.
+You are a helpful SMS assistant with four external helper tools. Use the tools only when the user's request clearly requires them.
 
 Available tools: {tool_names}
 {tools}
 
-API options and usage examples:
-""" + api_descriptions + """
+API options and concise usage instructions:
+"""
+    + api_descriptions
+    + """
 
-Usage instructions and examples:
-- To get India time, call get_india_time() with no arguments.
-- To guess gender for a name, call genderize with a name argument. Example action:
-  Action: genderize
-  Action Input: {{"name": "ishita"}}
-- To guess age for a name, call agify with a name argument. Example action:
-  Action: agify
-  Action Input: {{"name": "meelad"}}
-- To get a joke, call random_joke() with no arguments.
+Usage examples for the agent:
+To get India time, call get_india_time with no arguments. Example action:
+Action: get_india_time
+Action Input: 
+
+To guess gender, call genderize with the name as a single token. Example action:
+Action: genderize
+Action Input: ishita
+
+To guess age, call agify with the name as a single token. Example action:
+Action: agify
+Action Input: meelad
+
+To get a joke, call random_joke with no arguments. Example action:
+Action: random_joke
+Action Input: 
 
 Rules:
-- Only call a tool when the user's request explicitly requires it.
-- Do not invent or hallucinate API outputs. Always return the tool output when you call a tool.
-- Keep responses concise and accurate for the user's query.
+- Only call a tool when the user's request explicitly demands it.
+- When you call a tool, return the tool output directly and then continue reasoning if needed.
+- Do not fabricate or invent API outputs.
+- Keep replies concise and accurate.
 
 Question: {input}
 {agent_scratchpad}
@@ -118,9 +118,6 @@ Question: {input}
 
 # ============= Executor constructor helper (version tolerant) =============
 def make_executor(agent_obj, tools_list, max_iterations=6, max_execution_time=None, verbose=False):
-    """
-    Construct AgentExecutor with fallback behavior depending on installed LangChain.
-    """
     kwargs = dict(
         agent=agent_obj,
         tools=tools_list,
@@ -133,10 +130,10 @@ def make_executor(agent_obj, tools_list, max_iterations=6, max_execution_time=No
     try:
         return AgentExecutor(**kwargs)
     except TypeError:
-        fallback_kwargs = kwargs.copy()
-        fallback_kwargs.pop("max_execution_time", None)
+        # fallback without max_execution_time
+        kwargs.pop("max_execution_time", None)
         try:
-            return AgentExecutor(**fallback_kwargs)
+            return AgentExecutor(**kwargs)
         except Exception:
             try:
                 return AgentExecutor(agent_obj, tools_list)
@@ -145,9 +142,6 @@ def make_executor(agent_obj, tools_list, max_iterations=6, max_execution_time=No
 
 # ============= Response extraction helper ============
 def extract_response_text(resp):
-    """
-    Extract readable text from various possible executor responses.
-    """
     try:
         if resp is None:
             return None
@@ -171,7 +165,6 @@ def extract_response_text(resp):
         if isinstance(resp, (list, tuple)):
             parts = [extract_response_text(el) or "" for el in resp]
             return "\n".join([p for p in parts if p])
-        # objects with attributes
         for attr in ("output", "result", "text", "answer", "return_values"):
             if hasattr(resp, attr):
                 try:
@@ -193,9 +186,6 @@ def extract_response_text(resp):
         return f"Failed to extract response text: {str(e)}"
 
 def indicates_iteration_or_time_limit(text_or_error):
-    """
-    Detect phrases that indicate the agent hit iteration or time limits.
-    """
     if text_or_error is None:
         return False
     txt = str(text_or_error).lower()
@@ -212,16 +202,11 @@ def indicates_iteration_or_time_limit(text_or_error):
 
 # ============= AGENT (Pure LangChain) =============
 def run_agent(conversation_history: list, message: str, api_key: str, provider: str):
-    """
-    Runs the agent using invoke() where possible and robustly extracts a textual reply.
-    """
-    # Build LLM (preserve provider logic)
     llm = ChatGroq(api_key=api_key, model="llama-3.3-70b-versatile", temperature=0.7) if provider == "groq" \
           else ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
 
     agent = create_react_agent(llm, tools, REACT_PROMPT)
 
-    # Prepare conversation context text
     try:
         if conversation_history and isinstance(conversation_history, list):
             parts = []
@@ -243,7 +228,6 @@ def run_agent(conversation_history: list, message: str, api_key: str, provider: 
 
     combined_input = f"Conversation history:\n{conv_text}\n\nUser question: {message}"
 
-    # Create executor with safe caps
     initial_max_iter = 6
     initial_max_time = 20
     executor = make_executor(agent, tools, max_iterations=initial_max_iter, max_execution_time=initial_max_time, verbose=False)
@@ -273,7 +257,6 @@ def run_agent(conversation_history: list, message: str, api_key: str, provider: 
     resp_raw, resp_err = invoke_executor(executor, combined_input)
     resp_text = extract_response_text(resp_raw)
 
-    # Retry once with higher limits if we detect iteration/time-limit failure
     if indicates_iteration_or_time_limit(resp_text) or indicates_iteration_or_time_limit(resp_err):
         print("Detected iteration/time-limit stop on first attempt. Retrying once with higher limits.")
         try:
