@@ -281,7 +281,8 @@ def indicates_iteration_or_time_limit(text_or_error) -> bool:
 # ---------------------------
 # Main agent runner (returns dict with reply + logs + diagnostics)
 # ---------------------------
-def run_agent(conversation_history: List[Dict[str, Any]], message: str, provider: str, api_key: str):
+def run_agent(conversation_history, message, provider, api_key):
+
 
     """
     Run the agent. Returns a dict with:
@@ -300,7 +301,8 @@ def run_agent(conversation_history: List[Dict[str, Any]], message: str, provider
             llm = ChatGroq(api_key=None, model="llama-3.3-70b-versatile", temperature=0.7)  # placeholder None to avoid logging
             logger.log("llm.create", "ChatGroq instance created (api_key omitted from logs)", {"model": "llama-3.3-70b-versatile"})
         else:
-            llm = ChatOpenAI(api_key=None, model="gpt-4o-mini", temperature=0.7)
+            llm = ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
+
             logger.log("llm.create", "ChatOpenAI instance created (api_key omitted from logs)", {"model": "gpt-4o-mini"})
     except Exception as e:
         tb = traceback.format_exc()
@@ -454,6 +456,7 @@ async def run(request: Request):
     # IMPORTANT: do not include api_key in logs or responses. We'll pass provider only.
     result = run_agent(conv, msg, provider=prov, api_key=key)
 
+
     # attach provider and status
     response = {
         "reply": result.get("reply"),
@@ -474,6 +477,7 @@ if "inputs" in globals():
 
     if msg and key:
         _result = run_agent(conv, msg, provider=prov, api_key=key)
+
         globals()["result"] = {
             "reply": _result.get("reply"),
             "status": "success",
