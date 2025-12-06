@@ -149,39 +149,33 @@ api_descriptions = "\n".join([
 
 REACT_PROMPT = PromptTemplate.from_template(
     """
-You are a helpful SMS assistant that may call external tools when necessary.
+You are a helpful assistant. You may use tools to answer questions.
 
-Available tools: {tool_names}
-{tools}
+Use the following format:
 
-API options:
-"""
-    + api_descriptions
-    + """
-
-Usage examples (agent actions must use these tools only when required):
-Action: get_india_time
-Action Input: 
-
-Action: genderize
-Action Input: ishita
-
-Action: agify
-Action Input: meelad
-
-Action: random_joke
-Action Input: 
+Question: the input question
+Thought: think about what to do
+Action: the tool name to use (one of: {tool_names})
+Action Input: the input for the toola
+Observation: the tool result
+... (you may repeat Thought/Action/Action Input/Observation)
+Thought: I now know the final answer
+Final Answer: the final answer to the user
 
 Rules:
-- Call a tool only when the user's request explicitly requires it.
-- When you call a tool, include only the required input token (name for genderize/agify) and return the tool output.
-- Do not invent data or fabricate API outputs.
-- Keep replies concise and accurate.
+- Use a tool ONLY when needed.
+- If the question is about gender, call genderize.
+- If the question is about age, call agify.
+- If the user asks for a joke, call random_joke.
+- If the user asks for time, call get_india_time.
+- NEVER call the same tool twice for the same name.
+- NEVER loop. After one tool call, produce the final answer.
 
 Question: {input}
 {agent_scratchpad}
 """
 )
+
 
 # ---------------------------
 # Executor constructor helper (version tolerant)
