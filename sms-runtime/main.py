@@ -48,6 +48,19 @@ class Logger:
 logger = Logger()
 
 # ---------------------------
+# Small helpers for key validation and masking
+# ---------------------------
+def _is_plausible_openai_key(k: Optional[str]) -> bool:
+    return isinstance(k, str) and k.startswith("sk-") and len(k) >= 40
+
+def _mask_key(k: Optional[str]) -> str:
+    if not k or not isinstance(k, str):
+        return "NO_KEY"
+    if len(k) <= 10:
+        return k
+    return k[:6] + "..." + k[-4:]
+
+# ---------------------------
 # Tools: direct GET wrappers that log requests & responses
 # ---------------------------
 @tool
@@ -151,31 +164,35 @@ REACT_PROMPT = PromptTemplate.from_template(
     """
 You are a helpful assistant. You may use tools to answer questions.
 
-Use the following format:
+Available tools: {tool_names}
+{tools}
 
-Question: the input question
-Thought: think about what to do
-Action: the tool name to use (one of: {tool_names})
-Action Input: the input for the toola
-Observation: the tool result
-... (you may repeat Thought/Action/Action Input/Observation)
-Thought: I now know the final answer
-Final Answer: the final answer to the user
-
-Rules:
-- Use a tool ONLY when needed.
-- If the question is about gender, call genderize.
-- If the question is about age, call agify.
-- If the user asks for a joke, call random_joke.
-- If the user asks for time, call get_india_time.
-- NEVER call the same tool twice for the same name.
-- NEVER loop. After one tool call, produce the final answer.
+Use the following format exactly when reasoning and producing outputs:
 
 Question: {input}
+
+Thought: think about what to do
+Action: the tool name to use (one of: {tool_names})
+Action Input: the single token input for the tool (for genderize/agify use a single name)
+Observation: the tool result
+
+...repeat Thought/Action/Action Input/Observation as needed...
+
+Thought: I now know the final answer
+Final Answer: <the concise final answer for the user>
+
+Rules:
+- Use a tool only when needed.
+- If the question asks gender, call genderize(name).
+- If the question asks age, call agify(name).
+- If the user asks for a joke, call random_joke().
+- If the user asks for India time, call get_india_time().
+- Do not call the same tool twice for the same question.
+- After producing Final Answer, stop. Do not produce additional Thoughts.
+
 {agent_scratchpad}
 """
 )
-
 
 # ---------------------------
 # Executor constructor helper (version tolerant)
@@ -276,27 +293,45 @@ def indicates_iteration_or_time_limit(text_or_error) -> bool:
 # Main agent runner (returns dict with reply + logs + diagnostics)
 # ---------------------------
 def run_agent(conversation_history, message, provider, api_key):
-
-
     """
     Run the agent. Returns a dict with:
       reply: final reply text (or diagnostic)
       logs: list of log events
       diagnostics: optional additional info
-    Notes: This function does NOT log the api_key. Pass provider string only.
+    Note: this function avoids logging the raw api_key.
     """
     # clear logger for this request
     logger.clear()
     logger.log("run.start", "run_agent start", {"provider": provider})
 
+    # Determine which API key to use: prefer client-provided, otherwise environment
+    api_key_to_use = None
+    provided_masked = None
+    if api_key and isinstance(api_key, str) and api_key.strip():
+        api_key_to_use = api_key.strip()
+        provided_masked = _mask_key(api_key_to_use)
+        logger.log("api_key.received", "Client provided api_key received (masked)", {"masked": provided_masked})
+    else:
+        env_key = os.getenv("OPENAI_API_KEY")
+        if env_key:
+            api_key_to_use = env_key
+            logger.log("api_key.env", "Using OPENAI_API_KEY from environment (masked)", {"masked": _mask_key(env_key)})
+
+    # Validate plausible key and log a warning (masked) if it looks wrong
+    if api_key_to_use and not _is_plausible_openai_key(api_key_to_use):
+        logger.log("api_key.warning", "Provided API key does not look like a standard OpenAI key (masked)", {"masked": _mask_key(api_key_to_use)})
+
     # Build LLM (do not log api_key)
     try:
         if provider == "groq":
-            llm = ChatGroq(api_key=None, model="llama-3.3-70b-versatile", temperature=0.7)  # placeholder None to avoid logging
+            llm = ChatGroq(api_key=None, model="llama-3.3-70b-versatile", temperature=0.7)
             logger.log("llm.create", "ChatGroq instance created (api_key omitted from logs)", {"model": "llama-3.3-70b-versatile"})
         else:
-            llm = ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.7)
-
+            if not api_key_to_use:
+                logger.log("llm.error", "No API key available for OpenAI provider", {})
+                return {"reply": "LLM creation error: The api_key client option must be set either by passing api_key to the request or by setting the OPENAI_API_KEY environment variable", "logs": logger.to_list(), "diagnostics": {"llm_error": "no_api_key"}}
+            # pass the api key directly to the client; avoid logging it
+            llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0.7)
             logger.log("llm.create", "ChatOpenAI instance created (api_key omitted from logs)", {"model": "gpt-4o-mini"})
     except Exception as e:
         tb = traceback.format_exc()
@@ -439,17 +474,22 @@ app = FastAPI()
 
 @app.post("/run-agent")
 async def run(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        # return a clear error if JSON is malformed
+        return JSONResponse({"error": "invalid JSON payload", "details": str(e)}, status_code=400)
+
     conv = body.get("conversation", [])
     msg = body.get("message", "")
-    key = body.get("api_key", "")  # we will not log api_key anywhere
+    key = body.get("api_key", "")  # client-provided key (optional)
     prov = body.get("provider", "groq")
-    if not msg or not key:
-        return JSONResponse({"error": "missing data"}, status_code=400)
 
-    # IMPORTANT: do not include api_key in logs or responses. We'll pass provider only.
-    result = run_agent(conv, msg, provider=prov, api_key=key)
+    if not msg:
+        return JSONResponse({"error": "missing message"}, status_code=400)
 
+    # forward client-provided key if present, else rely on env
+    result = run_agent(conv, msg, provider=prov, api_key=key if key else None)
 
     # attach provider and status
     response = {
@@ -469,8 +509,8 @@ if "inputs" in globals():
     key = data.get("api_key", "")
     prov = data.get("provider", "groq")
 
-    if msg and key:
-        _result = run_agent(conv, msg, provider=prov, api_key=key)
+    if msg:
+        _result = run_agent(conv, msg, provider=prov, api_key=key if key else None)
 
         globals()["result"] = {
             "reply": _result.get("reply"),
