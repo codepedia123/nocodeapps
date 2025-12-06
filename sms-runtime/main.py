@@ -281,7 +281,8 @@ def indicates_iteration_or_time_limit(text_or_error) -> bool:
 # ---------------------------
 # Main agent runner (returns dict with reply + logs + diagnostics)
 # ---------------------------
-def run_agent(conversation_history: List[Dict[str, Any]], message: str, provider: str, api_key_placeholder_shown: bool=False) -> Dict[str, Any]:
+def run_agent(conversation_history: List[Dict[str, Any]], message: str, provider: str, api_key: str):
+
     """
     Run the agent. Returns a dict with:
       reply: final reply text (or diagnostic)
@@ -451,7 +452,8 @@ async def run(request: Request):
         return JSONResponse({"error": "missing data"}, status_code=400)
 
     # IMPORTANT: do not include api_key in logs or responses. We'll pass provider only.
-    result = run_agent(conv, msg, provider=prov)
+    result = run_agent(conv, msg, provider=prov, api_key=key)
+
     # attach provider and status
     response = {
         "reply": result.get("reply"),
@@ -471,7 +473,7 @@ if "inputs" in globals():
     prov = data.get("provider", "groq")
 
     if msg and key:
-        _result = run_agent(conv, msg, provider=prov)
+        _result = run_agent(conv, msg, provider=prov, api_key=key)
         globals()["result"] = {
             "reply": _result.get("reply"),
             "status": "success",
