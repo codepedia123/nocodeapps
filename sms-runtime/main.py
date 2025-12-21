@@ -5,6 +5,7 @@ import requests
 import traceback
 import time
 import uuid
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,514 +13,182 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # LangChain imports
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 
 # ---------------------------
-# Logger helper (collects sequence of events)
+# Configuration JSON
+# ---------------------------
+DYNAMIC_CONFIG = {
+    "3": {
+        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/I8pJYgOFUaIqx5SfudeHn/sync",
+        "api_payload_json": "%7B %22row_id%22%3A 0%2C %22values%22%3A %7B %22A%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22B%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22C%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22D%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22E%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22F%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22G%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22H%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22I%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22J%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22K%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22 %7D %7D",
+        "instructions": "'row_id' This is a Required parameter, its value should be the zero-based index for the row number you intend to update; 'values.A' is timestamp; 'values.B' is phone; 'values.C' is name; 'values.D' is email; 'values.E' is street address; 'values.F' is city; 'values.G' is state; 'values.H' is ZIP; 'values.I' is age; 'values.J' is DOB; 'values.K' is 'Qualified + Transferred' status.",
+        "when_run": "Run this whenever user asks for email or provides contact information to be synced/updated."
+    },
+    "4": {
+        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/DDBxxS1Ja2b1PgrHE1R3w/sync",
+        "api_payload_json": "%7B%22values%22%3A%7B%22A%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22B%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22C%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22D%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22E%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22F%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22G%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22H%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22I%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22J%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22K%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%7D%7D",
+        "instructions": "'A' is Timestamp; 'B' is Phone; 'C' is Name; 'D' is Email; 'E' is Address; 'F' is City; 'G' is State; 'H' is ZIP; 'I' is Age; 'J' is DOB; 'K' is Qualified + Transferred status.",
+        "when_run": "Run this whenever user provides contact details or requests a status update for a lead."
+    }
+}
+
+# ---------------------------
+# Logger helper
 # ---------------------------
 class Logger:
     def __init__(self):
         self._events: List[Dict[str, Any]] = []
-
     def _now(self) -> str:
         return datetime.utcnow().isoformat() + "Z"
-
     def log(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
-        entry = {
-            "ts": self._now(),
-            "id": str(uuid.uuid4()),
-            "type": event_type,
-            "message": message,
-            "data": data or {}
-        }
+        entry = {"ts": self._now(), "id": str(uuid.uuid4()), "type": event_type, "message": message, "data": data or {}}
         self._events.append(entry)
+    def to_list(self) -> List[Dict[str, Any]]: return self._events.copy()
+    def clear(self): self._events = []
 
-    def to_list(self) -> List[Dict[str, Any]]:
-        return self._events.copy()
-
-    def clear(self):
-        self._events = []
-
-# Module-level logger instance used by tools and agent
 logger = Logger()
 
 # ---------------------------
-# Small helpers for key validation and masking
+# Dynamic Tool Factory
 # ---------------------------
-def _is_plausible_openai_key(k: Optional[str]) -> bool:
-    return isinstance(k, str) and k.startswith("sk-") and len(k) >= 40
+def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
+    generated_tools = []
 
-def _mask_key(k: Optional[str]) -> str:
-    if not k or not isinstance(k, str):
-        return "NO_KEY"
-    if len(k) <= 10:
-        return k
-    return k[:6] + "..." + k[-4:]
+    for tool_id, cfg in config.items():
+        api_url = cfg["api_url"]
+        instructions = cfg["instructions"]
+        condition = cfg["when_run"]
+        # Decode the payload template for reference (though the LLM creates the actual payload)
+        raw_payload_str = urllib.parse.unquote(cfg["api_payload_json"])
+        
+        def make_api_call(payload: Dict[str, Any], url=api_url, tid=tool_id) -> str:
+            event_id = str(uuid.uuid4())
+            logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
+            start = time.time()
+            try:
+                resp = requests.post(url, json=payload, timeout=15)
+                elapsed = time.time() - start
+                logger.log("http.request", f"POST to {url}", {"status_code": resp.status_code, "elapsed_s": elapsed})
+                resp.raise_for_status()
+                return f"Success: {resp.text}"
+            except Exception as e:
+                logger.log("tool.error", f"api_tool_{tid} failed", {"error": str(e)})
+                return f"API Call failed: {str(e)}"
 
-# ---------------------------
-# Tools: direct GET wrappers that log requests & responses
-# ---------------------------
-@tool
-def get_india_time() -> str:
-    """Get current time in India (Asia/Kolkata). No arguments."""
-    event_id = str(uuid.uuid4())
-    logger.log("tool.call", "get_india_time called", {"event_id": event_id})
-    url = "https://worldtimeapi.org/api/timezone/Asia/Kolkata"
-    start = time.time()
-    try:
-        resp = requests.get(url, timeout=10)
-        elapsed = time.time() - start
-        logger.log("http.request", "GET worldtimeapi", {"url": url, "status_code": resp.status_code, "elapsed_s": elapsed})
-        resp.raise_for_status()
-        data = resp.json()
-        snippet = json.dumps(data, indent=2)[:2000]
-        logger.log("tool.return", "get_india_time success", {"event_id": event_id, "snippet": snippet})
-        return snippet
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("tool.error", "get_india_time failed", {"event_id": event_id, "error": str(e), "traceback": tb})
-        return f"get_india_time failed: {str(e)}"
+        # Create StructuredTool with dynamic description
+        # We tell the LLM exactly how to format the JSON payload via the description
+        tool_desc = (
+            f"USE CASE: {condition}. "
+            f"INSTRUCTIONS: {instructions}. "
+            f"The input must be a valid JSON object following the structure: {raw_payload_str}"
+        )
 
-@tool
-def genderize(name: str) -> str:
-    """Guess gender for a given name using genderize.io. Example: genderize('ishita')"""
-    event_id = str(uuid.uuid4())
-    logger.log("tool.call", "genderize called", {"event_id": event_id, "name": name})
-    url = "https://api.genderize.io/"
-    start = time.time()
-    try:
-        resp = requests.get(url, params={"name": name}, timeout=8)
-        elapsed = time.time() - start
-        logger.log("http.request", "GET genderize", {"url": url, "params": {"name": name}, "status_code": resp.status_code, "elapsed_s": elapsed})
-        resp.raise_for_status()
-        data = resp.json()
-        snippet = json.dumps(data, indent=2)[:2000]
-        logger.log("tool.return", "genderize success", {"event_id": event_id, "snippet": snippet})
-        return snippet
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("tool.error", "genderize failed", {"event_id": event_id, "name": name, "error": str(e), "traceback": tb})
-        return f"genderize failed: {str(e)}"
+        new_tool = StructuredTool.from_function(
+            func=make_api_call,
+            name=f"api_tool_{tool_id}",
+            description=tool_desc
+        )
+        generated_tools.append(new_tool)
+    
+    return generated_tools
 
-@tool
-def agify(name: str) -> str:
-    """Guess age for a given name using agify.io. Example: agify('meelad')"""
-    event_id = str(uuid.uuid4())
-    logger.log("tool.call", "agify called", {"event_id": event_id, "name": name})
-    url = "https://api.agify.io/"
-    start = time.time()
-    try:
-        resp = requests.get(url, params={"name": name}, timeout=8)
-        elapsed = time.time() - start
-        logger.log("http.request", "GET agify", {"url": url, "params": {"name": name}, "status_code": resp.status_code, "elapsed_s": elapsed})
-        resp.raise_for_status()
-        data = resp.json()
-        snippet = json.dumps(data, indent=2)[:2000]
-        logger.log("tool.return", "agify success", {"event_id": event_id, "snippet": snippet})
-        return snippet
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("tool.error", "agify failed", {"event_id": event_id, "name": name, "error": str(e), "traceback": tb})
-        return f"agify failed: {str(e)}"
-
-@tool
-def random_joke() -> str:
-    """Get a random joke from official-joke-api.appspot.com. No arguments."""
-    event_id = str(uuid.uuid4())
-    logger.log("tool.call", "random_joke called", {"event_id": event_id})
-    url = "https://official-joke-api.appspot.com/random_joke"
-    start = time.time()
-    try:
-        resp = requests.get(url, timeout=8)
-        elapsed = time.time() - start
-        logger.log("http.request", "GET random_joke", {"url": url, "status_code": resp.status_code, "elapsed_s": elapsed})
-        resp.raise_for_status()
-        data = resp.json()
-        snippet = json.dumps(data, indent=2)[:1500]
-        logger.log("tool.return", "random_joke success", {"event_id": event_id, "snippet": snippet})
-        return snippet
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("tool.error", "random_joke failed", {"event_id": event_id, "error": str(e), "traceback": tb})
-        return f"random_joke failed: {str(e)}"
-
-# Register tools in a list used by the agent
-tools = [get_india_time, genderize, agify, random_joke]
+# Register tools
+tools = create_universal_tools(DYNAMIC_CONFIG)
 
 # ---------------------------
-# Prompt: only safe variables {tool_names},{tools},{input},{agent_scratchpad}
+# ReAct Prompt
 # ---------------------------
-api_descriptions = "\n".join([
-    "- get_india_time(): Get current time in India (Asia/Kolkata).",
-    "- genderize(name): Provide the person's name as single token, e.g. ishita.",
-    "- agify(name): Provide the person's name as single token, e.g. meelad.",
-    "- random_joke(): Returns a random joke (setup + punchline)."
-])
-
 REACT_PROMPT = PromptTemplate.from_template(
     """
-You are a helpful assistant. You may use tools to answer questions.
+You are an expert data assistant. You have access to specific API tools to sync user data.
 
 Available tools: {tool_names}
 {tools}
 
-Use the following format exactly when reasoning and producing outputs:
+To use a tool, you MUST use this exact format:
+
+Thought: I need to use api_tool_X because [reason]. I will curate the payload based on the tool's instructions.
+Action: the tool name (one of: {tool_names})
+Action Input: A valid JSON object containing the parameters required by the tool instructions.
+Observation: the tool result
+... (repeat Thought/Action/Action Input/Observation if needed)
+Thought: I have successfully synced the data.
+Final Answer: [Concise confirmation to the user]
+
+RULES:
+1. Only call a tool if the user's request matches the 'USE CASE' in the tool description.
+2. Curate the 'Action Input' JSON carefully, mapping user info to the keys (like A, B, C, row_id) as defined in the instructions.
+3. If information is missing, use an empty string or null for non-required fields.
 
 Question: {input}
-
-Thought: think about what to do
-Action: the tool name to use (one of: {tool_names})
-Action Input: the single token input for the tool (for genderize/agify use a single name)
-Observation: the tool result
-
-...repeat Thought/Action/Action Input/Observation as needed...
-
-Thought: I now know the final answer
-Final Answer: <the concise final answer for the user>
-
-Rules:
-- Use a tool only when needed.
-- If the question asks gender, call genderize(name).
-- If the question asks age, call agify(name).
-- If the user asks for a joke, call random_joke().
-- If the user asks for India time, call get_india_time().
-- Do not call the same tool twice for the same question.
-- After producing Final Answer, stop. Do not produce additional Thoughts.
-
 {agent_scratchpad}
 """
 )
 
 # ---------------------------
-# Executor constructor helper (version tolerant)
+# Core Logic & Execution
 # ---------------------------
-def make_executor(agent_obj, tools_list, max_iterations=6, max_execution_time=None, verbose=False):
-    kwargs = dict(agent=agent_obj, tools=tools_list, handle_parsing_errors=True, max_iterations=max_iterations, verbose=verbose)
-    if max_execution_time is not None:
-        kwargs["max_execution_time"] = max_execution_time
-    try:
-        exec_inst = AgentExecutor(**kwargs)
-        logger.log("executor.create", "AgentExecutor created", {"kwargs": {"max_iterations": max_iterations, "max_execution_time": max_execution_time}})
-        return exec_inst
-    except TypeError:
-        # fallback
-        try:
-            kwargs.pop("max_execution_time", None)
-            exec_inst = AgentExecutor(**kwargs)
-            logger.log("executor.create", "AgentExecutor created (fallback)", {"kwargs": {"max_iterations": max_iterations}})
-            return exec_inst
-        except Exception as e:
-            tb = traceback.format_exc()
-            logger.log("executor.error", "AgentExecutor creation failed", {"error": str(e), "traceback": tb})
-            raise
+def _mask_key(k: Optional[str]) -> str:
+    return k[:6] + "..." + k[-4:] if k and len(k) > 10 else "NO_KEY"
 
-# ---------------------------
-# Response extraction helper
-# ---------------------------
-def extract_response_text(resp) -> Optional[str]:
-    try:
-        if resp is None:
-            return None
-        if isinstance(resp, str):
-            return resp
-        if isinstance(resp, (bytes, bytearray)):
-            try:
-                return resp.decode("utf-8", errors="replace")
-            except Exception:
-                return str(resp)
-        if isinstance(resp, dict):
-            # Common keys used across LangChain variants
-            for key in ("output", "result", "text", "answer", "final_answer", "response"):
-                if key in resp and resp[key]:
-                    return extract_response_text(resp[key])
-            if "return_values" in resp and resp["return_values"]:
-                return extract_response_text(resp["return_values"])
-            # include 'intermediate_steps' if present for diagnostics
-            if "intermediate_steps" in resp:
-                try:
-                    return json.dumps(resp["intermediate_steps"], default=str)[:4000]
-                except Exception:
-                    pass
-            return json.dumps(resp, default=str)[:4000]
-        if isinstance(resp, (list, tuple)):
-            parts = [extract_response_text(el) or "" for el in resp]
-            return "\n".join([p for p in parts if p])
-        # objects with common attributes
-        for attr in ("output", "result", "text", "answer", "return_values"):
-            if hasattr(resp, attr):
-                try:
-                    val = getattr(resp, attr)
-                    return extract_response_text(val)
-                except Exception:
-                    continue
-        if hasattr(resp, "to_dict"):
-            try:
-                return extract_response_text(resp.to_dict())
-            except Exception:
-                pass
-        if hasattr(resp, "dict"):
-            try:
-                return extract_response_text(resp.dict())
-            except Exception:
-                pass
-        return str(resp)[:4000]
-    except Exception as e:
-        return f"extract_response_text_error: {str(e)}"
+def make_executor(agent_obj, tools_list):
+    return AgentExecutor(agent=agent_obj, tools=tools_list, handle_parsing_errors=True, max_iterations=6, verbose=False)
 
-# ---------------------------
-# Detection helper (iteration/time-limit)
-# ---------------------------
-def indicates_iteration_or_time_limit(text_or_error) -> bool:
-    if text_or_error is None:
-        return False
-    txt = str(text_or_error).lower()
-    tokens = [
-        "iteration limit",
-        "time limit",
-        "stopped due to",
-        "agent stopped",
-        "exceeded max",
-        "max_iterations",
-        "max execution time",
-        "iteration"
-    ]
-    return any(tok in txt for tok in tokens)
+def extract_response_text(resp) -> str:
+    if isinstance(resp, dict):
+        return resp.get("output", resp.get("result", str(resp)))
+    return str(resp)
 
-# ---------------------------
-# Main agent runner (returns dict with reply + logs + diagnostics)
-# ---------------------------
 def run_agent(conversation_history, message, provider, api_key):
-    """
-    Run the agent. Returns a dict with:
-      reply: final reply text (or diagnostic)
-      logs: list of log events
-      diagnostics: optional additional info
-    Note: this function avoids logging the raw api_key.
-    """
-    # clear logger for this request
     logger.clear()
-    logger.log("run.start", "run_agent start", {"provider": provider})
+    logger.log("run.start", "Starting dynamic agent", {"provider": provider})
 
-    # Determine which API key to use: prefer client-provided, otherwise environment
-    api_key_to_use = None
-    provided_masked = None
-    if api_key and isinstance(api_key, str) and api_key.strip():
-        api_key_to_use = api_key.strip()
-        provided_masked = _mask_key(api_key_to_use)
-        logger.log("api_key.received", "Client provided api_key received (masked)", {"masked": provided_masked})
-    else:
-        env_key = os.getenv("OPENAI_API_KEY")
-        if env_key:
-            api_key_to_use = env_key
-            logger.log("api_key.env", "Using OPENAI_API_KEY from environment (masked)", {"masked": _mask_key(env_key)})
+    api_key_to_use = api_key or os.getenv("OPENAI_API_KEY")
 
-    # Validate plausible key and log a warning (masked) if it looks wrong
-    if api_key_to_use and not _is_plausible_openai_key(api_key_to_use):
-        logger.log("api_key.warning", "Provided API key does not look like a standard OpenAI key (masked)", {"masked": _mask_key(api_key_to_use)})
-
-    # Build LLM (do not log api_key)
     try:
         if provider == "groq":
-            llm = ChatGroq(api_key=None, model="llama-3.3-70b-versatile", temperature=0.7)
-            logger.log("llm.create", "ChatGroq instance created (api_key omitted from logs)", {"model": "llama-3.3-70b-versatile"})
+            llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
         else:
-            if not api_key_to_use:
-                logger.log("llm.error", "No API key available for OpenAI provider", {})
-                return {"reply": "LLM creation error: The api_key client option must be set either by passing api_key to the request or by setting the OPENAI_API_KEY environment variable", "logs": logger.to_list(), "diagnostics": {"llm_error": "no_api_key"}}
-            # pass the api key directly to the client; avoid logging it
-            llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0.7)
-            logger.log("llm.create", "ChatOpenAI instance created (api_key omitted from logs)", {"model": "gpt-4o-mini"})
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("llm.error", "LLM creation failed", {"error": str(e), "traceback": tb})
-        return {"reply": f"LLM creation error: {str(e)}", "logs": logger.to_list(), "diagnostics": {"llm_error": str(e)}}
-
-    # Create agent
-    try:
+            llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
+        
         agent = create_react_agent(llm, tools, REACT_PROMPT)
-        logger.log("agent.create", "Agent created", {})
+        executor = make_executor(agent, tools)
+
+        # Context building
+        conv_text = "\n".join([f"{i.get('role')}: {i.get('content')}" for i in conversation_history if isinstance(i, dict)])
+        combined_input = f"History:\n{conv_text}\n\nUser: {message}"
+
+        resp_raw = executor.invoke({"input": combined_input})
+        resp_text = extract_response_text(resp_raw)
+
+        return {"reply": resp_text, "logs": logger.to_list(), "diagnostics": {"status": "completed"}}
+
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("agent.error", "create_react_agent failed", {"error": str(e), "traceback": tb})
-        return {"reply": f"Agent creation failed: {str(e)}", "logs": logger.to_list(), "diagnostics": {"agent_error": str(e)}}
-
-    # Build conversation context text
-    try:
-        parts = []
-        if conversation_history and isinstance(conversation_history, list):
-            for item in conversation_history:
-                if isinstance(item, dict):
-                    role = item.get("role", "user")
-                    content = item.get("content", "")
-                else:
-                    role = "user"
-                    content = str(item)
-                if isinstance(content, str):
-                    content = content.replace("\x00", " ")
-                parts.append(f"{role}: {content}")
-        conv_text = "\n".join(parts)
-    except Exception as e:
-        conv_text = ""
-        logger.log("conv.error", "Failed to build conversation text", {"error": str(e)})
-
-    combined_input = f"Conversation history:\n{conv_text}\n\nUser question: {message}"
-    logger.log("input.prepared", "Combined input prepared", {"combined_input_preview": combined_input[:2000]})
-
-    # Executor creation & invocation
-    initial_max_iter = 6
-    initial_max_time = 20
-    try:
-        executor = make_executor(agent, tools, max_iterations=initial_max_iter, max_execution_time=initial_max_time, verbose=False)
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.log("executor.error", "Failed to create executor", {"error": str(e), "traceback": tb})
-        return {"reply": f"Executor creation failed: {str(e)}", "logs": logger.to_list(), "diagnostics": {"executor_error": str(e)}}
-
-    def invoke_executor(exec_obj, inp) -> Tuple[Any, Optional[Exception]]:
-        logger.log("executor.invoke.start", "Invoking executor", {"method_attempt_order": ["invoke","callable","run"]})
-        try:
-            if hasattr(exec_obj, "invoke"):
-                resp = exec_obj.invoke({"input": inp})
-                logger.log("executor.invoke", "Called invoke()", {"resp_type": type(resp).__name__})
-                return resp, None
-            if callable(exec_obj):
-                try:
-                    resp = exec_obj({"input": inp})
-                    logger.log("executor.callable", "Called executor as callable with dict input", {"resp_type": type(resp).__name__})
-                    return resp, None
-                except TypeError:
-                    resp = exec_obj(inp)
-                    logger.log("executor.callable", "Called executor as callable with string input", {"resp_type": type(resp).__name__})
-                    return resp, None
-            if hasattr(exec_obj, "run"):
-                resp = exec_obj.run(inp)
-                logger.log("executor.run", "Called run()", {"resp_type": type(resp).__name__})
-                return resp, None
-            return None, RuntimeError("Executor has no invoke/run/call method")
-        except Exception as e:
-            tb = traceback.format_exc()
-            logger.log("executor.invoke.error", "Executor invocation failed", {"error": str(e), "traceback": tb})
-            return None, e
-
-    # First attempt
-    t0 = time.time()
-    resp_raw, resp_err = invoke_executor(executor, combined_input)
-    t1 = time.time()
-    logger.log("executor.invoke.done", "Executor finished first attempt", {"elapsed_s": t1 - t0, "raw_type": type(resp_raw).__name__ if resp_raw is not None else None, "error": repr(resp_err) if resp_err else None})
-
-    resp_text = extract_response_text(resp_raw)
-    logger.log("executor.output.extract", "Extracted text from executor raw output", {"text_preview": resp_text[:2000] if resp_text else None})
-
-    # If intermediate steps exist in raw dict, log them
-    try:
-        if isinstance(resp_raw, dict) and "intermediate_steps" in resp_raw:
-            logger.log("executor.intermediate_steps", "Captured intermediate_steps", {"intermediate_steps": resp_raw.get("intermediate_steps")})
-    except Exception:
-        pass
-
-    # Detect iteration/time-limit stops and retry once with higher caps if detected
-    if indicates_iteration_or_time_limit(resp_text) or indicates_iteration_or_time_limit(resp_err):
-        logger.log("executor.limit_detected", "Iteration/time-limit suspected on first attempt", {"resp_text_preview": str(resp_text)[:1000], "error_repr": repr(resp_err)})
-        # Retry with higher limits
-        try:
-            retry_max_iter = 12
-            retry_max_time = 60
-            logger.log("executor.retry.start", "Starting retry with higher limits", {"retry_max_iter": retry_max_iter, "retry_max_time": retry_max_time})
-            executor_retry = make_executor(agent, tools, max_iterations=retry_max_iter, max_execution_time=retry_max_time, verbose=False)
-            t2 = time.time()
-            resp_raw_r, resp_err_r = invoke_executor(executor_retry, combined_input)
-            t3 = time.time()
-            logger.log("executor.retry.done", "Retry finished", {"elapsed_s": t3 - t2, "raw_type": type(resp_raw_r).__name__ if resp_raw_r is not None else None, "error": repr(resp_err_r) if resp_err_r else None})
-            resp_text_r = extract_response_text(resp_raw_r)
-            logger.log("executor.retry.output.extract", "Extracted text from retry", {"text_preview": resp_text_r[:2000] if resp_text_r else None})
-
-            if not indicates_iteration_or_time_limit(resp_text_r) and not indicates_iteration_or_time_limit(resp_err_r):
-                # Success on retry
-                final_reply = resp_text_r or "Agent returned empty response on retry."
-                logger.log("run.success", "Agent returned output on retry", {"reply_preview": final_reply[:2000]})
-                return {"reply": final_reply, "logs": logger.to_list(), "diagnostics": {"attempts": 2}}
-            else:
-                # Both failed; collect diagnostics
-                diag = {
-                    "first_response_text": resp_text,
-                    "first_error_repr": repr(resp_err),
-                    "retry_response_text": resp_text_r,
-                    "retry_error_repr": repr(resp_err_r)
-                }
-                logger.log("run.failure", "Agent stopped due to iteration/time limit after retry", {"diagnostics": diag})
-                return {"reply": "Agent stopped due to iteration/time limit after retry. See diagnostics.", "logs": logger.to_list(), "diagnostics": diag}
-        except Exception as e:
-            tb = traceback.format_exc()
-            logger.log("executor.retry.exception", "Retry raised exception", {"error": str(e), "traceback": tb})
-            return {"reply": f"Agent retry failed with exception: {str(e)}", "logs": logger.to_list(), "diagnostics": {"retry_exception": str(e)}}
-
-    # If first attempt had an error (but not iteration/time-limit), return diagnostics
-    if resp_err:
-        tb = traceback.format_exc()
-        logger.log("executor.error.final", "Executor returned error", {"error": str(resp_err)})
-        return {"reply": "Agent execution error. See logs for details.", "logs": logger.to_list(), "diagnostics": {"error_repr": repr(resp_err), "extracted_text": resp_text}}
-
-    # Success on first attempt
-    logger.log("run.success", "Agent returned output", {"reply_preview": resp_text[:2000] if resp_text else None})
-    return {"reply": resp_text or "Agent returned no output.", "logs": logger.to_list(), "diagnostics": {"attempts": 1}}
+        logger.log("run.error", str(e), {"traceback": traceback.format_exc()})
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list()}
 
 # ---------------------------
-# FastAPI endpoints
+# FastAPI
 # ---------------------------
 app = FastAPI()
 
 @app.post("/run-agent")
 async def run(request: Request):
-    try:
-        body = await request.json()
-    except Exception as e:
-        # return a clear error if JSON is malformed
-        return JSONResponse({"error": "invalid JSON payload", "details": str(e)}, status_code=400)
+    body = await request.json()
+    result = run_agent(
+        body.get("conversation", []),
+        body.get("message", ""),
+        body.get("provider", "openai"),
+        body.get("api_key")
+    )
+    return JSONResponse(result)
 
-    conv = body.get("conversation", [])
-    msg = body.get("message", "")
-    key = body.get("api_key", "")  # client-provided key (optional)
-    prov = body.get("provider", "groq")
-
-    if not msg:
-        return JSONResponse({"error": "missing message"}, status_code=400)
-
-    # forward client-provided key if present, else rely on env
-    result = run_agent(conv, msg, provider=prov, api_key=key if key else None)
-
-    # attach provider and status
-    response = {
-        "reply": result.get("reply"),
-        "status": "success",
-        "provider": prov,
-        "logs": result.get("logs"),
-        "diagnostics": result.get("diagnostics", {})
-    }
-    return JSONResponse(response)
-
-# /int support for your execution environment (preserve behavior, set globals()["result"])
 if "inputs" in globals():
     data = globals().get("inputs", {})
-    conv = data.get("conversation", [])
-    msg = data.get("message", "")
-    key = data.get("api_key", "")
-    prov = data.get("provider", "groq")
-
-    if msg:
-        _result = run_agent(conv, msg, provider=prov, api_key=key if key else None)
-
-        globals()["result"] = {
-            "reply": _result.get("reply"),
-            "status": "success",
-            "provider": prov,
-            "logs": _result.get("logs"),
-            "diagnostics": _result.get("diagnostics", {})
-        }
-    else:
-        globals()["result"] = {"error": "missing message or key"}
-
-# End of file
+    _res = run_agent(data.get("conversation", []), data.get("message", ""), data.get("provider", "openai"), data.get("api_key", ""))
+    globals()["result"] = _res
