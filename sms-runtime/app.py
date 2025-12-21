@@ -363,75 +363,39 @@ LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 
 # simple unsafe token blacklist (adjust as needed)
 def _sanitize_code(code: str) -> str:
-    blocked = [
-
-    ]
-    for token in blocked:
-        if re.search(token, code):
-            raise ValueError(f"Blocked keyword used: {token}")
+    # Pass through without restriction
     return code
 
 
 def _run_code(code: str, inputs: dict) -> dict:
-    # Allowed modules
-    allowed_modules = {
-        "json": __import__("json"),
-        "time": __import__("time"),
-        "datetime": __import__("datetime"),
-        "math": __import__("math"),
-        "re": __import__("re"),
-        "uuid": __import__("uuid"),
-        "random": __import__("random"),
-        "requests": __import__("requests"),
-    }
-
-    def restricted_import(name, globals=None, locals=None, fromlist=None, level=0):
-        if name in allowed_modules:
-            return allowed_modules[name]
-        raise Exception(f"Import '{name}' not allowed")
-
-    # Safe builtins
-    safe_builtins = {
-        "abs": abs,
-        "all": all,
-        "any": any,
-        "bool": bool,
-        "dict": dict,
-        "float": float,
-        "int": int,
-        "len": len,
-        "list": list,
-        "max": max,
-        "min": min,
-        "range": range,
-        "str": str,
-        "sum": sum,
-        "print": print,
-        "Exception": Exception,
-        "isinstance": isinstance,
-        "__import__": restricted_import,
-    }
-
+    """
+    Unrestricted runner.
+    This executes user-provided code with normal Python semantics.
+    Inputs are injected into the execution environment under their keys.
+    The executed code may perform imports, filesystem operations, networking, and other system calls.
+    Use only in trusted environments.
+    """
     env = {
-        "__builtins__": safe_builtins,
-        **allowed_modules,
+        "__name__": "__main__",
+        "__file__": "<dynamic_function>",
         **inputs
     }
 
     try:
-        exec(code, env)
+        # Compile to get clearer tracebacks
+        compiled = compile(code, "<dynamic_function>", "exec")
+        exec(compiled, env)
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
     if "result" in env:
         try:
+            # Ensure the result is JSON serializable
             json.dumps(env["result"])
             return env["result"]
         except Exception:
-            return {"error": "Function returned a non-JSON-serializable value"}
-
+            return {"error": "Function returned a non-JSON-serializable value", "value_repr": repr(env["result"])}
     return {"error": "No result returned from function"}
-
 
 def _save_local_function(fid: str, code: str, meta: dict):
     (LOCAL_FUNC_DIR / f"{fid}.py").write_text(code)
