@@ -53,16 +53,24 @@ logger = Logger()
 # ---------------------------
 FETCH_BASE = "https://api.rhythmflow.ai/fetch"
 
-def fetch_agent_details(agent_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def fetch_agent_details(agent_id: str):
+    url = f"https://api.rhythmflow.ai/fetch?table=agents&id={agent_id}"
+    
+    # Mimic a real browser to avoid being throttled or deprioritized
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
-        params = {"table": "agents", "id": agent_id}
-        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.log("fetch.agent", "Fetched agent details", {"agent_id": agent_id, "status_code": resp.status_code})
-        return data
+        # Increase timeout to 30 seconds to allow for server 'wake-up' time
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.Timeout:
+        logger.log("fetch.agent.error", "Request timed out after 30 seconds", {"agent_id": agent_id})
+        return None
     except Exception as e:
-        logger.log("fetch.agent.error", "Failed to fetch agent details", {"agent_id": agent_id, "error": str(e)})
+        logger.log("fetch.agent.error", f"Failed: {str(e)}", {"agent_id": agent_id})
         return None
 
 def fetch_agent_tools(agent_user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
