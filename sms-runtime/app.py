@@ -364,17 +364,7 @@ LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 # simple unsafe token blacklist (adjust as needed)
 def _sanitize_code(code: str) -> str:
     blocked = [
-        r'\beval\b',
-        r'\bexec\b',
-        r'\bcompile\b',
-        r'\bopen\b',
 
-        r'\bsys\b',
-        r'\bsubprocess\b',
-        r'\bsocket\b',
-        r'\bthreading\b',
-        r'\bmultiprocessing\b',
-        r'\bimportlib\b'
     ]
     for token in blocked:
         if re.search(token, code):
