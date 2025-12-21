@@ -22,6 +22,7 @@ from langchain_groq import ChatGroq
 # ---------------------------
 # Configuration JSON
 # ---------------------------
+# Keep a minimal default fallback config. This will be merged with fetched tools at runtime.
 DYNAMIC_CONFIG = {
     "5": {
         "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/UZ6KJw8w1EInlLqhP1gWZ/sync",
@@ -48,17 +49,47 @@ class Logger:
 logger = Logger()
 
 # ---------------------------
+# Helper: fetch agent details and tools from remote DB endpoints
+# ---------------------------
+FETCH_BASE = "http://54.89.185.235:8000/fetch"
+
+def fetch_agent_details(agent_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    try:
+        params = {"table": "agents", "id": agent_id}
+        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.log("fetch.agent", "Fetched agent details", {"agent_id": agent_id, "status_code": resp.status_code})
+        return data
+    except Exception as e:
+        logger.log("fetch.agent.error", "Failed to fetch agent details", {"agent_id": agent_id, "error": str(e)})
+        return None
+
+def fetch_agent_tools(agent_user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    try:
+        params = {"table": "all-agents-tools", "agent_id": agent_user_id}
+        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.log("fetch.tools", "Fetched agent tools", {"agent_user_id": agent_user_id, "tool_count": len(data) if isinstance(data, dict) else 0})
+        return data
+    except Exception as e:
+        logger.log("fetch.tools.error", "Failed to fetch agent tools", {"agent_user_id": agent_user_id, "error": str(e)})
+        return None
+
+# ---------------------------
 # Dynamic Tool Factory
 # ---------------------------
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     generated_tools = []
 
     for tool_id, cfg in config.items():
-        api_url = cfg["api_url"]
-        instructions = cfg["instructions"]
-        condition = cfg["when_run"]
-        raw_payload_template = urllib.parse.unquote(cfg["api_payload_json"])
-        
+        api_url = cfg.get("api_url", "")
+        instructions = cfg.get("instructions", "")
+        condition = cfg.get("when_run", cfg.get("when_to_run", ""))
+        raw_payload_template = urllib.parse.unquote(cfg.get("api_payload_json", ""))
+
+        # Use defaults in closure to avoid late-binding issues
         def make_api_call(tool_input: Any, url=api_url, tid=tool_id) -> str:
             event_id = str(uuid.uuid4())
             payload = {}
@@ -68,7 +99,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 try:
                     cleaned = tool_input.strip().strip('`').replace('json\n', '', 1)
                     payload = json.loads(cleaned)
-                except:
+                except Exception:
                     return f"Error: Invalid JSON format."
             else:
                 payload = tool_input
@@ -100,40 +131,94 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
 # ---------------------------
 # Core Execution logic
 # ---------------------------
-def run_agent(conversation_history, message, provider, api_key):
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str):
+    """
+    New behavior:
+    - Accepts agent_id, conversation_history, message
+    - Fetch agent details from /fetch?table=agents&id=<agent_id>
+    - Use agent response's prompt as system prompt
+    - Fetch agent tools using agent_resp['user_id'] and merge them into the dynamic tool config
+    - Provider is always openai. The API key is taken from agent details if present, else from environment variable OPENAI_API_KEY
+    """
     logger.clear()
-    logger.log("run.start", "Agent started", {"provider": provider})
+    logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
 
-    api_key_to_use = api_key or os.getenv("OPENAI_API_KEY")
-    tools = create_universal_tools(DYNAMIC_CONFIG)
+    # 1. Fetch agent details
+    agent_resp = fetch_agent_details(agent_id)
+    if not agent_resp:
+        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list()}
+
+    # Determine the api key to use
+    # Prefer an API key stored in the agent details under common keys, otherwise fallback to env var.
+    api_key_to_use = None
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        if key_name in agent_resp and agent_resp.get(key_name):
+            api_key_to_use = agent_resp.get(key_name)
+            break
+    if not api_key_to_use:
+        api_key_to_use = os.getenv("OPENAI_API_KEY")
+
+    # Get agent prompt (instruction)
+    agent_prompt = agent_resp.get("prompt", "You are a helpful assistant.")
+
+    # 2. Fetch tools associated with this agent
+    # The sample uses agent_user_id "1" which maps to agent_resp['user_id']
+    agent_user_id = agent_resp.get("user_id", agent_id)
+    fetched_tools = fetch_agent_tools(agent_user_id)
+    merged_config = DYNAMIC_CONFIG.copy()
+
+    # If fetched_tools is a mapping of ids to tool definitions, merge them
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            try:
+                # Ensure tool id is string
+                str_tid = str(tid)
+                merged_config[str_tid] = {
+                    "api_url": tcfg.get("api_url", ""),
+                    "api_payload_json": tcfg.get("api_payload_json", ""),
+                    "instructions": tcfg.get("instructions", ""),
+                    "when_run": tcfg.get("when_run", tcfg.get("when_run", "")),
+                }
+            except Exception as e:
+                logger.log("merge.tool.error", "Failed to merge tool", {"tool_id": tid, "error": str(e)})
+    else:
+        logger.log("run.tools", "No tools fetched, using default config", {})
+
+    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+
+    # 3. Create tools
+    tools = create_universal_tools(merged_config)
 
     try:
-        # 1. Select Model
-        if provider == "groq":
-            llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-        else:
-            llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
-        
-        # 2. Define modern Tool-Calling Prompt
+        # 4. Select Model (provider is always openai as required)
+        llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
+
+        # 5. Define modern Tool-Calling Prompt using agent_prompt
+        system_message = (
+            f"{agent_prompt}\n\n"
+            "You have tools available for data syncing. "
+            "CRITICAL RULE: Only use a tool if the user's request matches the tool's 'CRITICAL CONDITION'. "
+            "If the user is asking general questions, do NOT use any tools. Just answer naturally."
+        )
+
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful assistant. You have tools available for data syncing. "
-                       "CRITICAL RULE: Only use a tool if the user's request matches the tool's 'CRITICAL CONDITION'. "
-                       "If the user is asking general questions (like 'What is ChatGPT'), do NOT use any tools. Just answer naturally."),
+            ("system", system_message),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
-        # 3. Create Agent
+        # 6. Create Agent
         agent = create_tool_calling_agent(llm, tools, prompt)
         executor = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=False, 
+            agent=agent,
+            tools=tools,
+            verbose=False,
             handle_parsing_errors=True
         )
 
-        # 4. Format History
+        # 7. Format History
         history = []
         for turn in conversation_history:
             if turn.get("role") == "user":
@@ -141,14 +226,14 @@ def run_agent(conversation_history, message, provider, api_key):
             else:
                 history.append(("ai", turn.get("content")))
 
-        # 5. Execute
+        # 8. Execute
         response = executor.invoke({
             "input": message,
             "chat_history": history
         })
-        
+
         return {
-            "reply": response["output"], 
+            "reply": response.get("output", ""), 
             "logs": logger.to_list()
         }
 
@@ -163,16 +248,29 @@ app = FastAPI()
 
 @app.post("/run-agent")
 async def run_endpoint(request: Request):
+    """
+    Expected request JSON:
+    {
+        "agent_id": "agent1",
+        "message": "Hello",
+        "conversation": [ {"role":"user","content":"..."} ]
+    }
+    The code will fetch the agent details and tools, then run the agent using the agent's prompt and tools.
+    """
     body = await request.json()
-    res = run_agent(
-        body.get("conversation", []),
-        body.get("message", ""),
-        body.get("provider", "openai"),
-        body.get("api_key")
-    )
+    agent_id = body.get("agent_id") or body.get("agentId") or body.get("id")
+    if not agent_id:
+        return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
+
+    message = body.get("message", "")
+    conversation = body.get("conversation", [])
+
+    res = run_agent(agent_id, conversation, message)
     return JSONResponse(res)
 
+# Support for interactive runtime evaluation similar to original script
 if "inputs" in globals():
     data = globals().get("inputs", {})
-    _out = run_agent(data.get("conversation", []), data.get("message", ""), data.get("provider", "openai"), data.get("api_key", ""))
+    agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
+    _out = run_agent(agent_id, data.get("conversation", []), data.get("message", ""))
     globals()["result"] = _out
