@@ -6,9 +6,6 @@ import traceback
 import time
 import uuid
 import urllib.parse
-import socket
-import subprocess
-import shlex
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -54,186 +51,107 @@ logger = Logger()
 # ---------------------------
 # Helper: fetch agent details and tools from remote DB endpoints
 # ---------------------------
-# NOTE: adapted so tools fetching uses the same IP-based API first, then falls back to domain.
 FETCH_BASE = "http://54.89.185.235:8000/fetch"
-DOMAIN_FALLBACK = "https://api.rhythmflow.ai/fetch"
 
-def fetch_agent_details(agent_id: str, timeout: int = 30):
+def fetch_agent_details(agent_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    try:
+        params = {"table": "agents", "id": agent_id}
+        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.log("fetch.agent", "Fetched agent details", {"agent_id": agent_id, "status_code": resp.status_code})
+        return data
+    except Exception as e:
+        logger.log("fetch.agent.error", "Failed to fetch agent details", {"agent_id": agent_id, "error": str(e)})
+        return None
+
+# ---------------------------------------------------------------------
+# NEW: Redis-based tools fetch (preferred). Falls back to HTTP if Redis not available.
+# ---------------------------------------------------------------------
+import redis
+from redis.cluster import RedisCluster
+
+# --- Redis connection (same as app.py) ---
+_redis_client = None
+try:
+    redis_url = "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379"
+    _redis_client = RedisCluster.from_url(
+        redis_url,
+        decode_responses=True,
+        ssl_cert_reqs=None,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+        read_from_replicas=True
+    )
+    # quick ping to validate
+    try:
+        _redis_client.ping()
+        logger.log("redis", "Connected to RedisCluster", {"url": redis_url})
+    except Exception as e:
+        logger.log("redis.ping_error", "Ping failed", {"error": str(e)})
+        _redis_client = None
+except Exception as e:
+    logger.log("redis.init_error", "Failed to initialize RedisCluster client", {"error": str(e)})
+    _redis_client = None
+
+def fetch_agent_tools(agent_user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
     """
-    Robust fetch:
-    1) Try IP-based endpoint first (no TLS, avoids DNS/proxy/TLS surprises).
-    2) If that fails, try domain endpoint with TLS verification.
-    3) If that fails, try domain endpoint with verify=False for diagnostic purposes.
-    4) If still failing, run TCP checks and a subprocess curl for diagnostics and log them.
-    Returns parsed JSON dict on success, otherwise None.
+    New behavior:
+    - Attempt to load all rows from dynamic table 'all-agents-tools' directly from Redis.
+    - Filter rows where row['agent_id'] == agent_user_id OR row['agent_id'] == str(agent_user_id)
+    - Return a dict of tool_id -> tool_definition compatible with merging into DYNAMIC_CONFIG.
+    - If Redis is not available, fallback to the original HTTP fetch.
     """
-    ip_url = f"http://54.89.185.235:8000/fetch"
-    domain_url = "https://api.rhythmflow.ai/fetch"
-    params = {"table": "agents", "id": agent_id}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
+    table_name = "all-agents-tools"
+    tool_map: Dict[str, Any] = {}
 
-    session = requests.Session()
-    session.trust_env = True
-
-    def try_get(url, params, verify=True, timeout_local=timeout):
+    # If Redis is available, prefer it
+    if _redis_client:
         try:
-            logger.log("fetch.attempt", "HTTP GET", {"url": url, "params": params, "verify": verify})
-            resp = session.get(url, params=params, headers=headers, timeout=timeout_local, allow_redirects=True, verify=verify)
-            resp.raise_for_status()
-            try:
-                return resp.json()
-            except ValueError as ve:
-                logger.log("fetch.parse.error", "JSON parse error", {"url": url, "status": resp.status_code, "text_snippet": (resp.text[:800] if resp.text else ""), "error": str(ve)})
-                return None
-        except requests.exceptions.Timeout as te:
-            logger.log("fetch.http.timeout", "Timeout", {"url": url, "error": str(te)})
-            return None
-        except requests.exceptions.SSLError as se:
-            logger.log("fetch.http.sslerror", "SSL error", {"url": url, "error": str(se)})
-            return None
-        except requests.exceptions.RequestException as re:
-            logger.log("fetch.http.requesterror", "RequestException", {"url": url, "error": str(re)})
-            return None
-        except Exception as e:
-            logger.log("fetch.http.unexpected", "Unexpected error", {"url": url, "error": str(e), "trace": traceback.format_exc()})
-            return None
+            ids_key = f"table:{table_name}:ids"
+            row_ids = _redis_client.smembers(ids_key) or set()
 
-    # 1) Try IP-based endpoint first
-    try:
-        result = try_get(ip_url, params=params, verify=True, timeout_local=timeout)
-        if result:
-            logger.log("fetch.agent.success", "Fetched agent details via IP", {"agent_id": agent_id, "base": "ip"})
-            return result
-    except Exception as e:
-        logger.log("fetch.agent.error", "IP attempt raised", {"agent_id": agent_id, "error": str(e), "trace": traceback.format_exc()})
+            for row_id in row_ids:
+                if row_id == "_meta":
+                    continue
+                row_key = f"table:{table_name}:row:{row_id}"
+                row = _redis_client.hgetall(row_key)
+                if not row:
+                    continue
 
-    # 2) Try domain endpoint normally (TLS verify)
-    try:
-        result = try_get(domain_url, params=params, verify=True, timeout_local=timeout)
-        if result:
-            logger.log("fetch.agent.success", "Fetched agent details via domain (verified TLS)", {"agent_id": agent_id, "base": "domain_verified"})
-            return result
-    except Exception as e:
-        logger.log("fetch.agent.error", "Domain verified attempt raised", {"agent_id": agent_id, "error": str(e), "trace": traceback.format_exc()})
+                # Normalize agent_id comparisons as strings
+                row_agent_val = row.get("agent_id", "")
+                # compare either numeric user_id or agent-like value
+                if str(row_agent_val) != str(agent_user_id):
+                    # not a match; skip
+                    continue
 
-    # 3) Try domain endpoint with verify=False as diagnostic (not recommended long term)
-    try:
-        result = try_get(domain_url, params=params, verify=False, timeout_local=timeout)
-        if result:
-            logger.log("fetch.agent.success", "Fetched agent details via domain (TLS verify disabled)", {"agent_id": agent_id, "base": "domain_no_verify"})
-            return result
-        else:
-            logger.log("fetch.agent.info", "Domain no-verify returned no JSON", {"agent_id": agent_id})
-    except Exception as e:
-        logger.log("fetch.agent.error", "Domain no-verify attempt raised", {"agent_id": agent_id, "error": str(e), "trace": traceback.format_exc()})
+                # Build tool entry
+                tool_map[str(row_id)] = {
+                    "api_url": row.get("api_url", "") or "",
+                    "api_payload_json": row.get("api_payload_json", "") or "",
+                    "instructions": row.get("instructions", "") or "",
+                    "when_run": row.get("when_run", "") or row.get("when_run", "")
+                }
 
-    # 4) TCP checks and subprocess curl as diagnostics
-    diagnostics = {}
-    try:
-        diagnostics['tcp_checks'] = {}
-        for host, port in [("54.89.185.235", 8000), ("api.rhythmflow.ai", 443)]:
-            try:
-                s = socket.create_connection((host, port), timeout=5)
-                s.close()
-                diagnostics['tcp_checks'][f"{host}:{port}"] = "ok"
-            except Exception as e:
-                diagnostics['tcp_checks'][f"{host}:{port}"] = f"fail: {type(e).__name__} {str(e)}"
-    except Exception as e:
-        diagnostics['tcp_error'] = str(e)
-
-    try:
-        cmd = f"curl -sS -m 20 'http://54.89.185.235:8000/fetch?table=agents&id={agent_id}'"
-        diagnostics['curl_ip_cmd'] = cmd
-        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ)
-        out, err = p.communicate(timeout=25)
-        diagnostics['curl_ip_exit'] = p.returncode
-        diagnostics['curl_ip_out'] = (out.decode('utf-8', errors='replace')[:2000] if out else "")
-        diagnostics['curl_ip_err'] = (err.decode('utf-8', errors='replace')[:2000] if err else "")
-    except Exception as e:
-        diagnostics['curl_error'] = str(e)
-
-    logger.log("fetch.diagnostics", "All fetch attempts failed; diagnostics attached", {"agent_id": agent_id, "diagnostics": diagnostics})
-    return None
-
-def fetch_agent_tools(agent_user_id: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-    """
-    Simplified and reliable tools fetcher.
-
-    Strategy:
-    1. Try primary IP-based endpoint (fast, no TLS ambiguity).
-    2. Fallback once to domain-based HTTPS endpoint.
-    3. Fail fast with clear logs.
-    """
-
-    headers = {
-        "User-Agent": "rhythmflow-agent/1.0",
-        "Accept": "application/json"
-    }
-
-    params = {
-        "table": "all-agents-tools",
-        "agent_id": agent_user_id
-    }
-
-    endpoints = [
-        FETCH_BASE,
-        DOMAIN_FALLBACK
-    ]
-
-    for url in endpoints:
-        try:
-            logger.log("fetch.tools.request", "Fetching agent tools", {
-                "agent_user_id": agent_user_id,
-                "url": url
-            })
-
-            resp = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=timeout
-            )
-
-            if resp.status_code != 200:
-                logger.log("fetch.tools.http_error", "Non-200 response", {
-                    "url": url,
-                    "status": resp.status_code,
-                    "snippet": resp.text[:300]
-                })
-                continue
-
-            data = resp.json()
-            if not isinstance(data, dict):
-                logger.log("fetch.tools.invalid_payload", "Expected JSON object", {
-                    "url": url
-                })
-                continue
-
-            logger.log("fetch.tools.success", "Agent tools fetched", {
-                "agent_user_id": agent_user_id,
-                "tool_count": len(data)
-            })
-            return data
-
-        except requests.exceptions.Timeout:
-            logger.log("fetch.tools.timeout", "Request timed out", {
-                "url": url
-            })
+            logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
+            return tool_map
 
         except Exception as e:
-            logger.log("fetch.tools.exception", "Unexpected error", {
-                "url": url,
-                "error": str(e)
-            })
+            logger.log("fetch.tools.redis.error", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
+            # Fall through to HTTP fallback
 
-    logger.log("fetch.tools.failed", "Failed to fetch agent tools from all endpoints", {
-        "agent_user_id": agent_user_id
-    })
-    return None
-
+    # Fallback: use HTTP fetch (original behavior)
+    try:
+        params = {"table": table_name, "agent_id": agent_user_id}
+        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.log("fetch.tools.http", "Fetched agent tools via HTTP fallback", {"agent_user_id": agent_user_id, "status_code": resp.status_code})
+        return data
+    except Exception as e:
+        logger.log("fetch.tools.error", "Failed to fetch agent tools via HTTP fallback", {"agent_user_id": agent_user_id, "error": str(e)})
+        return None
 
 # ---------------------------
 # Dynamic Tool Factory
@@ -426,69 +344,9 @@ async def run_endpoint(request: Request):
     res = run_agent(agent_id, conversation, message)
     return JSONResponse(res)
 
-@app.get("/diag")
-async def diagnostics():
-    """
-    Diagnostic endpoint to run inside the FastAPI process.
-    Call: curl -sS http://localhost:8000/diag
-    It returns JSON with env proxy variables, TCP connect checks, requests attempts, and a subprocess curl attempt.
-    """
-    out = {"env": {}, "tcp": {}, "requests": {}, "curl_subprocess": {}, "logger": logger.to_list()}
-
-    # 1) Environment proxy variables and important env
-    for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
-        out["env"][k] = os.environ.get(k)
-
-    # 2) TCP connect checks
-    hosts = [("54.89.185.235", 8000), ("api.rhythmflow.ai", 443)]
-    for host, port in hosts:
-        key = f"{host}:{port}"
-        try:
-            s = socket.create_connection((host, port), timeout=5)
-            s.close()
-            out["tcp"][key] = "ok"
-        except Exception as e:
-            out["tcp"][key] = f"fail: {type(e).__name__} {str(e)}"
-
-    # 3) requests checks using session.trust_env True
-    sess = requests.Session()
-    sess.trust_env = True
-    headers = {"User-Agent": "diag-agent/1.0", "Accept": "application/json"}
-    targets = {
-        "ip_http": ("http://54.89.185.235:8000/fetch", {"table": "agents", "id": "agent1"}),
-        "domain_https": ("https://api.rhythmflow.ai/fetch", {"table": "agents", "id": "agent1"})
-    }
-    for name, (url, params) in targets.items():
-        try:
-            r = sess.get(url, params=params, headers=headers, timeout=10, allow_redirects=True, verify=True)
-            out["requests"][name] = {"status": r.status_code, "len": len(r.text or ""), "text_snippet": (r.text[:500] if r.text else "")}
-        except Exception as e:
-            out["requests"][name] = {"error": f"{type(e).__name__}: {str(e)}"}
-
-        # try with verify=False as diagnostic
-        try:
-            r2 = sess.get(url, params=params, headers=headers, timeout=10, allow_redirects=True, verify=False)
-            out["requests"][f"{name}_no_verify"] = {"status": getattr(r2, "status_code", None), "len": len(getattr(r2, "text", "") or ""), "text_snippet": (getattr(r2, "text", "")[:500] if getattr(r2, "text", "") else "")}
-        except Exception as e:
-            out["requests"][f"{name}_no_verify"] = {"error": f"{type(e).__name__}: {str(e)}"}
-
-    # 4) Subprocess curl diagnostic (same user as FastAPI process)
-    try:
-        cmd = f"curl -sS -m 20 'http://54.89.185.235:8000/fetch?table=agents&id=agent1'"
-        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ)
-        out_bytes, err_bytes = p.communicate(timeout=25)
-        out["curl_subprocess"]["cmd"] = cmd
-        out["curl_subprocess"]["exitcode"] = p.returncode
-        out["curl_subprocess"]["stdout_snippet"] = out_bytes.decode("utf-8", errors="replace")[:2000]
-        out["curl_subprocess"]["stderr_snippet"] = err_bytes.decode("utf-8", errors="replace")[:2000]
-    except Exception as e:
-        out["curl_subprocess"]["error"] = f"{type(e).__name__}: {str(e)}"
-
-    return JSONResponse(out)
-
 # Support for interactive runtime evaluation similar to original script
 if "inputs" in globals():
-    data = globals().get("inputs") or globals().get("input") or {}
+    data = globals().get("inputs", {})
     agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
     _out = run_agent(agent_id, data.get("conversation", []), data.get("message", ""))
     globals()["result"] = _out
