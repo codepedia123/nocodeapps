@@ -55,7 +55,7 @@ logger = Logger()
 # Networking defaults and session
 # ---------------------------
 # Use loopback for internal fetches to avoid public routing and potential hairpins
-FETCH_BASE = os.getenv("FETCH_BASE", "http://127.0.0.1:8000/fetch")
+FETCH_BASE = os.getenv("FETCH_BASE", "http://54.89.185.235:8000/fetch")
 # Default connect/read timeouts (connect, read)
 DEFAULT_TIMEOUT = (3, 10)
 
