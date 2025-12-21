@@ -29,7 +29,8 @@ DYNAMIC_CONFIG = {
         "instructions": "'values.A' This is a Non-Required parameter, its value should be the name of the person, if provided, and can be any short text format; 'values.B' This is a Non-Required parameter, its value should be the email address, if provided, and must follow the standard email format; 'values.C' This is a Non-Required parameter, its value should be the phone number, if provided, and can be any short text format.",
         "agent_id": "1",
         "created_at": "1766317934",
-        "updated_at": "1766317934"
+        "updated_at": "1766317934",
+        "when_run": "When user asks for email"
     }
 }
 
