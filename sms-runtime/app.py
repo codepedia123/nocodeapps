@@ -368,7 +368,7 @@ def _sanitize_code(code: str) -> str:
         r'\bexec\b',
         r'\bcompile\b',
         r'\bopen\b',
-        r'\bos\b',
+
         r'\bsys\b',
         r'\bsubprocess\b',
         r'\bsocket\b',
