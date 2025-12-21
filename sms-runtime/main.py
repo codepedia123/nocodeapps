@@ -51,7 +51,9 @@ logger = Logger()
 # ---------------------------
 # Helper: fetch agent details and tools from remote DB endpoints
 # ---------------------------
-FETCH_BASE = "https://api.rhythmflow.ai/fetch"
+# NOTE: adapted so tools fetching uses the same IP-based API first, then falls back to domain.
+FETCH_BASE = "http://54.89.185.235:8000/fetch"
+DOMAIN_FALLBACK = "https://api.rhythmflow.ai/fetch"
 
 def fetch_agent_details(agent_id: str):
     url = f"http://54.89.185.235:8000/fetch?table=agents&id={agent_id}"
@@ -74,16 +76,50 @@ def fetch_agent_details(agent_id: str):
         return None
 
 def fetch_agent_tools(agent_user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    try:
-        params = {"table": "all-agents-tools", "agent_id": agent_user_id}
-        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.log("fetch.tools", "Fetched agent tools", {"agent_user_id": agent_user_id, "tool_count": len(data) if isinstance(data, dict) else 0})
-        return data
-    except Exception as e:
-        logger.log("fetch.tools.error", "Failed to fetch agent tools", {"agent_user_id": agent_user_id, "error": str(e)})
-        return None
+    """
+    Robust fetch for agent tools. Try the primary IP-based FETCH_BASE first, then fall back to DOMAIN_FALLBACK.
+    Logs each attempt and returns the parsed JSON dict on success, or None on permanent failure.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    params = {"table": "all-agents-tools", "agent_id": agent_user_id}
+    attempts = []
+
+    for base in (FETCH_BASE, DOMAIN_FALLBACK):
+        try:
+            logger.log("fetch.tools.attempt", "Attempting to fetch agent tools", {"agent_user_id": agent_user_id, "base": base})
+            resp = requests.get(base, params=params, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            # Parse JSON safely
+            try:
+                data = resp.json()
+            except ValueError as ve:
+                logger.log("fetch.tools.error", "Failed to parse JSON", {"base": base, "error": str(ve), "status_code": resp.status_code, "text_snippet": (resp.text[:400] if resp.text else "")})
+                attempts.append({"base": base, "error": f"json_parse_error: {str(ve)}"})
+                continue
+
+            # Success
+            logger.log("fetch.tools", "Fetched agent tools", {"agent_user_id": agent_user_id, "tool_count": len(data) if isinstance(data, dict) else 0, "base": base})
+            return data
+
+        except requests.exceptions.Timeout as te:
+            logger.log("fetch.tools.attempt.error", "Timeout while fetching agent tools", {"agent_user_id": agent_user_id, "base": base, "error": str(te)})
+            attempts.append({"base": base, "error": f"timeout: {str(te)}"})
+            continue
+        except requests.exceptions.RequestException as re:
+            logger.log("fetch.tools.attempt.error", "RequestException while fetching agent tools", {"agent_user_id": agent_user_id, "base": base, "error": str(re)})
+            attempts.append({"base": base, "error": f"request_error: {str(re)}"})
+            continue
+        except Exception as e:
+            logger.log("fetch.tools.attempt.error", "Unexpected error while fetching agent tools", {"agent_user_id": agent_user_id, "base": base, "error": str(e)})
+            attempts.append({"base": base, "error": f"unexpected: {str(e)}"})
+            continue
+
+    # All attempts failed
+    logger.log("fetch.tools.error", "All attempts to fetch agent tools failed", {"agent_user_id": agent_user_id, "attempts": attempts})
+    return None
 
 # ---------------------------
 # Dynamic Tool Factory
