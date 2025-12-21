@@ -23,17 +23,13 @@ from langchain_groq import ChatGroq
 # Configuration JSON
 # ---------------------------
 DYNAMIC_CONFIG = {
-    "3": {
-        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/I8pJYgOFUaIqx5SfudeHn/sync",
-        "api_payload_json": "%7B %22row_id%22%3A 0%2C %22values%22%3A %7B %22A%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22B%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22C%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22D%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22E%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22F%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22G%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22H%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22I%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22J%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22K%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22 %7D %7D",
-        "instructions": "'row_id' is REQUIRED (zero-based index); 'values.A' is timestamp; 'values.B' is phone; 'values.C' is name; 'values.D' is email; 'values.E' is street address; 'values.F' is city; 'values.G' is state; 'values.H' is ZIP; 'values.I' is age; 'values.J' is DOB; 'values.K' is 'Qualified + Transferred' status.",
-        "when_run": "Run this whenever user asks for email or provides contact information to be synced/updated."
-    },
-    "4": {
-        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/DDBxxS1Ja2b1PgrHE1R3w/sync",
-        "api_payload_json": "%7B%22values%22%3A%7B%22A%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22B%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22C%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22D%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22E%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22F%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22G%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22H%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22I%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22J%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22K%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%7D%7D",
-        "instructions": "'A' is Timestamp; 'B' is Phone; 'C' is Name; 'D' is Email; 'E' is Address; 'F' is City; 'G' is State; 'H' is ZIP; 'I' is Age; 'J' is DOB; 'K' is Qualified + Transferred status.",
-        "when_run": "Run this whenever user provides contact details or requests a status update for a lead."
+    "5": {
+        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/UZ6KJw8w1EInlLqhP1gWZ/sync",
+        "api_payload_json": "%7B%22values%22%3A%7B%22A%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22B%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22C%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%7D%7D",
+        "instructions": "'values.A' This is a Non-Required parameter, its value should be the name of the person, if provided, and can be any short text format; 'values.B' This is a Non-Required parameter, its value should be the email address, if provided, and must follow the standard email format; 'values.C' This is a Non-Required parameter, its value should be the phone number, if provided, and can be any short text format.",
+        "agent_id": "1",
+        "created_at": "1766317934",
+        "updated_at": "1766317934"
     }
 }
 
