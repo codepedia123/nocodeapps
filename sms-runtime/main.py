@@ -1,4 +1,4 @@
-# main.py - LangChain dynamic API runtime with full step-by-step logging
+# main.py - LangChain dynamic API runtime with robust JSON parsing
 import os
 import json
 import requests
@@ -26,7 +26,7 @@ DYNAMIC_CONFIG = {
     "3": {
         "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/I8pJYgOFUaIqx5SfudeHn/sync",
         "api_payload_json": "%7B %22row_id%22%3A 0%2C %22values%22%3A %7B %22A%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22B%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22C%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22D%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22E%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22F%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22G%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22H%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22I%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22J%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C %22K%22%3A %22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22 %7D %7D",
-        "instructions": "'row_id' This is a Required parameter, its value should be the zero-based index for the row number you intend to update; 'values.A' is timestamp; 'values.B' is phone; 'values.C' is name; 'values.D' is email; 'values.E' is street address; 'values.F' is city; 'values.G' is state; 'values.H' is ZIP; 'values.I' is age; 'values.J' is DOB; 'values.K' is 'Qualified + Transferred' status.",
+        "instructions": "'row_id' is REQUIRED (zero-based index); 'values.A' is timestamp; 'values.B' is phone; 'values.C' is name; 'values.D' is email; 'values.E' is street address; 'values.F' is city; 'values.G' is state; 'values.H' is ZIP; 'values.I' is age; 'values.J' is DOB; 'values.K' is 'Qualified + Transferred' status.",
         "when_run": "Run this whenever user asks for email or provides contact information to be synced/updated."
     },
     "4": {
@@ -54,7 +54,7 @@ class Logger:
 logger = Logger()
 
 # ---------------------------
-# Dynamic Tool Factory
+# Dynamic Tool Factory (Robust Version)
 # ---------------------------
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     generated_tools = []
@@ -63,12 +63,28 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         api_url = cfg["api_url"]
         instructions = cfg["instructions"]
         condition = cfg["when_run"]
-        # Decode the payload template for reference (though the LLM creates the actual payload)
-        raw_payload_str = urllib.parse.unquote(cfg["api_payload_json"])
+        raw_payload_template = urllib.parse.unquote(cfg["api_payload_json"])
         
-        def make_api_call(payload: Dict[str, Any], url=api_url, tid=tool_id) -> str:
+        # We use Any for tool_input to prevent Pydantic validation errors when the agent sends a string
+        def make_api_call(tool_input: Any, url=api_url, tid=tool_id) -> str:
             event_id = str(uuid.uuid4())
+            payload = {}
+
+            # Parse string to dictionary if the agent sends a JSON string
+            if isinstance(tool_input, str):
+                try:
+                    # Remove potential markdown code blocks
+                    cleaned = tool_input.strip().strip('`')
+                    if cleaned.startswith('json'):
+                        cleaned = cleaned[4:].strip()
+                    payload = json.loads(cleaned)
+                except Exception as e:
+                    return f"Error: Input was not valid JSON. You provided: {tool_input}. Parse Error: {str(e)}"
+            else:
+                payload = tool_input
+
             logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
+            
             start = time.time()
             try:
                 resp = requests.post(url, json=payload, timeout=15)
@@ -80,12 +96,10 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 logger.log("tool.error", f"api_tool_{tid} failed", {"error": str(e)})
                 return f"API Call failed: {str(e)}"
 
-        # Create StructuredTool with dynamic description
-        # We tell the LLM exactly how to format the JSON payload via the description
         tool_desc = (
-            f"USE CASE: {condition}. "
-            f"INSTRUCTIONS: {instructions}. "
-            f"The input must be a valid JSON object following the structure: {raw_payload_str}"
+            f"WHEN TO RUN: {condition}. "
+            f"DATA MAPPING: {instructions}. "
+            f"INPUT FORMAT: You MUST provide a JSON object matching this schema: {raw_payload_template}"
         )
 
         new_tool = StructuredTool.from_function(
@@ -97,7 +111,6 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     
     return generated_tools
 
-# Register tools
 tools = create_universal_tools(DYNAMIC_CONFIG)
 
 # ---------------------------
@@ -105,25 +118,26 @@ tools = create_universal_tools(DYNAMIC_CONFIG)
 # ---------------------------
 REACT_PROMPT = PromptTemplate.from_template(
     """
-You are an expert data assistant. You have access to specific API tools to sync user data.
+You are a highly efficient data synchronization assistant.
 
 Available tools: {tool_names}
 {tools}
 
-To use a tool, you MUST use this exact format:
+To use a tool, follow this format exactly:
 
-Thought: I need to use api_tool_X because [reason]. I will curate the payload based on the tool's instructions.
+Question: the input question you must answer
+Thought: I need to sync data using api_tool_X. I will construct the JSON payload.
 Action: the tool name (one of: {tool_names})
-Action Input: A valid JSON object containing the parameters required by the tool instructions.
+Action Input: A RAW JSON OBJECT (No markdown, no backticks). Example: {{"row_id": 0, "values": {{"A": "data"}}}}
 Observation: the tool result
 ... (repeat Thought/Action/Action Input/Observation if needed)
-Thought: I have successfully synced the data.
-Final Answer: [Concise confirmation to the user]
+Thought: I have finished the task.
+Final Answer: [Short confirmation to user]
 
 RULES:
-1. Only call a tool if the user's request matches the 'USE CASE' in the tool description.
-2. Curate the 'Action Input' JSON carefully, mapping user info to the keys (like A, B, C, row_id) as defined in the instructions.
-3. If information is missing, use an empty string or null for non-required fields.
+1. ONLY provide a JSON object in the 'Action Input'.
+2. If data for a field is unknown, use an empty string "" unless specified otherwise.
+3. Stop immediately after the Final Answer.
 
 Question: {input}
 {agent_scratchpad}
@@ -131,22 +145,11 @@ Question: {input}
 )
 
 # ---------------------------
-# Core Logic & Execution
+# Core Execution
 # ---------------------------
-def _mask_key(k: Optional[str]) -> str:
-    return k[:6] + "..." + k[-4:] if k and len(k) > 10 else "NO_KEY"
-
-def make_executor(agent_obj, tools_list):
-    return AgentExecutor(agent=agent_obj, tools=tools_list, handle_parsing_errors=True, max_iterations=6, verbose=False)
-
-def extract_response_text(resp) -> str:
-    if isinstance(resp, dict):
-        return resp.get("output", resp.get("result", str(resp)))
-    return str(resp)
-
 def run_agent(conversation_history, message, provider, api_key):
     logger.clear()
-    logger.log("run.start", "Starting dynamic agent", {"provider": provider})
+    logger.log("run.start", "Dynamic agent invoked", {"provider": provider})
 
     api_key_to_use = api_key or os.getenv("OPENAI_API_KEY")
 
@@ -154,41 +157,59 @@ def run_agent(conversation_history, message, provider, api_key):
         if provider == "groq":
             llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
         else:
+            if not api_key_to_use:
+                return {"reply": "Error: No API Key provided.", "logs": logger.to_list()}
             llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
         
         agent = create_react_agent(llm, tools, REACT_PROMPT)
-        executor = make_executor(agent, tools)
+        executor = AgentExecutor(agent=agent, tools=tools, handle_parsing_errors=True, max_iterations=5)
 
-        # Context building
-        conv_text = "\n".join([f"{i.get('role')}: {i.get('content')}" for i in conversation_history if isinstance(i, dict)])
-        combined_input = f"History:\n{conv_text}\n\nUser: {message}"
+        # Context construction
+        history_lines = []
+        for turn in conversation_history:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+            history_lines.append(f"{role}: {content}")
+        
+        conv_text = "\n".join(history_lines)
+        combined_input = f"Conversation History:\n{conv_text}\n\nLatest User Request: {message}"
 
-        resp_raw = executor.invoke({"input": combined_input})
-        resp_text = extract_response_text(resp_raw)
+        response = executor.invoke({"input": combined_input})
+        reply = response.get("output", "No response generated.")
 
-        return {"reply": resp_text, "logs": logger.to_list(), "diagnostics": {"status": "completed"}}
+        return {"reply": reply, "logs": logger.to_list(), "diagnostics": {"status": "success"}}
 
     except Exception as e:
-        logger.log("run.error", str(e), {"traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list()}
+        tb = traceback.format_exc()
+        logger.log("run.error", str(e), {"traceback": tb})
+        return {"reply": f"Internal Error: {str(e)}", "logs": logger.to_list()}
 
 # ---------------------------
-# FastAPI
+# FastAPI Endpoints
 # ---------------------------
 app = FastAPI()
 
 @app.post("/run-agent")
-async def run(request: Request):
-    body = await request.json()
-    result = run_agent(
-        body.get("conversation", []),
-        body.get("message", ""),
-        body.get("provider", "openai"),
-        body.get("api_key")
-    )
-    return JSONResponse(result)
+async def run_endpoint(request: Request):
+    try:
+        body = await request.json()
+        res = run_agent(
+            body.get("conversation", []),
+            body.get("message", ""),
+            body.get("provider", "openai"),
+            body.get("api_key")
+        )
+        return JSONResponse(res)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
+# Compatibility for execution environments
 if "inputs" in globals():
     data = globals().get("inputs", {})
-    _res = run_agent(data.get("conversation", []), data.get("message", ""), data.get("provider", "openai"), data.get("api_key", ""))
-    globals()["result"] = _res
+    _out = run_agent(
+        data.get("conversation", []),
+        data.get("message", ""),
+        data.get("provider", "openai"),
+        data.get("api_key", "")
+    )
+    globals()["result"] = _out
