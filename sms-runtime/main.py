@@ -51,7 +51,7 @@ logger = Logger()
 # ---------------------------
 # Helper: fetch agent details and tools from remote DB endpoints
 # ---------------------------
-FETCH_BASE = "http://54.89.185.235:8000/fetch"
+FETCH_BASE = "https://api.rhythmflow.ai/fetch"
 
 def fetch_agent_details(agent_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
     try:
