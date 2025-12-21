@@ -49,29 +49,13 @@ class Logger:
 logger = Logger()
 
 # ---------------------------
-# Helper: fetch agent details and tools from remote DB endpoints
+# Helper: fetch agent details and tools from Redis-only
 # ---------------------------
-FETCH_BASE = "http://54.89.185.235:8000/fetch"
+# Note: we intentionally use Redis only. No HTTP fallback.
 
-def fetch_agent_details(agent_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    try:
-        params = {"table": "agents", "id": agent_id}
-        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.log("fetch.agent", "Fetched agent details", {"agent_id": agent_id, "status_code": resp.status_code})
-        return data
-    except Exception as e:
-        logger.log("fetch.agent.error", "Failed to fetch agent details", {"agent_id": agent_id, "error": str(e)})
-        return None
-
-# ---------------------------------------------------------------------
-# NEW: Redis-based tools fetch (preferred). Falls back to HTTP if Redis not available.
-# ---------------------------------------------------------------------
 import redis
 from redis.cluster import RedisCluster
 
-# --- Redis connection (same as app.py) ---
 _redis_client = None
 try:
     redis_url = "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379"
@@ -83,7 +67,6 @@ try:
         socket_timeout=3,
         read_from_replicas=True
     )
-    # quick ping to validate
     try:
         _redis_client.ping()
         logger.log("redis", "Connected to RedisCluster", {"url": redis_url})
@@ -94,63 +77,121 @@ except Exception as e:
     logger.log("redis.init_error", "Failed to initialize RedisCluster client", {"error": str(e)})
     _redis_client = None
 
-def fetch_agent_tools(agent_user_id: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
     """
-    New behavior:
-    - Attempt to load all rows from dynamic table 'all-agents-tools' directly from Redis.
-    - Filter rows where row['agent_id'] == agent_user_id OR row['agent_id'] == str(agent_user_id)
-    - Return a dict of tool_id -> tool_definition compatible with merging into DYNAMIC_CONFIG.
-    - If Redis is not available, fallback to the original HTTP fetch.
+    Fetch agent details from Redis only.
+    agent_id may be 'agent1' or '1'. We check both forms.
+    Returns a dict of the agent hash or None if not found.
     """
-    table_name = "all-agents-tools"
-    tool_map: Dict[str, Any] = {}
+    if not _redis_client:
+        logger.log("fetch.agent.no_redis", "Redis client not available", {"agent_id": agent_id})
+        return None
 
-    # If Redis is available, prefer it
-    if _redis_client:
-        try:
-            ids_key = f"table:{table_name}:ids"
-            row_ids = _redis_client.smembers(ids_key) or set()
-
-            for row_id in row_ids:
-                if row_id == "_meta":
-                    continue
-                row_key = f"table:{table_name}:row:{row_id}"
-                row = _redis_client.hgetall(row_key)
-                if not row:
-                    continue
-
-                # Normalize agent_id comparisons as strings
-                row_agent_val = row.get("agent_id", "")
-                # compare either numeric user_id or agent-like value
-                if str(row_agent_val) != str(agent_user_id):
-                    # not a match; skip
-                    continue
-
-                # Build tool entry
-                tool_map[str(row_id)] = {
-                    "api_url": row.get("api_url", "") or "",
-                    "api_payload_json": row.get("api_payload_json", "") or "",
-                    "instructions": row.get("instructions", "") or "",
-                    "when_run": row.get("when_run", "") or row.get("when_run", "")
-                }
-
-            logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
-            return tool_map
-
-        except Exception as e:
-            logger.log("fetch.tools.redis.error", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
-            # Fall through to HTTP fallback
-
-    # Fallback: use HTTP fetch (original behavior)
     try:
-        params = {"table": table_name, "agent_id": agent_user_id}
-        resp = requests.get(FETCH_BASE, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.log("fetch.tools.http", "Fetched agent tools via HTTP fallback", {"agent_user_id": agent_user_id, "status_code": resp.status_code})
-        return data
+        # build candidate keys to try
+        candidates = []
+        if isinstance(agent_id, str):
+            candidates.append(agent_id)
+            if agent_id.startswith("agent"):
+                # keep as-is, but also try numeric suffix
+                try:
+                    suffix = int(agent_id[len("agent"):])
+                    candidates.append(str(suffix))
+                    candidates.append(f"agent{suffix}")
+                except Exception:
+                    pass
+            else:
+                # try numeric and agent<id>
+                candidates.append(f"agent{agent_id}")
+        else:
+            candidates.append(f"agent{agent_id}")
+            candidates.append(str(agent_id))
+
+        seen = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            # prefer actual agent key like "agent1"
+            key = cand if cand.startswith("agent") else f"agent{cand}" if cand.isdigit() else cand
+            try:
+                if _redis_client.exists(key):
+                    rec = _redis_client.hgetall(key) or {}
+                    # parse tools field if present
+                    if "tools" in rec and rec.get("tools"):
+                        try:
+                            rec["tools"] = json.loads(rec["tools"])
+                        except Exception:
+                            # keep as-is if not JSON
+                            pass
+                    # normalize numeric timestamps
+                    for fld in ("created_at", "updated_at"):
+                        if fld in rec:
+                            try:
+                                rec[fld] = int(rec[fld])
+                            except Exception:
+                                pass
+                    logger.log("fetch.agent.redis", "Fetched agent details from Redis", {"agent_key": key})
+                    return rec
+            except Exception as e:
+                # continue trying other candidates but log the error
+                logger.log("fetch.agent.redis.error", "Error checking agent key in Redis", {"candidate": key, "error": str(e)})
+                continue
+
+        # Not found
+        logger.log("fetch.agent.redis.notfound", "Agent not found in Redis", {"agent_id": agent_id, "candidates_tried": list(seen)})
+        return None
+
     except Exception as e:
-        logger.log("fetch.tools.error", "Failed to fetch agent tools via HTTP fallback", {"agent_user_id": agent_user_id, "error": str(e)})
+        logger.log("fetch.agent.redis.exception", "Unexpected error fetching agent", {"agent_id": agent_id, "error": str(e)})
+        return None
+
+def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch all rows from dynamic table 'all-agents-tools' directly from Redis only.
+    Filter rows where row['agent_id'] == agent_user_id (string comparison).
+    Return a dict of tool_id -> tool_definition or None if Redis unavailable.
+    """
+    if not _redis_client:
+        logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
+        return None
+
+    try:
+        table_name = "all-agents-tools"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        tool_map: Dict[str, Any] = {}
+
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
+                continue
+
+            if not row:
+                continue
+
+            # normalize stored agent_id and compare as strings
+            row_agent_val = row.get("agent_id", "")
+            if str(row_agent_val) != str(agent_user_id):
+                continue
+
+            tool_map[str(row_id)] = {
+                "api_url": row.get("api_url", "") or "",
+                "api_payload_json": row.get("api_payload_json", "") or "",
+                "instructions": row.get("instructions", "") or "",
+                "when_run": row.get("when_run", "") or ""
+            }
+
+        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
+        return tool_map
+
+    except Exception as e:
+        logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
         return None
 
 # ---------------------------
@@ -211,15 +252,15 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     """
     New behavior:
     - Accepts agent_id, conversation_history, message
-    - Fetch agent details from /fetch?table=agents&id=<agent_id>
+    - Fetch agent details from Redis-only
     - Use agent response's prompt as system prompt
-    - Fetch agent tools using agent_resp['user_id'] and merge them into the dynamic tool config
+    - Fetch agent tools from Redis-only using agent_resp['user_id'] and merge them into dynamic tool config
     - Provider is always openai. The API key is taken from agent details if present, else from environment variable OPENAI_API_KEY
     """
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
 
-    # 1. Fetch agent details
+    # 1. Fetch agent details (Redis-only)
     agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
@@ -238,8 +279,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     # Get agent prompt (instruction)
     agent_prompt = agent_resp.get("prompt", "You are a helpful assistant.")
 
-    # 2. Fetch tools associated with this agent
-    # The sample uses agent_user_id "1" which maps to agent_resp['user_id']
+    # 2. Fetch tools associated with this agent (Redis-only)
     agent_user_id = agent_resp.get("user_id", agent_id)
     fetched_tools = fetch_agent_tools(agent_user_id)
     merged_config = DYNAMIC_CONFIG.copy()
@@ -259,7 +299,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             except Exception as e:
                 logger.log("merge.tool.error", "Failed to merge tool", {"tool_id": tid, "error": str(e)})
     else:
-        logger.log("run.tools", "No tools fetched, using default config", {})
+        logger.log("run.tools", "No tools fetched from Redis, using default config", {})
 
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
 
