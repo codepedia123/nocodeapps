@@ -337,3 +337,7 @@ if "inputs" in globals():
     agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
     _out = run_agent(agent_id, data.get("conversation", []), data.get("message", ""))
     globals()["result"] = _out
+    
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8001)))
