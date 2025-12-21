@@ -54,7 +54,7 @@ logger = Logger()
 FETCH_BASE = "https://api.rhythmflow.ai/fetch"
 
 def fetch_agent_details(agent_id: str):
-    url = f"https://api.rhythmflow.ai/fetch?table=agents&id={agent_id}"
+    url = f"http://54.89.185.235:8000/fetch?table=agents&id={agent_id}"
     
     # Mimic a real browser to avoid being throttled or deprioritized
     headers = {
@@ -278,7 +278,7 @@ async def run_endpoint(request: Request):
 
 # Support for interactive runtime evaluation similar to original script
 if "inputs" in globals():
-    data = globals().get("inputs", {})
+    data = globals().get("inputs") or globals().get("input") or {}
     agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
     _out = run_agent(agent_id, data.get("conversation", []), data.get("message", ""))
     globals()["result"] = _out
