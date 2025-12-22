@@ -208,32 +208,104 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
 
         # Use defaults in closure to avoid late-binding issues
         def make_api_call(tool_input: Any, url=api_url, tid=tool_id) -> str:
+            """
+            This tool call is synchronous (blocking). The agent will not continue until this returns.
+            We also return the real API response content back to the agent (as a JSON string),
+            so the LLM can ground its final answer on actual tool results.
+            """
             event_id = str(uuid.uuid4())
-            payload = {}
+            payload: Any = {}
 
             # Robust parsing (handles strings or dicts)
             if isinstance(tool_input, str):
                 try:
-                    cleaned = tool_input.strip().strip('`').replace('json\n', '', 1)
+                    cleaned = tool_input.strip().strip("`").replace("json\n", "", 1)
                     payload = json.loads(cleaned)
                 except Exception:
-                    return f"Error: Invalid JSON format."
+                    # Log tool error and return structured error to the agent
+                    err_obj = {
+                        "ok": False,
+                        "tool_id": str(tid),
+                        "event_id": event_id,
+                        "error": "Invalid JSON format",
+                        "input_type": "string"
+                    }
+                    logger.log("tool.error", f"api_tool_{tid} invalid_json", {"event_id": event_id})
+                    return json.dumps(err_obj, ensure_ascii=False)
+
             else:
                 payload = tool_input
 
             logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
-            
+
             try:
                 resp = requests.post(url, json=payload, timeout=15)
-                resp.raise_for_status()
-                return f"Success: Data synced to API."
+                status_code = resp.status_code
+                content_type = (resp.headers.get("content-type") or "").lower()
+
+                # Try to parse JSON safely, else keep text
+                parsed_json = None
+                raw_text = ""
+                try:
+                    if "application/json" in content_type:
+                        parsed_json = resp.json()
+                    else:
+                        raw_text = resp.text or ""
+                except Exception:
+                    raw_text = resp.text or ""
+
+                # Raise only after capture so we can report body on errors too
+                try:
+                    resp.raise_for_status()
+                    ok = True
+                    error_str = ""
+                except Exception as e:
+                    ok = False
+                    error_str = str(e)
+
+                # Keep responses reasonably sized for LLM context and logs
+                MAX_TEXT = 8000
+                if raw_text and len(raw_text) > MAX_TEXT:
+                    raw_text = raw_text[:MAX_TEXT] + "...(truncated)"
+
+                tool_result = {
+                    "ok": ok,
+                    "tool_id": str(tid),
+                    "event_id": event_id,
+                    "status_code": status_code,
+                    "content_type": content_type,
+                    "response_json": parsed_json,
+                    "response_text": raw_text,
+                    "error": error_str
+                }
+
+                # Log the tool response, so your API response includes it in logs
+                logger.log("tool.response", f"api_tool_{tid} response received", tool_result)
+
+                # Return the tool result to the agent as a JSON string so the final LLM reply can use it
+                return json.dumps(tool_result, ensure_ascii=False)
+
             except Exception as e:
-                return f"API Call failed: {str(e)}"
+                # Network errors, timeouts, DNS, etc.
+                tool_result = {
+                    "ok": False,
+                    "tool_id": str(tid),
+                    "event_id": event_id,
+                    "status_code": None,
+                    "content_type": "",
+                    "response_json": None,
+                    "response_text": "",
+                    "error": str(e)
+                }
+                logger.log("tool.response", f"api_tool_{tid} response received", tool_result)
+                return json.dumps(tool_result, ensure_ascii=False)
 
         tool_desc = (
             f"CRITICAL CONDITION: {condition}. "
             f"INSTRUCTIONS: {instructions}. "
-            f"REQUIRED JSON STRUCTURE: {raw_payload_template}"
+            f"REQUIRED JSON STRUCTURE: {raw_payload_template}. "
+            "IMPORTANT: After calling this tool, you MUST read its returned JSON result and base your final answer on it. "
+            "If ok=false, you must report the failure clearly and include the error."
         )
 
         new_tool = StructuredTool.from_function(
@@ -242,7 +314,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
             description=tool_desc
         )
         generated_tools.append(new_tool)
-    
+
     return generated_tools
 
 # ---------------------------
@@ -256,6 +328,11 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     - Use agent response's prompt as system prompt
     - Fetch agent tools from Redis-only using agent_resp['user_id'] and merge them into dynamic tool config
     - Provider is always openai. The API key is taken from agent details if present, else from environment variable OPENAI_API_KEY
+
+    Tool behavior:
+    - Tool calls are synchronous and blocking.
+    - Each tool returns the real API response as JSON (string) to the agent.
+    - Each tool response is also logged as "tool.response" so your API output includes it.
     """
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
@@ -315,6 +392,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             f"{agent_prompt}\n\n"
             "You have tools available for data syncing. "
             "CRITICAL RULE: Only use a tool if the user's request matches the tool's 'CRITICAL CONDITION'. "
+            "When you call tools, you MUST rely on the tool's returned JSON to determine whether the action succeeded. "
+            "If any tool returns ok=false, you must report the failure and the error. "
+            "If tools return ok=true, you may confirm success using details from response_json/response_text. "
             "If the user is asking general questions, do NOT use any tools. Just answer naturally."
         )
 
@@ -334,13 +414,21 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             handle_parsing_errors=True
         )
 
-        # 7. Format History
+        # 7. Format History (be tolerant to both "content" and "message")
         history = []
         for turn in conversation_history:
-            if turn.get("role") == "user":
-                history.append(("human", turn.get("content")))
+            role = (turn.get("role") or "").lower().strip()
+            content = turn.get("content")
+            if content is None:
+                content = turn.get("message")
+            if content is None:
+                content = ""
+            # Accept common role variants
+            if role == "user":
+                history.append(("human", content))
             else:
-                history.append(("ai", turn.get("content")))
+                # Treat agent/assistant/ai as ai
+                history.append(("ai", content))
 
         # 8. Execute
         response = executor.invoke({
@@ -349,7 +437,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         })
 
         return {
-            "reply": response.get("output", ""), 
+            "reply": response.get("output", ""),
             "logs": logger.to_list()
         }
 
