@@ -387,14 +387,35 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         # 4. Select Model (provider is always openai as required)
         llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
 
-        # 5. Define modern Tool-Calling Prompt using agent_prompt
+        # 5. Build a list of tool "when_run" values so the agent knows what it can do
+        _conditions_raw: List[str] = []
+        for _tid, _cfg in merged_config.items():
+            _cond = _cfg.get("when_run", _cfg.get("when_to_run", ""))
+            if _cond:
+                _conditions_raw.append(str(_cond).strip())
+
+        _seen_conditions = set()
+        _conditions: List[str] = []
+        for _c in _conditions_raw:
+            if _c and _c not in _seen_conditions:
+                _seen_conditions.add(_c)
+                _conditions.append(_c)
+
+        if _conditions:
+            tools_when_run_text = "Tool conditions you can act on (when_run):\n" + "\n".join(
+                [f"{i+1}) {c}" for i, c in enumerate(_conditions)]
+            )
+        else:
+            tools_when_run_text = "Tool conditions you can act on (when_run): None."
+
+        # 6. Define modern Tool-Calling Prompt using agent_prompt and the tools' when_run list
         system_message = (
             f"{agent_prompt}\n\n"
-            "You have tools available for data syncing. "
-            "CRITICAL RULE: Only use a tool if the user's request matches the tool's 'CRITICAL CONDITION'. "
+            f"{tools_when_run_text}\n\n"
+            "CRITICAL RULE: Only use a tool if the user's request matches the relevant when_run condition above. "
             "When you call tools, you MUST rely on the tool's returned JSON to determine whether the action succeeded. "
             "If any tool returns ok=false, you must report the failure and the error. "
-            "If tools return ok=true, you may confirm success using details from response_json/response_text. "
+            "If tools return ok=true, you may confirm success using details from response_json or response_text. "
             "If the user is asking general questions, do NOT use any tools. Just answer naturally."
         )
 
@@ -405,7 +426,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
-        # 6. Create Agent
+        # 7. Create Agent
         agent = create_tool_calling_agent(llm, tools, prompt)
         executor = AgentExecutor(
             agent=agent,
@@ -414,7 +435,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             handle_parsing_errors=True
         )
 
-        # 7. Format History (be tolerant to both "content" and "message")
+        # 8. Format History (be tolerant to both "content" and "message")
         history = []
         for turn in conversation_history:
             role = (turn.get("role") or "").lower().strip()
@@ -430,7 +451,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 # Treat agent/assistant/ai as ai
                 history.append(("ai", content))
 
-        # 8. Execute
+        # 9. Execute
         response = executor.invoke({
             "input": message,
             "chat_history": history
