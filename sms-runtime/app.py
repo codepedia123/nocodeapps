@@ -1029,6 +1029,57 @@ def clear_dynamic_table(name: str):
         "deleted_rows": deleted_count,
         "message": f"All rows cleared for table '{name}'"
     }
+@app.delete("/table/clear")
+def clear_table(name: str):
+    """
+    Deletes ALL records inside a dynamic table but keeps the table definition.
+    Example:
+        DELETE /table/clear?name=logs
+    """
+    _require_redis()
+
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+
+    # Prevent clearing system tables
+    if name in ["users", "agents", "conversations"]:
+        raise HTTPException(
+            status_code=400,
+            detail="System tables cannot be cleared"
+        )
+
+    # Ensure table exists
+    if not _table_exists(name):
+        raise HTTPException(status_code=404, detail="Table does not exist")
+
+    ids_key = _table_ids_key(name)
+    row_ids = r.smembers(ids_key)
+
+    deleted = 0
+    for rid in row_ids:
+        if rid == "_meta":
+            continue
+        r.delete(_table_row_key(name, rid))
+        deleted += 1
+
+    # Reset ID tracking
+    r.delete(ids_key)
+    r.sadd(ids_key, "_meta")
+    r.set(f"nextid:{name}", 0)
+
+    # Reset table meta timestamp
+    r.delete(_table_meta_key(name))
+    r.hset(
+        _table_meta_key(name),
+        mapping={"created_at": int(time.time())}
+    )
+
+    return {
+        "status": "success",
+        "table": name,
+        "deleted_rows": deleted
+    }
 
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
