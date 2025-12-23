@@ -78,12 +78,6 @@ class UpdateRequest(BaseModel):
     table: str
     id: str
     updates: Dict[str, Any]
-@app.get("/tables")
-def list_tables():
-    _require_redis()
-    return {
-        "tables": _list_all_tables_with_counts()
-    }
 
 # ----------------------------------------------------------------------
 # Key utilities and helpers
@@ -173,7 +167,12 @@ def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
         pass
 
     return tables
-
+@app.get("/tables")
+def list_tables():
+    _require_redis()
+    return {
+        "tables": _list_all_tables_with_counts()
+    }
 def _table_exists(name: str) -> bool:
     return r.sismember("tables", name)
 
