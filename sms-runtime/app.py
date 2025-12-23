@@ -78,6 +78,12 @@ class UpdateRequest(BaseModel):
     table: str
     id: str
     updates: Dict[str, Any]
+@app.get("/tables")
+def list_tables():
+    _require_redis()
+    return {
+        "tables": _list_all_tables_with_counts()
+    }
 
 # ----------------------------------------------------------------------
 # Key utilities and helpers
@@ -113,6 +119,60 @@ def _table_ids_key(name: str) -> str:
 
 def _table_row_key(name: str, rowid: str) -> str:
     return f"table:{name}:row:{rowid}"
+def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
+    """
+    Returns all tables with record counts.
+    Covers system tables and dynamic tables.
+    """
+    tables = []
+
+    # ---- System tables ----
+    try:
+        users_count = r.scard("users")
+        tables.append({
+            "name": "users",
+            "records": int(users_count or 0)
+        })
+    except Exception:
+        pass
+
+    try:
+        agents_count = r.scard("agents")
+        tables.append({
+            "name": "agents",
+            "records": int(agents_count or 0)
+        })
+    except Exception:
+        pass
+
+    try:
+        conversations_count = r.scard("conversations")
+        tables.append({
+            "name": "conversations",
+            "records": int(conversations_count or 0)
+        })
+    except Exception:
+        pass
+
+    # ---- Dynamic tables ----
+    try:
+        dynamic_tables = r.smembers("tables") or []
+        for name in sorted(dynamic_tables):
+            ids_key = _table_ids_key(name)
+            count = r.scard(ids_key) or 0
+
+            # subtract sentinel "_meta"
+            if r.sismember(ids_key, "_meta"):
+                count -= 1
+
+            tables.append({
+                "name": name,
+                "records": max(count, 0)
+            })
+    except Exception:
+        pass
+
+    return tables
 
 def _table_exists(name: str) -> bool:
     return r.sismember("tables", name)
