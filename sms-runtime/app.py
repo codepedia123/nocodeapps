@@ -1080,6 +1080,46 @@ def clear_table(name: str):
         "table": name,
         "deleted_rows": deleted
     }
+@app.post("/table/bulk-delete")
+def bulk_delete_rows(name: str, req: BulkDeleteRequest):
+    _require_redis()
+
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Table name required")
+
+    if name in ["users", "agents", "conversations"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk delete not allowed on system tables"
+        )
+
+    if not _table_exists(name):
+        raise HTTPException(status_code=404, detail="Table does not exist")
+
+    ids_key = _table_ids_key(name)
+
+    deleted = []
+    skipped = []
+
+    for rid in req.ids:
+        rid = str(rid)
+        row_key = _table_row_key(name, rid)
+
+        if r.exists(row_key):
+            r.delete(row_key)
+            r.srem(ids_key, rid)
+            deleted.append(rid)
+        else:
+            skipped.append(rid)
+
+    return {
+        "status": "success",
+        "table": name,
+        "deleted_ids": deleted,
+        "skipped_ids": skipped,
+        "deleted_count": len(deleted)
+    }
 
 @app.delete("/delete")
 def delete_endpoint(table: str, id: str):
