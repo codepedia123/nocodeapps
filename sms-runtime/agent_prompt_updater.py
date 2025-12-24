@@ -14,16 +14,60 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 # ------------------------------------------------------------------
 # 1. SETUP INPUTS (Patterned after main.py logic)
 # ------------------------------------------------------------------
-# app.py injects 'inputs' as a global variable
-data = globals().get("inputs", {})
+# app.py injects 'inputs' as a global variable when run via /int.
+# Be robust: accept inputs from globals()["inputs"], globals()["input"], globals()["payload"],
+# or direct globals that may contain the expected keys.
+_raw_globals = globals()
+
+# Merge available input sources into a single dict called data
+data: Dict[str, Any] = {}
+
+# Priority ordering: explicit 'inputs', then 'input', then 'payload'
+for key in ("inputs", "input", "payload"):
+    candidate = _raw_globals.get(key)
+    if isinstance(candidate, dict) and candidate:
+        data.update(candidate)
+
+# If still empty, try to pick up top-level keys that might have been set directly
+# This helps when a calling environment sets variables directly in globals
+for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key"):
+    if k in _raw_globals and _raw_globals.get(k) not in (None, "", {}):
+        # do not overwrite existing keys already provided
+        if k not in data:
+            data[k] = _raw_globals.get(k)
+
+# As a last fallback, attempt to parse a raw JSON string from common env vars if present
+# This can help when a wrapper exports the entire request body as an env var
+if not data:
+    for env_key in ("REQUEST_BODY", "RAW_BODY", "INPUT_JSON"):
+        raw = os.getenv(env_key)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    data.update(parsed)
+                    break
+            except Exception:
+                # ignore parse errors
+                pass
+
+# Finally ensure data is a dict
+if not isinstance(data, dict):
+    data = {}
 
 # Extract specific fields from the payload
 long_text = data.get("long_text", "")
-user_message = data.get("message", "")
-conversation = data.get("conversation", [])
+user_message = data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
+conversation = data.get("conversation", []) or data.get("chat_history", [])
 
-# Extract API Key from the 'api_key' field in the request, fallback to environment
-api_key_to_use = data.get("api_key") or os.getenv("OPENAI_API_KEY")
+# Extract API Key from multiple possible fields in the request, fallback to environment
+api_key_to_use = (
+    data.get("api_key")
+    or data.get("openai_api_key")
+    or data.get("apiKey")
+    or data.get("key")
+    or os.getenv("OPENAI_API_KEY")
+)
 
 # ------------------------------------------------------------------
 # 2. DEFINE THE UPDATE TOOL
@@ -79,11 +123,19 @@ def run_updater_agent():
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
-        # Format History
+        # Format History tolerantly: accept 'content' or 'message' keys and common role names
         history = []
-        for turn in conversation:
-            role = "human" if turn.get("role") == "user" else "ai"
-            history.append((role, turn.get("content", turn.get("message", ""))))
+        if isinstance(conversation, list):
+            for turn in conversation:
+                if not isinstance(turn, dict):
+                    continue
+                role_raw = (turn.get("role") or "").lower().strip()
+                content = turn.get("content", turn.get("message", ""))
+                if role_raw == "user":
+                    history.append(("human", content))
+                else:
+                    # treat assistant, ai, system, bot as ai unless explicitly 'user'
+                    history.append(("ai", content))
 
         agent = create_tool_calling_agent(llm, tools, prompt)
         executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
@@ -107,5 +159,5 @@ def run_updater_agent():
 # ------------------------------------------------------------------
 # 4. SET GLOBAL RESULT (Required by app.py)
 # ------------------------------------------------------------------
-if "inputs" in globals():
+if "inputs" in globals() or "input" in globals() or "payload" in globals():
     globals()["result"] = run_updater_agent()
