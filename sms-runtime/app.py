@@ -79,6 +79,10 @@ class UpdateRequest(BaseModel):
     id: str
     updates: Dict[str, Any]
 
+class BulkDeleteRequest(BaseModel):
+    ids: List[str]
+
+
 # ----------------------------------------------------------------------
 # Key utilities and helpers
 # ----------------------------------------------------------------------
