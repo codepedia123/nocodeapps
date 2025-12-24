@@ -13,11 +13,15 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 # ------------------------------------------------------------------
 # 1. SETUP INPUTS (Injected by app.py /int endpoint)
 # ------------------------------------------------------------------
-# app.py provides 'inputs' which merges payload and input
+# app.py merges the JSON body into a dictionary called 'inputs'
 data = locals().get("inputs", {})
+
+# Extract specific fields from the payload
 long_text = data.get("long_text", "")
 user_message = data.get("message", "")
 conversation = data.get("conversation", [])
+# Extract API Key from the 'api_key' object/field in the request
+api_key = data.get("api_key")
 
 # ------------------------------------------------------------------
 # 2. DEFINE THE UPDATE TOOL
@@ -26,12 +30,11 @@ class UpdateTextSchema(BaseModel):
     updated_paragraph: str = Field(description="The complete, full version of the text with all requested changes applied.")
     explanation: str = Field(description="A brief summary of what was changed.")
 
-# This variable will store the update if the tool is triggered
+# This variable captures tool output to return to the main runtime
 state_update = {"new_text": None, "explanation": None}
 
 def update_prompt_content(updated_paragraph: str, explanation: str) -> str:
-    """Use this tool only when the user explicitly asks to modify, update, 
-    rewrite, or fix the specific long text paragraph provided."""
+    """Use this tool only when the user asks to modify, rewrite, or fix the text paragraph provided."""
     state_update["new_text"] = updated_paragraph
     state_update["explanation"] = explanation
     return f"Success: The text has been updated. Summary: {explanation}"
@@ -40,11 +43,11 @@ def update_prompt_content(updated_paragraph: str, explanation: str) -> str:
 # 3. CONSTRUCT THE AGENT
 # ------------------------------------------------------------------
 def run_agent():
-    # Fetch API Key from environment
-    api_key = os.getenv("OPENAI_API_KEY")
+    # Validation: Ensure API Key is present in the request
     if not api_key:
-        return {"error": "Missing OPENAI_API_KEY environment variable"}
+        return {"error": "Missing 'api_key' in request payload."}
 
+    # Initialize LLM with the provided key
     llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
 
     tools = [
@@ -65,8 +68,8 @@ def run_agent():
         "YOUR TASKS:\n"
         "1. If the user asks to change the text (e.g., 'make it pirate tone', 'fix grammar'), "
         "you MUST use the 'update_prompt_tool' and provide the FULL updated text.\n"
-        "2. If the user asks a general question (e.g., 'what is a prompt?'), just answer normally.\n"
-        "3. Always be helpful and precise."
+        "2. If the user asks a general question, answer normally.\n"
+        "3. Always return the full content when updating."
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -76,7 +79,7 @@ def run_agent():
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
 
-    # Build history
+    # Convert conversation list to LangChain history format
     history = []
     for turn in conversation:
         role = "human" if turn.get("role") == "user" else "ai"
@@ -94,6 +97,7 @@ def run_agent():
         # ------------------------------------------------------------------
         # 4. PREPARE THE RESULT FOR APP.PY
         # ------------------------------------------------------------------
+        # Assigning to 'result' is crucial for app.py to return the data
         return {
             "reply": response["output"],
             "updated_long_text": state_update["new_text"] if state_update["new_text"] else long_text,
@@ -104,5 +108,5 @@ def run_agent():
     except Exception as e:
         return {"error": str(e)}
 
-# Execute and assign to the 'result' variable required by app.py
+# Execute the logic and store in 'result' for the app.py response
 result = run_agent()
