@@ -1,6 +1,7 @@
 # agent_prompt_updater.py
 import os
 import json
+import traceback
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
@@ -11,17 +12,18 @@ from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # ------------------------------------------------------------------
-# 1. SETUP INPUTS (Injected by app.py /int endpoint)
+# 1. SETUP INPUTS (Patterned after main.py logic)
 # ------------------------------------------------------------------
-# app.py merges the JSON body into a dictionary called 'inputs'
-data = locals().get("inputs", {})
+# app.py injects 'inputs' as a global variable
+data = globals().get("inputs", {})
 
 # Extract specific fields from the payload
 long_text = data.get("long_text", "")
 user_message = data.get("message", "")
 conversation = data.get("conversation", [])
-# Extract API Key from the 'api_key' object/field in the request
-api_key = data.get("api_key")
+
+# Extract API Key from the 'api_key' field in the request, fallback to environment
+api_key_to_use = data.get("api_key") or os.getenv("OPENAI_API_KEY")
 
 # ------------------------------------------------------------------
 # 2. DEFINE THE UPDATE TOOL
@@ -30,83 +32,80 @@ class UpdateTextSchema(BaseModel):
     updated_paragraph: str = Field(description="The complete, full version of the text with all requested changes applied.")
     explanation: str = Field(description="A brief summary of what was changed.")
 
-# This variable captures tool output to return to the main runtime
+# State to capture tool output
 state_update = {"new_text": None, "explanation": None}
 
-def update_prompt_content(updated_paragraph: str, explanation: str) -> str:
-    """Use this tool only when the user asks to modify, rewrite, or fix the text paragraph provided."""
+def update_prompt_tool_func(updated_paragraph: str, explanation: str) -> str:
+    """Rewrites or modifies the main long text content. Use this when the user asks for changes."""
     state_update["new_text"] = updated_paragraph
     state_update["explanation"] = explanation
-    return f"Success: The text has been updated. Summary: {explanation}"
+    return f"Success: Text updated. Change: {explanation}"
 
 # ------------------------------------------------------------------
-# 3. CONSTRUCT THE AGENT
+# 3. AGENT CORE LOGIC
 # ------------------------------------------------------------------
-def run_agent():
-    # Validation: Ensure API Key is present in the request
-    if not api_key:
-        return {"error": "Missing 'api_key' in request payload."}
-
-    # Initialize LLM with the provided key
-    llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key)
-
-    tools = [
-        StructuredTool.from_function(
-            func=update_prompt_content,
-            name="update_prompt_tool",
-            description="Rewrites or modifies the main long text content.",
-            args_schema=UpdateTextSchema
-        )
-    ]
-
-    system_prompt = (
-        "You are a professional Prompt Engineer and Editor.\n"
-        "You are working on the following TEXT:\n"
-        "--- START TEXT ---\n"
-        f"{long_text}\n"
-        "--- END TEXT ---\n\n"
-        "YOUR TASKS:\n"
-        "1. If the user asks to change the text (e.g., 'make it pirate tone', 'fix grammar'), "
-        "you MUST use the 'update_prompt_tool' and provide the FULL updated text.\n"
-        "2. If the user asks a general question, answer normally.\n"
-        "3. Always return the full content when updating."
-    )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-
-    # Convert conversation list to LangChain history format
-    history = []
-    for turn in conversation:
-        role = "human" if turn.get("role") == "user" else "ai"
-        history.append((role, turn.get("content", "")))
-
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
+def run_updater_agent():
+    if not api_key_to_use:
+        return {"error": "Missing 'api_key' in request payload and no environment fallback found."}
 
     try:
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
+
+        tools = [
+            StructuredTool.from_function(
+                func=update_prompt_tool_func,
+                name="update_prompt_tool",
+                description="Rewrites or modifies the provided text. Use for tone changes, grammar, or formatting.",
+                args_schema=UpdateTextSchema
+            )
+        ]
+
+        system_prompt = (
+            "You are a professional Editor.\n"
+            "CURRENT TEXT:\n"
+            "--- START ---\n"
+            f"{long_text}\n"
+            "--- END ---\n\n"
+            "RULES:\n"
+            "1. Use 'update_prompt_tool' ONLY if the user wants to change the text above.\n"
+            "2. Always provide the FULL updated text in the tool arguments.\n"
+            "3. If the user is just chatting, answer normally."
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+
+        # Format History
+        history = []
+        for turn in conversation:
+            role = "human" if turn.get("role") == "user" else "ai"
+            history.append((role, turn.get("content", turn.get("message", ""))))
+
+        agent = create_tool_calling_agent(llm, tools, prompt)
+        executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
+
         response = executor.invoke({
             "input": user_message,
             "chat_history": history
         })
 
-        # ------------------------------------------------------------------
-        # 4. PREPARE THE RESULT FOR APP.PY
-        # ------------------------------------------------------------------
-        # Assigning to 'result' is crucial for app.py to return the data
+        # Construct final payload
         return {
-            "reply": response["output"],
+            "reply": response.get("output", ""),
             "updated_long_text": state_update["new_text"] if state_update["new_text"] else long_text,
             "is_updated": state_update["new_text"] is not None,
             "change_summary": state_update["explanation"]
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
-# Execute the logic and store in 'result' for the app.py response
-result = run_agent()
+# ------------------------------------------------------------------
+# 4. SET GLOBAL RESULT (Required by app.py)
+# ------------------------------------------------------------------
+if "inputs" in globals():
+    globals()["result"] = run_updater_agent()
