@@ -477,6 +477,57 @@ def _load_local_function(fid: str):
     except Exception:
         meta = {}
     return code, meta
+def _list_all_functions() -> List[Dict[str, Any]]:
+    functions = {}
+    
+    # -------------------------
+    # Redis-based functions
+    # -------------------------
+    if r:
+        try:
+            for key in r.scan_iter(match="function:*:meta"):
+                fid = key.split(":")[1]
+                meta = r.hgetall(key) or {}
+
+                functions[fid] = {
+                    "id": fid,
+                    "name": meta.get("name", ""),
+                    "created_at": int(meta.get("created_at") or meta.get("ts") or 0),
+                    "updated_at": int(meta.get("updated_at") or meta.get("ts") or 0),
+                    "source": "redis"
+                }
+        except Exception:
+            pass
+
+    # -------------------------
+    # Local filesystem functions
+    # -------------------------
+    try:
+        for meta_file in LOCAL_FUNC_DIR.glob("*.meta.json"):
+            fid = meta_file.stem.replace(".meta", "")
+            if fid in functions:
+                continue
+
+            try:
+                meta = json.loads(meta_file.read_text())
+            except Exception:
+                meta = {}
+
+            functions[fid] = {
+                "id": fid,
+                "name": meta.get("name", ""),
+                "created_at": int(meta.get("created_at") or meta.get("ts") or 0),
+                "updated_at": int(meta.get("updated_at") or meta.get("ts") or 0),
+                "source": "local"
+            }
+    except Exception:
+        pass
+
+    return sorted(
+        functions.values(),
+        key=lambda x: x["created_at"],
+        reverse=True
+    )
 
 def _find_project_file(filename: str) -> Optional[Path]:
     # Normalize to a .py filename
@@ -555,6 +606,15 @@ async def run_function(request: Request, id: Optional[str] = None):
 
     result = _run_code(code, inputs)
     return {"result": result}
+@app.get("/functions")
+def list_functions():
+    """
+    Returns all custom functions with metadata.
+    """
+    return {
+        "functions": _list_all_functions(),
+        "count": len(_list_all_functions())
+    }
 
 @app.post("/updatefunction")
 async def update_function(id: str = Form(...), file: UploadFile = File(...), name: str = Form(...)):
