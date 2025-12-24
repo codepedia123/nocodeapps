@@ -1,43 +1,34 @@
-# agent_prompt_updater.py
 import os
 import json
 import traceback
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Annotated, TypedDict
 from pydantic import BaseModel, Field
 
-# LangChain Imports
+# LangChain & LangGraph Imports
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import StructuredTool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.tools import tool
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 
 # ------------------------------------------------------------------
-# 1. SETUP INPUTS (Patterned after main.py logic)
+# 1. SETUP INPUTS (Unified Logic)
 # ------------------------------------------------------------------
-# app.py injects 'inputs' as a global variable when run via /int.
-# Be robust: accept inputs from globals()["inputs"], globals()["input"], globals()["payload"],
-# or direct globals that may contain the expected keys.
 _raw_globals = globals()
-
-# Merge available input sources into a single dict called data
 data: Dict[str, Any] = {}
 
-# Priority ordering: explicit 'inputs', then 'input', then 'payload'
 for key in ("inputs", "input", "payload"):
     candidate = _raw_globals.get(key)
     if isinstance(candidate, dict) and candidate:
         data.update(candidate)
 
-# If still empty, try to pick up top-level keys that might have been set directly
-# This helps when a calling environment sets variables directly in globals
 for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key"):
     if k in _raw_globals and _raw_globals.get(k) not in (None, "", {}):
-        # do not overwrite existing keys already provided
         if k not in data:
             data[k] = _raw_globals.get(k)
 
-# As a last fallback, attempt to parse a raw JSON string from common env vars if present
-# This can help when a wrapper exports the entire request body as an env var
+# Env Var Fallback for JSON
 if not data:
     for env_key in ("REQUEST_BODY", "RAW_BODY", "INPUT_JSON"):
         raw = os.getenv(env_key)
@@ -47,117 +38,127 @@ if not data:
                 if isinstance(parsed, dict):
                     data.update(parsed)
                     break
-            except Exception:
-                # ignore parse errors
-                pass
+            except: pass
 
-# Finally ensure data is a dict
-if not isinstance(data, dict):
-    data = {}
-
-# Extract specific fields from the payload
 long_text = data.get("long_text", "")
 user_message = data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
 conversation = data.get("conversation", []) or data.get("chat_history", [])
-
-# Extract API Key from multiple possible fields in the request, fallback to environment
-api_key_to_use = (
-    data.get("api_key")
-    or data.get("openai_api_key")
-    or data.get("apiKey")
-    or data.get("key")
-    or os.getenv("OPENAI_API_KEY")
-)
+api_key_to_use = (data.get("api_key") or data.get("openai_api_key") or data.get("apiKey") or os.getenv("OPENAI_API_KEY"))
 
 # ------------------------------------------------------------------
-# 2. DEFINE THE UPDATE TOOL
+# 2. DEFINE THE STATE & TOOLS (The Official LangGraph Way)
 # ------------------------------------------------------------------
-class UpdateTextSchema(BaseModel):
-    updated_paragraph: str = Field(description="The complete, full version of the text with all requested changes applied.")
-    explanation: str = Field(description="A brief summary of what was changed.")
 
-# State to capture tool output
-state_update = {"new_text": None, "explanation": None}
+class AgentState(TypedDict):
+    """The official way to track state across the agent's 'thought' process."""
+    messages: Annotated[List[BaseMessage], "The conversation messages"]
+    document: str  # This holds the long text without sending it back/forth in ToolMessages
+    change_summary: Optional[str]
+    is_updated: bool
 
-def update_prompt_tool_func(updated_paragraph: str, explanation: str) -> str:
-    """Rewrites or modifies the main long text content. Use this when the user asks for changes."""
-    state_update["new_text"] = updated_paragraph
-    state_update["explanation"] = explanation
-    return f"Success: Text updated. Change: {explanation}"
+@tool
+def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str):
+    """
+    Updates the document by replacing a specific snippet with new text.
+    Use this to edit the text efficiently without rewriting the whole thing.
+    """
+    # This function is essentially a 'schema' for the LLM. 
+    # The actual logic happens inside the Graph State update.
+    return f"Success: Modified snippet. Change: {explanation}"
 
 # ------------------------------------------------------------------
-# 3. AGENT CORE LOGIC
+# 3. AGENT LOGIC UNIT
 # ------------------------------------------------------------------
+
 def run_updater_agent():
     if not api_key_to_use:
-        return {"error": "Missing 'api_key' in request payload and no environment fallback found."}
+        return {"error": "Missing 'api_key'."}
 
     try:
+        # Initialize LLM with Tools
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
+        tools = [patch_document_tool]
+        llm_with_tools = llm.bind_tools(tools)
 
-        tools = [
-            StructuredTool.from_function(
-                func=update_prompt_tool_func,
-                name="update_prompt_tool",
-                description="Rewrites or modifies the provided text. Use for tone changes, grammar, or formatting.",
-                args_schema=UpdateTextSchema
-            )
-        ]
+        # 1. THE AGENT NODE
+        def call_model(state: AgentState):
+            sys_msg = SystemMessage(content=(
+                "You are a professional Editor.\n"
+                f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
+                "RULES:\n"
+                "1. To edit, use 'patch_document_tool'. Provide the EXACT original snippet to find.\n"
+                "2. Do NOT rewrite the whole document. Only provide the new snippet in the tool.\n"
+                "3. If the user is just chatting, reply normally."
+            ))
+            response = llm_with_tools.invoke([sys_msg] + state["messages"])
+            return {"messages": [response]}
 
-        system_prompt = (
-            "You are a professional Editor.\n"
-            "CURRENT TEXT:\n"
-            "--- START ---\n"
-            f"{long_text}\n"
-            "--- END ---\n\n"
-            "RULES:\n"
-            "1. Use 'update_prompt_tool' ONLY if the user wants to change the text above.\n"
-            "2. Always provide the FULL updated text in the tool arguments.\n"
-            "3. If the user is just chatting, answer normally."
-        )
+        # 2. THE TOOL EXECUTION NODE (Updates state directly)
+        def tool_executor(state: AgentState):
+            last_msg = state["messages"][-1]
+            new_doc = state["document"]
+            summary = state["change_summary"]
+            updated = state["is_updated"]
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
+            for tool_call in last_msg.tool_calls:
+                args = tool_call["args"]
+                old, new, expl = args["original_snippet"], args["replacement_text"], args["explanation"]
+                if old in new_doc:
+                    new_doc = new_doc.replace(old, new, 1) # Only replace first occurrence
+                    summary = expl
+                    updated = True
+            
+            # Return the updated document to the graph state
+            return {"document": new_doc, "change_summary": summary, "is_updated": updated}
 
-        # Format History tolerantly: accept 'content' or 'message' keys and common role names
+        # 3. BUILD THE GRAPH
+        workflow = StateGraph(AgentState)
+        workflow.add_node("agent", call_model)
+        workflow.add_node("tools", tool_executor)
+        
+        workflow.set_entry_point("agent")
+        
+        # Conditional logic: If LLM called a tool, go to tools node, else end
+        def should_continue(state: AgentState):
+            if state["messages"][-1].tool_calls:
+                return "tools"
+            return END
+
+        workflow.add_conditional_edges("agent", should_continue)
+        workflow.add_edge("tools", END) # End after one edit for safety/efficiency
+
+        app = workflow.compile()
+
+        # 4. EXECUTE
+        # Convert history
         history = []
-        if isinstance(conversation, list):
-            for turn in conversation:
-                if not isinstance(turn, dict):
-                    continue
-                role_raw = (turn.get("role") or "").lower().strip()
-                content = turn.get("content", turn.get("message", ""))
-                if role_raw == "user":
-                    history.append(("human", content))
-                else:
-                    # treat assistant, ai, system, bot as ai unless explicitly 'user'
-                    history.append(("ai", content))
+        for turn in conversation:
+            content = turn.get("content", turn.get("message", ""))
+            role = (turn.get("role") or "").lower()
+            if "user" in role: history.append(HumanMessage(content=content))
+            else: history.append(BaseMessage(content=content, type="ai"))
 
-        agent = create_tool_calling_agent(llm, tools, prompt)
-        executor = AgentExecutor(agent=agent, tools=tools, verbose=False)
+        inputs = {
+            "messages": history + [HumanMessage(content=user_message)],
+            "document": long_text,
+            "change_summary": None,
+            "is_updated": False
+        }
 
-        response = executor.invoke({
-            "input": user_message,
-            "chat_history": history
-        })
+        final_state = app.invoke(inputs)
 
-        # Construct final payload
         return {
-            "reply": response.get("output", ""),
-            "updated_long_text": state_update["new_text"] if state_update["new_text"] else long_text,
-            "is_updated": state_update["new_text"] is not None,
-            "change_summary": state_update["explanation"]
+            "reply": final_state["messages"][-1].content,
+            "updated_long_text": final_state["document"],
+            "is_updated": final_state["is_updated"],
+            "change_summary": final_state["change_summary"]
         }
 
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 # ------------------------------------------------------------------
-# 4. SET GLOBAL RESULT (Required by app.py)
+# 4. SET GLOBAL RESULT
 # ------------------------------------------------------------------
-if "inputs" in globals() or "input" in globals() or "payload" in globals():
+if any(k in globals() for k in ("inputs", "input", "payload")):
     globals()["result"] = run_updater_agent()
