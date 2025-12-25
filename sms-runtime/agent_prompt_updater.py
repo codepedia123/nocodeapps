@@ -54,6 +54,7 @@ class AgentState(TypedDict):
     document: str  
     change_summary: Optional[str]
     is_updated: bool
+    error_log: Optional[str] # Added to track why an update might fail
 
 @tool
 def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str):
@@ -84,31 +85,37 @@ def run_updater_agent():
                 f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "RULES:\n"
                 "1. To edit, use 'patch_document_tool'. Provide the EXACT original snippet to find.\n"
-                "2. Your 'explanation' inside the tool MUST be a clear, descriptive summary of the change "
-                "as this will be shown directly to the user as your reply.\n"
-                "3. If the user is just chatting, reply normally without tools."
+                "2. The 'original_snippet' must exist character-for-character in the CURRENT DOCUMENT CONTENT above.\n"
+                "3. Your 'explanation' inside the tool MUST be a clear, descriptive summary of the change.\n"
+                "4. If the user is just chatting, reply normally without tools."
             ))
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
 
-        # 2. THE TOOL EXECUTION NODE
+        # 2. THE TOOL EXECUTION NODE (The Surgical Update)
         def tool_executor(state: AgentState):
             last_msg = state["messages"][-1]
             new_doc = state["document"]
             summary = state["change_summary"]
             updated = state["is_updated"]
+            err = None
 
-            if hasattr(last_msg, "tool_calls"):
+            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                 for tool_call in last_msg.tool_calls:
                     args = tool_call["args"]
-                    old, new, expl = args["original_snippet"], args["replacement_text"], args["explanation"]
-                    if old in new_doc:
-                        # Perform the surgical update
+                    old, new, expl = args.get("original_snippet", ""), args.get("replacement_text", ""), args.get("explanation", "")
+                    
+                    # Verify the snippet exists in the document
+                    if old and old in new_doc:
                         new_doc = new_doc.replace(old, new, 1)
-                        summary = expl # Capture the raw explanation
+                        summary = expl
                         updated = True
+                    else:
+                        # Capture failure for the final reply logic
+                        err = f"Failed to update. The snippet you provided was not found in the original document."
+                        summary = expl # Still keep the intent
             
-            return {"document": new_doc, "change_summary": summary, "is_updated": updated}
+            return {"document": new_doc, "change_summary": summary, "is_updated": updated, "error_log": err}
 
         # 3. BUILD THE GRAPH
         workflow = StateGraph(AgentState)
@@ -139,26 +146,39 @@ def run_updater_agent():
             "messages": history + [HumanMessage(content=user_message)],
             "document": long_text,
             "change_summary": None,
-            "is_updated": False
+            "is_updated": False,
+            "error_log": None
         }
 
         final_state = app.invoke(inputs)
 
         # ------------------------------------------------------------------
-        # 5. CONSTRUCT FINAL RESPONSE
+        # 5. CONSTRUCT FINAL RESPONSE (Improved Logic)
         # ------------------------------------------------------------------
-        # If updated, we create a descriptive reply from the tool explanation.
-        # If not updated, we use the LLM's text response.
+        last_msg = final_state["messages"][-1]
+        
         if final_state["is_updated"]:
+            # Scenario A: Tool worked perfectly
             final_reply = f"I have updated the text as requested. {final_state['change_summary']}"
+        
+        elif final_state["error_log"]:
+            # Scenario B: Tool was called but the snippet didn't match
+            final_reply = (
+                f"I tried to make the following change: '{final_state['change_summary']}', "
+                f"but I couldn't find the exact matching text in the document to replace. "
+                "Please ensure the text you want to change is written exactly as it appears in the document."
+            )
+            
         else:
-            final_reply = final_state["messages"][-1].content
+            # Scenario C: Chatting or no tool was used
+            final_reply = last_msg.content or "I've processed your request, but no changes were made to the document."
 
         return {
             "reply": final_reply,
             "updated_long_text": final_state["document"],
             "is_updated": final_state["is_updated"],
-            "change_summary": final_state["change_summary"]
+            "change_summary": final_state["change_summary"],
+            "error_details": final_state.get("error_log")
         }
 
     except Exception as e:
