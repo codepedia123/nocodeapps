@@ -51,18 +51,43 @@ api_key_to_use = (data.get("api_key") or data.get("openai_api_key") or data.get(
 class AgentState(TypedDict):
     """The official way to track state across the agent's 'thought' process."""
     messages: Annotated[List[BaseMessage], "The conversation messages"]
-    document: str  
+    document: str
     change_summary: Optional[str]
     is_updated: bool
-    error_log: Optional[str] # Added to track why an update might fail
+    error_log: Optional[str]  # Added to track why an update might fail
 
 @tool
-def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str):
+def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str, anchor_for_insertion: Optional[str] = None):
     """
     Updates the document by replacing a specific snippet with new text.
     'explanation' should be a professional, descriptive summary of what you are changing.
+    'anchor_for_insertion' (optional) can be provided when original_snippet is not present:
+      - If provided and found, the replacement_text will be inserted after that anchor.
+      - This tool itself does not mutate the document (the executor applies changes).
+    Returns a stable, human-readable summary the agent can use.
     """
-    return f"Success: Modified snippet. Change: {explanation}"
+    return {
+        "status": "planned",
+        "action": "patch",
+        "original_snippet": original_snippet,
+        "replacement_text": replacement_text,
+        "explanation": explanation,
+        "anchor_for_insertion": anchor_for_insertion
+    }
+
+@tool
+def insert_after_anchor_tool(anchor_snippet: str, insertion_text: str, explanation: str):
+    """
+    Requests insertion of insertion_text immediately after the first occurrence of anchor_snippet.
+    The executor (tool_executor) will perform the insertion on the document.
+    """
+    return {
+        "status": "planned",
+        "action": "insert_after_anchor",
+        "anchor_snippet": anchor_snippet,
+        "insertion_text": insertion_text,
+        "explanation": explanation
+    }
 
 # ------------------------------------------------------------------
 # 3. AGENT LOGIC UNIT
@@ -75,21 +100,25 @@ def run_updater_agent():
     try:
         # Initialize LLM
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
-        tools = [patch_document_tool]
+        tools = [patch_document_tool, insert_after_anchor_tool]
         llm_with_tools = llm.bind_tools(tools)
 
         # 1. THE AGENT NODE
         def call_model(state: AgentState):
+            # Add explicit guidance to prefer anchor-based edits and the new insert tool
             sys_msg = SystemMessage(content=(
                 "You are a professional Editor.\n"
+                "IMPORTANT EDITING RULES (READ CAREFULLY):\n"
+                "1. To edit, prefer using 'patch_document_tool' when the exact original snippet is present.\n"
+                "2. If the exact snippet is not present, do NOT attempt to patch a demo chat transcript directly.\n"
+                "   Instead, use 'insert_after_anchor_tool' or provide an 'anchor_for_insertion' with 'patch_document_tool'.\n"
+                "3. Provide the EXACT original snippet when using 'patch_document_tool' whenever possible.\n"
+                "4. The 'anchor_for_insertion' can be a short, guaranteed-to-exist heading or line such as '#Notes:' or '#Task:' etc.\n"
+                "5. Your 'explanation' must be a clear, descriptive summary of the change.\n"
+                "6. If the user quotes a demo conversation line that is not present in the document, DO NOT try to patch that quoted line. Instead, add or modify a relevant section (Role, Notes, Conversational Style) using an insertion or anchor-based replacement.\n"
+                "7. When you intend to insert new instructions, prefer 'insert_after_anchor_tool' with an insertion anchor that exists in the document.\n\n"
                 f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
-                "RULES:\n"
-                "1. To edit, use 'patch_document_tool'. Provide the EXACT original snippet to find.\n"
-                "2. The 'original_snippet' must exist character-for-character in the CURRENT DOCUMENT CONTENT above.\n"
-                "3. Your 'explanation' inside the tool MUST be a clear, descriptive summary of the change.\n"
-                "4. If the user is just chatting, reply normally without tools.\n"
-                "5. If you can't find any related instructions to update, look for a nearby or similar instruction section and update that section accordingly.\n"
-                "6. If you can't find any related or similar instruction section at all, choose a blank section or whitespace and insert the new instructions there, as inserting new instructions may be required.\n"
+                "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
             ))
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
@@ -98,37 +127,92 @@ def run_updater_agent():
         def tool_executor(state: AgentState):
             last_msg = state["messages"][-1]
             new_doc = state["document"]
-            summary = state["change_summary"]
-            updated = state["is_updated"]
-            err = None
+            summary = state.get("change_summary")
+            updated = state.get("is_updated", False)
+            err = state.get("error_log")
 
+            # Normalize potential tool calls representation
+            tool_calls = []
             if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                for tool_call in last_msg.tool_calls:
-                    args = tool_call["args"]
-                    old, new, expl = args.get("original_snippet", ""), args.get("replacement_text", ""), args.get("explanation", "")
-                    
-                    # Verify the snippet exists in the document
+                tool_calls = last_msg.tool_calls
+            elif isinstance(last_msg, dict) and last_msg.get("tool_calls"):
+                tool_calls = last_msg.get("tool_calls")
+
+            for tool_call in tool_calls:
+                # tool_call may be a dict with 'name' & 'args'
+                name = tool_call.get("name") if isinstance(tool_call, dict) else None
+                args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
+
+                # Some runtimes nest args differently, handle both
+                if not isinstance(args, dict) and hasattr(args, "__dict__"):
+                    args = vars(args)
+
+                # Patch action
+                if name == "patch_document_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "patch_document_tool"):
+                    old = args.get("original_snippet", "") or ""
+                    new = args.get("replacement_text", "") or ""
+                    expl = args.get("explanation", "") or ""
+                    anchor = args.get("anchor_for_insertion", None)
+
                     if old and old in new_doc:
                         new_doc = new_doc.replace(old, new, 1)
-                        summary = expl
+                        summary = expl or f"Replaced an exact matching snippet."
                         updated = True
                     else:
-                        # Capture failure for the final reply logic
-                        err = f"Failed to update. The snippet you provided was not found in the original document."
-                        summary = expl # Still keep the intent
-            
+                        # fallback: if anchor provided and anchor exists, insert after anchor
+                        if anchor and anchor in new_doc:
+                            insertion = f"\n{new}\n"
+                            # insert after first occurrence of anchor
+                            idx = new_doc.find(anchor) + len(anchor)
+                            new_doc = new_doc[:idx] + insertion + new_doc[idx:]
+                            summary = expl or f"Inserted new text after provided anchor."
+                            updated = True
+                        else:
+                            # not found; keep the intent for reporting
+                            err = f"Failed to update: original snippet not found and no usable anchor provided."
+                            summary = expl or summary
+
+                # Insert-after-anchor action
+                elif name == "insert_after_anchor_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "insert_after_anchor_tool"):
+                    anchor = args.get("anchor_snippet", "") or ""
+                    insertion_text = args.get("insertion_text", "") or ""
+                    expl = args.get("explanation", "") or ""
+
+                    if anchor and anchor in new_doc:
+                        idx = new_doc.find(anchor) + len(anchor)
+                        # ensure insertion has newlines for separation
+                        insertion = f"\n{insertion_text}\n"
+                        new_doc = new_doc[:idx] + insertion + new_doc[idx:]
+                        summary = expl or f"Inserted text after anchor."
+                        updated = True
+                    else:
+                        err = f"Failed to insert: anchor snippet not found."
+                        summary = expl or summary
+
+                else:
+                    # Unknown tool name: capture for diagnostics
+                    err = f"Tool call with unknown tool name: {name}"
+                    summary = summary or None
+
             return {"document": new_doc, "change_summary": summary, "is_updated": updated, "error_log": err}
 
         # 3. BUILD THE GRAPH
         workflow = StateGraph(AgentState)
         workflow.add_node("agent", call_model)
         workflow.add_node("tools", tool_executor)
-        
+
         workflow.set_entry_point("agent")
-        
+
         def should_continue(state: AgentState):
-            if state["messages"][-1].tool_calls:
-                return "tools"
+            # safe guard: messages may be lists of Message objects or dicts
+            try:
+                last = state["messages"][-1]
+                if hasattr(last, "tool_calls") and last.tool_calls:
+                    return "tools"
+                if isinstance(last, dict) and last.get("tool_calls"):
+                    return "tools"
+            except Exception:
+                pass
             return END
 
         workflow.add_conditional_edges("agent", should_continue)
@@ -141,8 +225,10 @@ def run_updater_agent():
         for turn in conversation:
             content = turn.get("content", turn.get("message", ""))
             role = (turn.get("role") or "").lower()
-            if "user" in role: history.append(HumanMessage(content=content))
-            else: history.append(AIMessage(content=content))
+            if "user" in role:
+                history.append(HumanMessage(content=content))
+            else:
+                history.append(AIMessage(content=content))
 
         inputs = {
             "messages": history + [HumanMessage(content=user_message)],
@@ -157,29 +243,33 @@ def run_updater_agent():
         # ------------------------------------------------------------------
         # 5. CONSTRUCT FINAL RESPONSE (Improved Logic)
         # ------------------------------------------------------------------
-        last_msg = final_state["messages"][-1]
-        
-        if final_state["is_updated"]:
+        last_msg = final_state["messages"][-1] if final_state.get("messages") else None
+
+        if final_state.get("is_updated"):
             # Scenario A: Tool worked perfectly
-            final_reply = f"I have updated the text as requested. {final_state['change_summary']}"
-        
-        elif final_state["error_log"]:
+            final_reply = f"I have updated the text as requested. {final_state.get('change_summary')}"
+        elif final_state.get("error_log"):
             # Scenario B: Tool was called but the snippet didn't match
             final_reply = (
-                f"I tried to make the following change: '{final_state['change_summary']}', "
-                f"but I couldn't find the exact matching text in the document to replace. "
-                "Please ensure the text you want to change is written exactly as it appears in the document."
+                f"I tried to make the following change: '{final_state.get('change_summary')}', "
+                f"but I couldn't find the exact matching text in the document to replace or the anchor was missing. "
+                "Please ensure the text or an anchor (for example '#Notes:' or '#Task:') is present exactly as you'd like it changed."
             )
-            
         else:
             # Scenario C: Chatting or no tool was used
-            final_reply = last_msg.content or "I've processed your request, but no changes were made to the document."
+            # Prefer to return the assistant's final generated content if available
+            assistant_content = None
+            try:
+                assistant_content = last_msg.content if hasattr(last_msg, "content") else (last_msg.get("content") if isinstance(last_msg, dict) else None)
+            except Exception:
+                assistant_content = None
+            final_reply = assistant_content or "I've processed your request, but no changes were made to the document."
 
         return {
             "reply": final_reply,
-            "updated_long_text": final_state["document"],
-            "is_updated": final_state["is_updated"],
-            "change_summary": final_state["change_summary"],
+            "updated_long_text": final_state.get("document"),
+            "is_updated": final_state.get("is_updated"),
+            "change_summary": final_state.get("change_summary"),
             "error_details": final_state.get("error_log")
         }
 
