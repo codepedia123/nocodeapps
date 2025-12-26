@@ -87,9 +87,9 @@ def run_updater_agent():
                 "1. To edit, use 'patch_document_tool'. Provide the EXACT original snippet to find.\n"
                 "2. The 'original_snippet' must exist character-for-character in the CURRENT DOCUMENT CONTENT above.\n"
                 "3. Your 'explanation' inside the tool MUST be a clear, descriptive summary of the change.\n"
-                "4. If the user is just chatting, reply normally without tools."
-                "5. If you can't find any related intstructions, which you want to update on, find for a nearby related guess, of a instruction section which is similar to what needs to be udpated, or contain the updates, and update that section with new implements
-                "6. If you can't find any related intstructions, which you want to update on, not even a nearby related guess, of a instruction section which is similar to what needs to be udpated, or contain the updates, choose a blank section or space character, use it as the to update section, and implement changes there, because many times Inserting new instructions are also needed. "
+                "4. If the user is just chatting, reply normally without tools.\n"
+                "5. If you can't find any related instructions to update, look for a nearby or similar instruction section and update that section accordingly.\n"
+                "6. If you can't find any related or similar instruction section at all, choose a blank section or whitespace and insert the new instructions there, as inserting new instructions may be required.\n"
             ))
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
