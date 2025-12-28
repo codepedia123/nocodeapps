@@ -53,29 +53,39 @@ logger = Logger()
 # ---------------------------
 # Note: we intentionally use Redis only. No HTTP fallback.
 
-import redis
-from redis.cluster import RedisCluster
+import os
+from upstash_redis import Redis as UpstashRedis
 
 _redis_client = None
+
 try:
-    redis_url = "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379"
-    _redis_client = RedisCluster.from_url(
-        redis_url,
-        decode_responses=True,
-        ssl_cert_reqs=None,
-        socket_connect_timeout=3,
-        socket_timeout=3,
-        read_from_replicas=True
-    )
+    # 1. Pull credentials from environment variables (Railway)
+    # Falling back to the provided hardcoded values if environment variables are missing
+    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "https://climbing-hyena-56303.upstash.io")
+    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM")
+    
+    if not redis_url or not redis_token:
+        raise RuntimeError("Upstash credentials missing in environment")
+
+    # 2. Initialize the HTTP-based Upstash client
+    _redis_client = UpstashRedis(url=redis_url, token=redis_token)
+    
     try:
-        _redis_client.ping()
-        logger.log("redis", "Connected to RedisCluster", {"url": redis_url})
+        # 3. Test connection (Upstash uses .set or .get to verify HTTP connectivity)
+        _redis_client.set("connection_test", "ok")
+        logger.log("redis", "Connected to Upstash via HTTP SDK", {"url": redis_url})
+        print("✅ Connected to Upstash via HTTP SDK")
     except Exception as e:
-        logger.log("redis.ping_error", "Ping failed", {"error": str(e)})
+        logger.log("redis.ping_error", "Upstash test operation failed", {"error": str(e)})
         _redis_client = None
+        
 except Exception as e:
-    logger.log("redis.init_error", "Failed to initialize RedisCluster client", {"error": str(e)})
+    logger.log("redis.init_error", "Failed to initialize Upstash client", {"error": str(e)})
+    print(f"❌ Upstash SDK connection failed: {e}")
     _redis_client = None
+
+# For compatibility with the rest of your app logic
+r = _redis_client
 
 def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
     """
