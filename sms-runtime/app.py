@@ -24,35 +24,29 @@ load_dotenv()
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        # 1. Prioritize Railway's automatic environment variable
-        # 2. Fallback to hardcoded AWS URL if not in Railway
+        # Pull the URL from Railway Environment Variables
         redis_url = os.getenv("REDIS_URL", "redis://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379")
 
-        # Railway Redis is standalone (needs redis.from_url)
-        # AWS Serverless is a Cluster (needs RedisCluster.from_url)
-        if "cache.amazonaws.com" in redis_url:
+        if "upstash.io" in redis_url or "railway.app" in redis_url:
+            print("🔗 Connecting to Standard Redis (Upstash/Railway)...")
+            # Upstash uses standard redis.from_url
+            client = redis.from_url(
+                redis_url, 
+                decode_responses=True,
+                socket_connect_timeout=5
+            )
+        else:
             print("🔗 Connecting to AWS Redis Cluster...")
             client = RedisCluster.from_url(
                 redis_url,
                 decode_responses=True,
                 ssl_cert_reqs=None,
-                socket_connect_timeout=3,
-                socket_timeout=3,
-                read_from_replicas=True
-            )
-        else:
-            print("🔗 Connecting to Standalone Redis (Railway)...")
-            client = redis.from_url(
-                redis_url, 
-                decode_responses=True,
-                socket_connect_timeout=3,
-                socket_timeout=3
+                socket_connect_timeout=5
             )
 
         client.ping()
-        print("✅ Redis connection successful")
+        print("✅ Redis connection successful!")
         return client
-
     except Exception as e:
         print(f"❌ Redis connection failed: {e}")
         return None
