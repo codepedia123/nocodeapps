@@ -119,6 +119,42 @@ def _table_ids_key(name: str) -> str:
 
 def _table_row_key(name: str, rowid: str) -> str:
     return f"table:{name}:row:{rowid}"
+
+# Helper: Upstash-compatible hset for mapping dicts
+def hset_map(key: str, mapping: Dict[str, Any]):
+    """
+    Writes a mapping to a Redis hash in a way compatible with Upstash
+    (which expects field, value pairs rather than mapping=).
+    Values that are dict or list are JSON-encoded. None becomes empty string.
+    """
+    if not mapping:
+        return
+    for fld, val in mapping.items():
+        if isinstance(val, (dict, list)):
+            store_val = json.dumps(val)
+        elif val is None:
+            store_val = ""
+        elif isinstance(val, (str, bytes)):
+            store_val = val
+        elif isinstance(val, bool):
+            store_val = "1" if val else "0"
+        else:
+            # numbers and other types converted to string
+            store_val = str(val)
+        # Upstash's hset expects key, field, value
+        try:
+            r.hset(key, fld, store_val)
+        except TypeError:
+            # Fallback for redis-py if signature differs
+            try:
+                r.hset(key, mapping={fld: store_val})
+            except Exception:
+                # last resort: attempt set with HMSET style if available
+                try:
+                    r.hmset(key, {fld: store_val})
+                except Exception:
+                    raise
+
 def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
     """
     Returns all tables with record counts.
@@ -186,7 +222,8 @@ def _create_table(name: str):
     if _table_exists(name):
         raise HTTPException(status_code=400, detail="Table already exists")
     r.sadd("tables", name)
-    r.hset(_table_meta_key(name), mapping={"created_at": int(time.time())})
+    # use helper to be Upstash-safe
+    hset_map(_table_meta_key(name), {"created_at": int(time.time())})
     # use a dedicated set for ids and add a sentinel value to ensure set type
     r.sadd(_table_ids_key(name), "_meta")
     r.set(f"nextid:{name}", 0)
@@ -555,7 +592,8 @@ async def create_function(file: UploadFile = File(...), name: str = Form(...)):
     if r:
         try:
             r.set(f"function:{fid}:code", code)
-            r.hset(f"function:{fid}:meta", mapping=meta)
+            # Upstash-safe write of meta
+            hset_map(f"function:{fid}:meta", meta)
             return {"id": fid, "status": "created"}
         except Exception:
             # fallback to local
@@ -629,7 +667,8 @@ async def update_function(id: str = Form(...), file: UploadFile = File(...), nam
     if r:
         try:
             r.set(f"function:{id}:code", code)
-            r.hset(f"function:{id}:meta", mapping=meta)
+            # Upstash-safe write of meta
+            hset_map(f"function:{id}:meta", meta)
             return {"id": id, "status": "updated"}
         except Exception:
             _save_local_function(id, code, meta)
@@ -764,15 +803,18 @@ def add_endpoint(req: AddRequest):
         next_id = int(r.get(next_id_key) or 0) + 1
         r.set(next_id_key, next_id)
         row_key = _table_row_key(req.table, next_id)
-        r.hset(row_key, mapping=data)
+        # Upstash-safe write
+        hset_map(row_key, data)
         r.sadd(ids_key, next_id)
         return {"id": str(next_id), "table": req.table, "status": "success"}
 
     if req.table == "users":
+        nxt = _GetNextUser := None  # placeholder to preserve original behavior; overwritten next line
         nxt = _get_next_user_id() + 1
         r.set("next_user_id", nxt)
         uid = nxt
-        r.hset(_user_key(uid), mapping=data)
+        # Upstash-safe write
+        hset_map(_user_key(uid), data)
         r.sadd("users", str(uid))
         return {"id": str(uid), "status": "success"}
 
@@ -782,7 +824,8 @@ def add_endpoint(req: AddRequest):
         aid_name = _agent_name(nxt)
         if "tools" in data:
             data["tools"] = json.dumps(data["tools"])
-        r.hset(aid_name, mapping=data)
+        # Upstash-safe write
+        hset_map(aid_name, data)
         r.sadd("agents", aid_name)
         return {"id": aid_name, "status": "success"}
 
@@ -798,7 +841,8 @@ def add_endpoint(req: AddRequest):
         for m in messages:
             r.rpush(key, json.dumps(m))
         r.expire(key, 30 * 86400)
-        r.hset(meta_key, mapping=data)
+        # Upstash-safe write of meta
+        hset_map(meta_key, data)
         r.sadd("conversations", f"{agent_id}:{phone}")
         return {"id": f"{agent_id}:{phone}", "status": "success"}
 
@@ -1001,7 +1045,8 @@ def update_endpoint(req: UpdateRequest):
         row_key = _table_row_key(req.table, req.id)
         if not r.exists(row_key):
             raise HTTPException(status_code=404, detail="Row not found")
-        r.hset(row_key, mapping=updates)
+        # Upstash-safe write
+        hset_map(row_key, updates)
         return {"status": "success", "id": req.id}
 
     if req.table == "users":
@@ -1012,7 +1057,8 @@ def update_endpoint(req: UpdateRequest):
         key = _user_key(uid)
         if not r.exists(key):
             raise HTTPException(status_code=404, detail="User not found")
-        r.hset(key, mapping=updates)
+        # Upstash-safe write
+        hset_map(key, updates)
         return {"status": "success"}
 
     if req.table == "agents":
@@ -1021,7 +1067,8 @@ def update_endpoint(req: UpdateRequest):
             raise HTTPException(status_code=404, detail="Agent not found")
         if "tools" in updates:
             updates["tools"] = json.dumps(updates["tools"])
-        r.hset(aid, mapping=updates)
+        # Upstash-safe write
+        hset_map(aid, updates)
         return {"status": "success"}
 
     if req.table == "conversations":
@@ -1037,7 +1084,8 @@ def update_endpoint(req: UpdateRequest):
             for m in updates.pop("append"):
                 r.rpush(msg_key, json.dumps(m))
         if updates:
-            r.hset(meta_key, mapping=updates)
+            # Upstash-safe write
+            hset_map(meta_key, updates)
         return {"status": "success"}
 
     raise HTTPException(status_code=400, detail="Invalid table")
@@ -1087,7 +1135,7 @@ def clear_dynamic_table(name: str):
 
     # Optionally clear meta:
     r.delete(_table_meta_key(name))
-    r.hset(_table_meta_key(name), mapping={"created_at": int(time.time())})
+    hset_map(_table_meta_key(name), {"created_at": int(time.time())})
 
     return {
         "status": "success",
@@ -1136,9 +1184,9 @@ def clear_table(name: str):
 
     # Reset table meta timestamp
     r.delete(_table_meta_key(name))
-    r.hset(
+    hset_map(
         _table_meta_key(name),
-        mapping={"created_at": int(time.time())}
+        {"created_at": int(time.time())}
     )
 
     return {
