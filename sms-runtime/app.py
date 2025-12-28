@@ -18,12 +18,12 @@ import traceback
 import re
 import builtins
 import threading
+from upstash_redis import Redis as UpstashRedis
 load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-import redis
-import os
+
 
 def _init_redis() -> Optional[redis.Redis]:
     try:
