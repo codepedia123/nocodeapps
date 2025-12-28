@@ -764,7 +764,7 @@ def add_endpoint(req: AddRequest):
         next_id = int(r.get(next_id_key) or 0) + 1
         r.set(next_id_key, next_id)
         row_key = _table_row_key(req.table, next_id)
-        r.hset(row_key, mapping=data)
+        r.hset(row_key, data)
         r.sadd(ids_key, next_id)
         return {"id": str(next_id), "table": req.table, "status": "success"}
 
