@@ -46,7 +46,7 @@ def _init_redis() -> Optional[UpstashRedis]:
 r = _init_redis()
 
 
-r = _init_redis()
+
 MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
 safe_builtins = {
     "abs": abs, "all": all, "any": any, "bool": bool,
@@ -120,29 +120,32 @@ def _table_ids_key(name: str) -> str:
 def _table_row_key(name: str, rowid: str) -> str:
     return f"table:{name}:row:{rowid}"
 
-# Helper: Upstash-compatible hset for mapping dicts
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
-    Upstash-safe HSET helper.
-    Always uses mapping form.
+    Fully Upstash-compatible HSET helper.
+    Expands mapping into positional arguments.
     """
     if not mapping:
         return
 
-    safe_map = {}
+    args = []
 
     for fld, val in mapping.items():
         if isinstance(val, (dict, list)):
-            safe_map[fld] = json.dumps(val)
+            store_val = json.dumps(val)
         elif val is None:
-            safe_map[fld] = ""
+            store_val = ""
         elif isinstance(val, bool):
-            safe_map[fld] = "1" if val else "0"
+            store_val = "1" if val else "0"
         else:
-            safe_map[fld] = str(val)
+            store_val = str(val)
 
-    # THIS is the only valid Upstash call
-    r.hset(key, mapping=safe_map)
+        args.append(fld)
+        args.append(store_val)
+
+    # IMPORTANT: positional args only
+    r.hset(key, *args)
+
 
 
 def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
