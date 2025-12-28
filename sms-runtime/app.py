@@ -125,7 +125,6 @@ def _table_row_key(name: str, rowid: str) -> str:
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
     Correct, Upstash-safe HSET helper.
-    MUST use keyword argument `mapping=`.
     """
     if not mapping:
         return
@@ -142,8 +141,8 @@ def hset_map(key: str, mapping: Dict[str, Any]):
         else:
             clean_map[fld] = str(val)
 
-    # THIS IS THE CRITICAL LINE
-    r.hset(key, mapping=clean_map)
+    # CHANGE 'mapping' TO 'values' HERE
+    r.hset(key, values=clean_map)
 
 
 
