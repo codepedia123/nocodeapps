@@ -908,11 +908,13 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             keys = [_user_key(int(x)) for x in sorted([int(x) for x in members])]
         if not keys:
             return out
-        pipe = r.pipeline()
-        for k in keys:
-            pipe.hgetall(k)
-        results = pipe.execute()
-        for uid, rec in zip([int(k.split(":")[1]) for k in keys], results):
+
+        # REPLACE THE PIPELINE BLOCK WITH THIS:
+        results = [r.hgetall(k) for k in keys]
+        
+        # Extract UIDs from keys for the zip
+        uids = [int(k.split(":")[1]) for k in keys]
+        for uid, rec in zip(uids, results):
             if rec:
                 rec.setdefault("name", "")
                 rec.setdefault("phone", "")
@@ -944,12 +946,13 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
             agent_keys = sorted(list(members))
         if not agent_keys:
             return out
-        pipe = r.pipeline()
-        for aid in agent_keys:
-            pipe.hgetall(aid)
-        results = pipe.execute()
+            
+        # REPLACE THE PIPELINE BLOCK WITH THIS:
+        results = [r.hgetall(aid) for aid in agent_keys]
+        
         for aid, rec in zip(agent_keys, results):
             if rec:
+                # rec is already a dict from upstash-redis
                 rec.setdefault("prompt", "")
                 rec.setdefault("user_id", "")
                 rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
@@ -982,39 +985,23 @@ def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] 
                     return {"messages": [], "meta": meta}
             return {"messages": msgs, "meta": meta}
         out: Dict[str, Any] = {}
-        convs = list(r.smembers("conversations"))
-        if not convs:
-            return out
-        pipe = r.pipeline()
+        # REPLACE THE PIPELINE BLOCK WITH THIS:
         for ck in convs:
             try:
                 agent_id, phone = ck.split(":", 1)
-            except ValueError:
+                msg_key = _convo_msg_key(agent_id, phone)
+                meta_key = _convo_meta_key(agent_id, phone)
+                
+                # Direct calls instead of pipe.lrange and pipe.hgetall
+                msgs_raw = r.lrange(msg_key, 0, -1)
+                meta = dict(r.hgetall(meta_key))
+                
+                msgs = [json.loads(m) for m in msgs_raw] if msgs_raw else []
+                # ... (keep the rest of your processing/filtering logic) ...
+                if not filt or any(_matches(m, filt) for m in msgs):
+                    out[ck] = {"messages": msgs, "meta": meta}
+            except Exception:
                 continue
-            msg_key = _convo_msg_key(agent_id, phone)
-            meta_key = _convo_meta_key(agent_id, phone)
-            pipe.lrange(msg_key, 0, -1)
-            pipe.hgetall(meta_key)
-        results = pipe.execute()
-        it = iter(results)
-        for ck in convs:
-            try:
-                agent_id, phone = ck.split(":", 1)
-            except ValueError:
-                continue
-            try:
-                msgs_raw = next(it)
-                meta_raw = next(it)
-            except StopIteration:
-                break
-            msgs = [json.loads(m) for m in msgs_raw] if msgs_raw else []
-            meta = meta_raw or {}
-            meta.setdefault("agent_id", agent_id)
-            meta.setdefault("phone", phone)
-            meta["created_at"] = int(meta.get("created_at", 0))
-            meta["updated_at"] = int(meta.get("updated_at", 0))
-            if not filt or any(_matches(m, filt) for m in msgs):
-                out[ck] = {"messages": msgs, "meta": meta}
         return out
 
     raise HTTPException(status_code=400, detail="Invalid table")
