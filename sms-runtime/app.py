@@ -22,24 +22,30 @@ load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-from upstash_redis import Redis as UpstashRedis
+import redis
+import os
 
-def _init_redis() -> Optional[UpstashRedis]:
+def _init_redis() -> Optional[redis.Redis]:
     try:
-        # Pull these from Railway Environment Variables for security
-        url = os.getenv("UPSTASH_REDIS_REST_URL", "https://climbing-hyena-56303.upstash.io")
-        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM")
+        # 1. Get the URL from the Railway Variables we just set
+        # 2. Fallback to the internal name if the variable is missing
+        redis_url = os.getenv("REDIS_URL", "redis://redis-ugih.railway.internal:6379")
         
-        # Initialize the HTTP-based client
-        client = UpstashRedis(url=url, token=token)
+        print(f"🔗 Attempting to connect to Redis at: {redis_url}")
         
-        # Test connection
-        client.set("connection_test", "ok")
-        print("✅ Connected to Upstash via HTTP SDK")
+        # Initialize standard Redis client
+        client = redis.from_url(
+            redis_url, 
+            decode_responses=True,
+            socket_connect_timeout=5
+        )
+        
+        client.ping()
+        print("✅ Connected to Railway Redis via Private Network")
         return client
         
     except Exception as e:
-        print(f"❌ Upstash SDK connection failed: {e}")
+        print(f"❌ Redis connection failed: {e}")
         return None
 
 # Initialize global client
