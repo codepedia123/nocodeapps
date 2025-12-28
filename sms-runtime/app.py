@@ -22,34 +22,28 @@ load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-def _init_redis() -> Optional[redis.Redis]:
+from upstash_redis import Redis as UpstashRedis
+
+def _init_redis() -> Optional[UpstashRedis]:
     try:
-        # Pull the URL from Railway Environment Variables
-        redis_url = os.getenv("REDIS_URL", "redis://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379")
-
-        if "upstash.io" in redis_url or "railway.app" in redis_url:
-            print("🔗 Connecting to Standard Redis (Upstash/Railway)...")
-            # Upstash uses standard redis.from_url
-            client = redis.from_url(
-                redis_url, 
-                decode_responses=True,
-                socket_connect_timeout=5
-            )
-        else:
-            print("🔗 Connecting to AWS Redis Cluster...")
-            client = RedisCluster.from_url(
-                redis_url,
-                decode_responses=True,
-                ssl_cert_reqs=None,
-                socket_connect_timeout=5
-            )
-
-        client.ping()
-        print("✅ Redis connection successful!")
+        # Pull these from Railway Environment Variables for security
+        url = os.getenv("UPSTASH_REDIS_REST_URL", "https://climbing-hyena-56303.upstash.io")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM")
+        
+        # Initialize the HTTP-based client
+        client = UpstashRedis(url=url, token=token)
+        
+        # Test connection
+        client.set("connection_test", "ok")
+        print("✅ Connected to Upstash via HTTP SDK")
         return client
+        
     except Exception as e:
-        print(f"❌ Redis connection failed: {e}")
+        print(f"❌ Upstash SDK connection failed: {e}")
         return None
+
+# Initialize global client
+r = _init_redis()
 
 
 r = _init_redis()
