@@ -29,6 +29,8 @@ def _init_redis() -> Optional[UpstashRedis]:
         # Pull these from Railway Environment Variables for security
         url = os.getenv("UPSTASH_REDIS_REST_URL", "https://climbing-hyena-56303.upstash.io")
         token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM")
+        if not url or not token:
+            raise RuntimeError("Upstash credentials missing")
         
         # Initialize the HTTP-based client
         client = UpstashRedis(url=url, token=token)
@@ -123,12 +125,10 @@ def _table_row_key(name: str, rowid: str) -> str:
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
     Fully Upstash-compatible HSET helper.
-    Expands mapping into positional arguments.
+    Writes ONE field per call (required by Upstash SDK).
     """
     if not mapping:
         return
-
-    args = []
 
     for fld, val in mapping.items():
         if isinstance(val, (dict, list)):
@@ -140,12 +140,8 @@ def hset_map(key: str, mapping: Dict[str, Any]):
         else:
             store_val = str(val)
 
-        args.append(fld)
-        args.append(store_val)
-
-    # IMPORTANT: positional args only
-    r.hset(key, *args)
-
+        # Upstash only supports (key, field, value)
+        r.hset(key, fld, store_val)
 
 
 def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
@@ -406,7 +402,7 @@ def compact_agents() -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 # Health
 # ----------------------------------------------------------------------
-@app.get("/")
+
 @app.get("/")
 def health():
     redis_status = "Failed"
@@ -805,7 +801,7 @@ def add_endpoint(req: AddRequest):
             nxt = _get_next_user_id() + 1
             r.set("next_user_id", nxt)
             uid = nxt
-            hset_dict(_user_key(uid), data)
+            hset_map(_user_key(uid), data)
             r.sadd("users", str(uid))
             return {"id": str(uid), "status": "success"}
 
@@ -1088,7 +1084,7 @@ def update_endpoint(req: UpdateRequest):
 # ----------------------------------------------------------------------
 # DELETE ALL RECORDS OF A DYNAMIC TABLE (but keep the table itself)
 # ----------------------------------------------------------------------
-@app.delete("/table/clear")
+
 def clear_dynamic_table(name: str):
     """
     Deletes ALL rows inside a dynamic table but keeps the table definition.
