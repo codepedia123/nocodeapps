@@ -123,37 +123,27 @@ def _table_row_key(name: str, rowid: str) -> str:
 # Helper: Upstash-compatible hset for mapping dicts
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
-    Writes a mapping to a Redis hash in a way compatible with Upstash
-    (which expects field, value pairs rather than mapping=).
-    Values that are dict or list are JSON-encoded. None becomes empty string.
+    Upstash-safe HSET helper.
+    Always uses mapping form.
     """
     if not mapping:
         return
+
+    safe_map = {}
+
     for fld, val in mapping.items():
         if isinstance(val, (dict, list)):
-            store_val = json.dumps(val)
+            safe_map[fld] = json.dumps(val)
         elif val is None:
-            store_val = ""
-        elif isinstance(val, (str, bytes)):
-            store_val = val
+            safe_map[fld] = ""
         elif isinstance(val, bool):
-            store_val = "1" if val else "0"
+            safe_map[fld] = "1" if val else "0"
         else:
-            # numbers and other types converted to string
-            store_val = str(val)
-        # Upstash's hset expects key, field, value
-        try:
-            r.hset(key, fld, store_val)
-        except TypeError:
-            # Fallback for redis-py if signature differs
-            try:
-                r.hset(key, mapping={fld: store_val})
-            except Exception:
-                # last resort: attempt set with HMSET style if available
-                try:
-                    r.hmset(key, {fld: store_val})
-                except Exception:
-                    raise
+            safe_map[fld] = str(val)
+
+    # THIS is the only valid Upstash call
+    r.hset(key, mapping=safe_map)
+
 
 def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
     """
@@ -805,7 +795,7 @@ def add_endpoint(req: AddRequest):
         row_key = _table_row_key(req.table, next_id)
         # Upstash-safe write
         hset_map(row_key, data)
-        r.sadd(ids_key, next_id)
+        r.sadd(ids_key, str(next_id))
         return {"id": str(next_id), "table": req.table, "status": "success"}
 
     if req.table == "users":
