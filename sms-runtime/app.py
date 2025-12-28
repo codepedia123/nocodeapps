@@ -24,19 +24,33 @@ load_dotenv()
 # ----------------------------------------------------------------------
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        redis_url = "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379"
+        # 1. Prioritize Railway's automatic environment variable
+        # 2. Fallback to hardcoded AWS URL if not in Railway
+        redis_url = os.getenv("REDIS_URL", "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379")
 
-        client = RedisCluster.from_url(
-            redis_url,
-            decode_responses=True,
-            ssl_cert_reqs=None,           # serverless does not require cert validation
-            socket_connect_timeout=3,
-            socket_timeout=3,
-            read_from_replicas=True
-        )
+        # Railway Redis is standalone (needs redis.from_url)
+        # AWS Serverless is a Cluster (needs RedisCluster.from_url)
+        if "cache.amazonaws.com" in redis_url:
+            print("🔗 Connecting to AWS Redis Cluster...")
+            client = RedisCluster.from_url(
+                redis_url,
+                decode_responses=True,
+                ssl_cert_reqs=None,
+                socket_connect_timeout=3,
+                socket_timeout=3,
+                read_from_replicas=True
+            )
+        else:
+            print("🔗 Connecting to Standalone Redis (Railway)...")
+            client = redis.from_url(
+                redis_url, 
+                decode_responses=True,
+                socket_connect_timeout=3,
+                socket_timeout=3
+            )
 
         client.ping()
-        print("✅ Connected to Valkey Serverless")
+        print("✅ Redis connection successful")
         return client
 
     except Exception as e:
