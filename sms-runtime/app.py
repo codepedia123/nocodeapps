@@ -125,7 +125,7 @@ def _table_row_key(name: str, rowid: str) -> str:
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
     Fully Upstash-compatible HSET helper.
-    Writes ONE field per call (required by Upstash SDK).
+    Uses mapping= form (required by Upstash SDK).
     """
     if not mapping:
         return
@@ -140,8 +140,9 @@ def hset_map(key: str, mapping: Dict[str, Any]):
         else:
             store_val = str(val)
 
-        # Upstash only supports (key, field, value)
-        r.hset(key, fld, store_val)
+        # IMPORTANT: mapping form only
+        r.hset(key, {fld: store_val})
+
 
 
 def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
