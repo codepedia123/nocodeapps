@@ -124,24 +124,27 @@ def _table_row_key(name: str, rowid: str) -> str:
 
 def hset_map(key: str, mapping: Dict[str, Any]):
     """
-    Fully Upstash-compatible HSET helper.
-    Uses mapping= form (required by Upstash SDK).
+    Correct, Upstash-safe HSET helper.
+    MUST use keyword argument `mapping=`.
     """
     if not mapping:
         return
 
+    clean_map = {}
+
     for fld, val in mapping.items():
         if isinstance(val, (dict, list)):
-            store_val = json.dumps(val)
+            clean_map[fld] = json.dumps(val)
         elif val is None:
-            store_val = ""
+            clean_map[fld] = ""
         elif isinstance(val, bool):
-            store_val = "1" if val else "0"
+            clean_map[fld] = "1" if val else "0"
         else:
-            store_val = str(val)
+            clean_map[fld] = str(val)
 
-        # IMPORTANT: mapping form only
-        r.hset(key, {fld: store_val})
+    # THIS IS THE CRITICAL LINE
+    r.hset(key, mapping=clean_map)
+
 
 
 
