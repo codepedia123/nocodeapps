@@ -6,7 +6,7 @@ import uuid
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List, Tuple
 
-# --- Redis Cluster Support ---
+# --- Redis Cluster Supporrt ---
 from redis.cluster import RedisCluster
 import redis
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
