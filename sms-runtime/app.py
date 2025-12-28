@@ -26,7 +26,7 @@ def _init_redis() -> Optional[redis.Redis]:
     try:
         # 1. Prioritize Railway's automatic environment variable
         # 2. Fallback to hardcoded AWS URL if not in Railway
-        redis_url = os.getenv("REDIS_URL", "rediss://smsruntime-sm3cdo.serverless.use1.cache.amazonaws.com:6379")
+        redis_url = os.getenv("REDIS_URL", "redis://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379")
 
         # Railway Redis is standalone (needs redis.from_url)
         # AWS Serverless is a Cluster (needs RedisCluster.from_url)
