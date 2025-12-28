@@ -27,23 +27,17 @@ import os
 
 def _init_redis() -> Optional[redis.Redis]:
     try:
-        # 1. Get the URL from the Railway Variables we just set
-        # 2. Fallback to the internal name if the variable is missing
+        # This will now pick up the URL with the password included
         redis_url = os.getenv("REDIS_URL", "redis://redis-ugih.railway.internal:6379")
         
-        print(f"🔗 Attempting to connect to Redis at: {redis_url}")
-        
-        # Initialize standard Redis client
         client = redis.from_url(
             redis_url, 
             decode_responses=True,
             socket_connect_timeout=5
         )
-        
         client.ping()
         print("✅ Connected to Railway Redis via Private Network")
         return client
-        
     except Exception as e:
         print(f"❌ Redis connection failed: {e}")
         return None
