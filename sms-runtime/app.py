@@ -809,12 +809,12 @@ def add_endpoint(req: AddRequest):
         return {"id": str(next_id), "table": req.table, "status": "success"}
 
     if req.table == "users":
-    nxt = _get_next_user_id() + 1
-    r.set("next_user_id", nxt)
-    uid = nxt
-    hset_dict(_user_key(uid), data)
-    r.sadd("users", str(uid))
-    return {"id": str(uid), "status": "success"}
+            nxt = _get_next_user_id() + 1
+            r.set("next_user_id", nxt)
+            uid = nxt
+            hset_dict(_user_key(uid), data)
+            r.sadd("users", str(uid))
+            return {"id": str(uid), "status": "success"}
 
 
     if req.table == "agents":
