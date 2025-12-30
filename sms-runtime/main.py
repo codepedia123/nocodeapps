@@ -207,62 +207,64 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
 # ---------------------------
 # Dynamic Tool Factory
 # ---------------------------
+from typing import Dict, Any
+
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     generated_tools = []
 
     for tool_id, cfg in config.items():
         api_url = cfg.get("api_url", "")
         instructions = cfg.get("instructions", "")
-        condition = cfg.get("when_run", cfg.get("when_to_run", ""))
+        condition = cfg.get("when_run", "")
+        # Decode the template to show the LLM the structure
         raw_payload_template = urllib.parse.unquote(cfg.get("api_payload_json", ""))
 
-        # We define the function to take ANY named arguments
-        def make_api_call(url=api_url, tid=tool_id, **kwargs) -> str:
+        # 1. FIX: We use a named argument 'tool_input'. 
+        # This tells LangChain's Pydantic layer: "Expect a dictionary here."
+        def make_api_call(tool_input: Dict[str, Any], url=api_url, tid=tool_id) -> str:
             event_id = str(uuid.uuid4())
             
-            # If the LLM sends 'prompt', it will be in kwargs.
-            # If LangChain wraps everything in 'tool_input', we grab that.
-            payload = kwargs.get("tool_input", kwargs) if kwargs else {}
-            
-            # Clean up internal keys so they don't go to ActivePieces
-            payload_to_send = {k: v for k, v in payload.items() if k not in ["url", "tid"]}
+            # 2. 'tool_input' will now contain the JSON the LLM generated
+            payload = tool_input 
 
-            logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload_to_send})
+            logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
 
             try:
-                resp = requests.post(url, json=payload_to_send, timeout=15)
+                resp = requests.post(url, json=payload, timeout=15)
                 status_code = resp.status_code
                 
-                # Logic to handle response
                 try:
-                    res_data = resp.json()
+                    response_data = resp.json()
                 except:
-                    res_data = resp.text
+                    response_data = resp.text
 
-                ok = 200 <= status_code < 300
-                
+                # Return result to agent
                 tool_result = {
-                    "ok": ok,
-                    "tool_id": str(tid),
+                    "ok": resp.ok,
                     "status_code": status_code,
-                    "response": res_data
+                    "response": response_data,
+                    "event_id": event_id
                 }
                 logger.log("tool.response", f"api_tool_{tid} success", tool_result)
                 return json.dumps(tool_result)
 
             except Exception as e:
-                return json.dumps({"ok": False, "error": str(e)})
+                error_data = {"ok": False, "error": str(e)}
+                logger.log("tool.error", f"api_tool_{tid} failed", error_data)
+                return json.dumps(error_data)
 
-        # IMPORTANT: We tell the tool explicitly what the input schema looks like
-        # This forces LangChain to map 'prompt' into the kwargs
+        # 3. FIX: We must tell the LLM that 'tool_input' is the key for its JSON
+        tool_desc = (
+            f"WHEN_TO_RUN: {condition}. "
+            f"REQUIRED_JSON_STRUCTURE: {raw_payload_template}. "
+            f"INSTRUCTIONS: {instructions}. "
+            f"IMPORTANT: You must pass your JSON as a dictionary into the 'tool_input' argument."
+        )
+
         new_tool = StructuredTool.from_function(
             func=make_api_call,
             name=f"sync_data_tool_{tool_id}",
-            description=(
-                f"USE CASE: {condition}. "
-                f"REQUIRED JSON FIELDS: {raw_payload_template}. "
-                f"INSTRUCTIONS: {instructions}"
-            )
+            description=tool_desc
         )
         generated_tools.append(new_tool)
 
