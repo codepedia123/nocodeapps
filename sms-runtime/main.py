@@ -207,8 +207,6 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
 # ---------------------------
 # Dynamic Tool Factory
 # ---------------------------
-from typing import Dict, Any
-
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     generated_tools = []
 
@@ -216,49 +214,62 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         api_url = cfg.get("api_url", "")
         instructions = cfg.get("instructions", "")
         condition = cfg.get("when_run", "")
-        # Decode the template to show the LLM the structure
         raw_payload_template = urllib.parse.unquote(cfg.get("api_payload_json", ""))
 
-        # 1. FIX: We use a named argument 'tool_input'. 
-        # This tells LangChain's Pydantic layer: "Expect a dictionary here."
-        def make_api_call(tool_input: Dict[str, Any], url=api_url, tid=tool_id) -> str:
+        # Improved tool function: accept both 'tool_input' and alternate top-level keys like 'prompt'
+        def make_api_call(tool_input: Optional[Dict[str, Any]] = None,
+                          prompt: Optional[Any] = None,
+                          **kwargs) -> str:
+            """
+            Accepts multiple forms of input to avoid pydantic validation errors when the LLM
+            returns top-level keys such as {'prompt': "..."} instead of {'tool_input': {...}}.
+            Precedence for payload construction:
+              1) tool_input if provided
+              2) kwargs if any (maps top-level JSON produced by the LLM)
+              3) {'prompt': prompt} if prompt provided
+              4) empty dict otherwise
+            """
             event_id = str(uuid.uuid4())
-            
-            # 2. 'tool_input' will now contain the JSON the LLM generated
-            payload = tool_input 
 
-            logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
+            # Resolve payload using the precedence rules above
+            if tool_input is not None:
+                payload = tool_input
+            elif kwargs:
+                payload = kwargs
+            elif prompt is not None:
+                payload = {"prompt": prompt}
+            else:
+                payload = {}
+
+            logger.log("tool.call", f"api_tool_{tool_id} triggered", {"event_id": event_id, "payload": payload})
 
             try:
-                resp = requests.post(url, json=payload, timeout=15)
+                resp = requests.post(api_url, json=payload, timeout=15)
                 status_code = resp.status_code
-                
                 try:
                     response_data = resp.json()
-                except:
+                except Exception:
                     response_data = resp.text
 
-                # Return result to agent
                 tool_result = {
                     "ok": resp.ok,
                     "status_code": status_code,
                     "response": response_data,
                     "event_id": event_id
                 }
-                logger.log("tool.response", f"api_tool_{tid} success", tool_result)
+                logger.log("tool.response", f"api_tool_{tool_id} success", tool_result)
                 return json.dumps(tool_result)
 
             except Exception as e:
-                error_data = {"ok": False, "error": str(e)}
-                logger.log("tool.error", f"api_tool_{tid} failed", error_data)
+                error_data = {"ok": False, "error": str(e), "event_id": event_id}
+                logger.log("tool.error", f"api_tool_{tool_id} failed", error_data)
                 return json.dumps(error_data)
 
-        # 3. FIX: We must tell the LLM that 'tool_input' is the key for its JSON
         tool_desc = (
             f"WHEN_TO_RUN: {condition}. "
             f"REQUIRED_JSON_STRUCTURE: {raw_payload_template}. "
             f"INSTRUCTIONS: {instructions}. "
-            f"IMPORTANT: You must pass your JSON as a dictionary into the 'tool_input' argument."
+            f"IMPORTANT: You may pass your JSON either as 'tool_input' or as top-level keys such as 'prompt'."
         )
 
         new_tool = StructuredTool.from_function(
@@ -269,6 +280,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         generated_tools.append(new_tool)
 
     return generated_tools
+
 
 # ---------------------------
 # Core Execution logic
