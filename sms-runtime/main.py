@@ -216,44 +216,25 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         condition = cfg.get("when_run", cfg.get("when_to_run", ""))
         raw_payload_template = urllib.parse.unquote(cfg.get("api_payload_json", ""))
 
-        # Use defaults in closure to avoid late-binding issues
-        def make_api_call(tool_input: Any, url=api_url, tid=tool_id) -> str:
-            """
-            This tool call is synchronous (blocking). The agent will not continue until this returns.
-            We also return the real API response content back to the agent (as a JSON string),
-            so the LLM can ground its final answer on actual tool results.
-            """
+        # 1. Use **kwargs to capture whatever the LLM sends
+        def make_api_call(url=api_url, tid=tool_id, **kwargs) -> str:
             event_id = str(uuid.uuid4())
-            payload: Any = {}
-
-            # Robust parsing (handles strings or dicts)
-            if isinstance(tool_input, str):
-                try:
-                    cleaned = tool_input.strip().strip("`").replace("json\n", "", 1)
-                    payload = json.loads(cleaned)
-                except Exception:
-                    # Log tool error and return structured error to the agent
-                    err_obj = {
-                        "ok": False,
-                        "tool_id": str(tid),
-                        "event_id": event_id,
-                        "error": "Invalid JSON format",
-                        "input_type": "string"
-                    }
-                    logger.log("tool.error", f"api_tool_{tid} invalid_json", {"event_id": event_id})
-                    return json.dumps(err_obj, ensure_ascii=False)
-
-            else:
-                payload = tool_input
+            
+            # 2. The payload is now simply the kwargs provided by the LLM
+            payload = kwargs 
+            
+            # If the LLM still wraps it in tool_input for some reason, handle it:
+            if "tool_input" in kwargs and len(kwargs) == 1:
+                payload = kwargs["tool_input"]
 
             logger.log("tool.call", f"api_tool_{tid} triggered", {"event_id": event_id, "payload": payload})
 
             try:
                 resp = requests.post(url, json=payload, timeout=15)
+                # ... (rest of your existing logic)
                 status_code = resp.status_code
                 content_type = (resp.headers.get("content-type") or "").lower()
-
-                # Try to parse JSON safely, else keep text
+                
                 parsed_json = None
                 raw_text = ""
                 try:
@@ -264,7 +245,6 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 except Exception:
                     raw_text = resp.text or ""
 
-                # Raise only after capture so we can report body on errors too
                 try:
                     resp.raise_for_status()
                     ok = True
@@ -273,51 +253,29 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     ok = False
                     error_str = str(e)
 
-                # Keep responses reasonably sized for LLM context and logs
-                MAX_TEXT = 8000
-                if raw_text and len(raw_text) > MAX_TEXT:
-                    raw_text = raw_text[:MAX_TEXT] + "...(truncated)"
-
                 tool_result = {
                     "ok": ok,
                     "tool_id": str(tid),
                     "event_id": event_id,
                     "status_code": status_code,
-                    "content_type": content_type,
                     "response_json": parsed_json,
                     "response_text": raw_text,
                     "error": error_str
                 }
-
-                # Log the tool response, so your API response includes it in logs
                 logger.log("tool.response", f"api_tool_{tid} response received", tool_result)
-
-                # Return the tool result to the agent as a JSON string so the final LLM reply can use it
                 return json.dumps(tool_result, ensure_ascii=False)
 
             except Exception as e:
-                # Network errors, timeouts, DNS, etc.
-                tool_result = {
-                    "ok": False,
-                    "tool_id": str(tid),
-                    "event_id": event_id,
-                    "status_code": None,
-                    "content_type": "",
-                    "response_json": None,
-                    "response_text": "",
-                    "error": str(e)
-                }
-                logger.log("tool.response", f"api_tool_{tid} response received", tool_result)
-                return json.dumps(tool_result, ensure_ascii=False)
+                return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
         tool_desc = (
             f"CRITICAL CONDITION: {condition}. "
             f"INSTRUCTIONS: {instructions}. "
-            f"REQUIRED JSON STRUCTURE: {raw_payload_template}. "
-            "IMPORTANT: After calling this tool, you MUST read its returned JSON result and base your final answer on it. "
-            "If ok=false, you must report the failure clearly and include the error."
+            f"REQUIRED JSON FIELDS: {raw_payload_template}. "
+            "IMPORTANT: Base your final answer on the JSON result returned by this tool."
         )
 
+        # 3. Create the tool
         new_tool = StructuredTool.from_function(
             func=make_api_call,
             name=f"sync_data_tool_{tool_id}",
