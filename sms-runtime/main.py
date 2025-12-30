@@ -24,12 +24,7 @@ from langchain_groq import ChatGroq
 # ---------------------------
 # Keep a minimal default fallback config. This will be merged with fetched tools at runtime.
 DYNAMIC_CONFIG = {
-    "5": {
-        "api_url": "https://ap.rhythmflow.ai/api/v1/webhooks/UZ6KJw8w1EInlLqhP1gWZ/sync",
-        "api_payload_json": "%7B%22values%22%3A%7B%22A%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22B%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%2C%22C%22%3A%22%7B%7BREPLACE_WITH_ACTUAL_VALUE%7D%7D%22%7D%7D",
-        "instructions": "'values.A' is Name; 'values.B' is Email; 'values.C' is Phone.",
-        "when_run": "ONLY run this when the user specifically provides an email or contact info to be saved/synced."
-    }
+
 }
 
 # ---------------------------
