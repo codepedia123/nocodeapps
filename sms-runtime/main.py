@@ -366,6 +366,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             "If any tool returns ok=false, you must report the failure and the error. "
             "If tools return ok=true, you may confirm success using details from response_json or response_text. "
             "If the user is asking general questions, do NOT use any tools. Just answer naturally."
+            "For the values of the paylaod objects, fill it with the info you have, and only ask for what you don't have ( eg: case specific info, contact info, etc. which you don't know )"
         )
 
         prompt = ChatPromptTemplate.from_messages([
