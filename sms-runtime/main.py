@@ -202,6 +202,8 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
 # ---------------------------
 # Dynamic Tool Factory
 # ---------------------------
+from pydantic import create_model, Field
+
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
     generated_tools = []
 
@@ -210,25 +212,32 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         instructions = cfg.get("instructions", "")
         condition = cfg.get("when_run", "")
         raw_payload_template = urllib.parse.unquote(cfg.get("api_payload_json", ""))
+        
+        # 1. Try to parse the keys from your template to create a schema
+        try:
+            example_json = json.loads(raw_payload_template)
+            # Create a dynamic Pydantic model so the LLM "sees" the fields
+            # We treat all keys in your template as required fields for the LLM
+            fields = {
+                key: (Any, Field(description=f"Value for {key}")) 
+                for key in example_json.keys()
+            }
+            DynamicArgsModel = create_model(f"Args_{tool_id}", **fields)
+        except Exception:
+            DynamicArgsModel = None
 
-        # We remove 'prompt' from the arguments to force the LLM 
-        # to look at the required structure instead.
-        def make_api_call(tool_input: Optional[Dict[str, Any]] = None, **kwargs) -> str:
+        # 2. The function now only takes kwargs (which the LLM will fill based on the schema)
+        def make_api_call(**kwargs) -> str:
             event_id = str(uuid.uuid4())
-
-            # If the LLM passes fields as kwargs (top-level), use those.
-            # If it uses tool_input, use that.
-            payload = tool_input if tool_input is not None else kwargs
+            payload = kwargs # The LLM will now fill this with 'title', 'start_date_time', etc.
 
             logger.log("tool.call", f"api_tool_{tool_id} triggered", {"event_id": event_id, "payload": payload})
 
             try:
-                # ActivePieces expects the structured JSON, not a raw string
                 resp = requests.post(api_url, json=payload, timeout=15)
-                
                 try:
                     response_data = resp.json()
-                except Exception:
+                except:
                     response_data = resp.text
 
                 tool_result = {
@@ -237,7 +246,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     "response": response_data,
                     "event_id": event_id
                 }
-                logger.log("tool.response", f"api_tool_{tool_id} status: {resp.status_code}", tool_result)
+                logger.log("tool.response", f"api_tool_{tool_id} result", tool_result)
                 return json.dumps(tool_result)
 
             except Exception as e:
@@ -245,19 +254,12 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 logger.log("tool.error", f"api_tool_{tool_id} failed", error_data)
                 return json.dumps(error_data)
 
-        # Updated Description: Removed the "prompt" fallback instructions
-        tool_desc = (
-            f"WHEN_TO_RUN: {condition}. "
-            f"STRICT_REQUIRED_SCHEMA: {raw_payload_template}. "
-            f"INSTRUCTIONS: {instructions}. "
-            f"IMPORTANT: You MUST extract the data from the conversation and format it EXACTLY according to the STRICT_REQUIRED_SCHEMA. "
-            f"Do not send raw text; send a structured JSON object."
-        )
-
+        # 3. Create the tool with the args_schema
         new_tool = StructuredTool.from_function(
             func=make_api_call,
             name=f"sync_data_tool_{tool_id}",
-            description=tool_desc
+            description=f"Condition: {condition}. Instructions: {instructions}",
+            args_schema=DynamicArgsModel # <--- THIS IS THE MAGIC KEY
         )
         generated_tools.append(new_tool)
 
