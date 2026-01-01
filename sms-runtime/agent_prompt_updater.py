@@ -53,7 +53,7 @@ class AgentState(TypedDict):
     """The official way to track state across the agent's 'thought' process."""
     messages: Annotated[List[BaseMessage], "The conversation messages"]
     document: str
-    change_summary: Optional[str]
+    change_summary: Optional[List[str]]
     is_updated: bool
     error_log: Optional[str]  # Added to track why an update might fail
 
@@ -106,18 +106,19 @@ def run_updater_agent():
 
         # 1. THE AGENT NODE
         def call_model(state: AgentState):
-            # Add explicit guidance to prefer anchor-based edits and the new insert tool
+            # Add explicit guidance to be conservative and prefer precise updates
             sys_msg = SystemMessage(content=(
                 "You are a professional Editor.\n"
                 "IMPORTANT EDITING RULES (READ CAREFULLY):\n"
-                "1. To edit, prefer using 'patch_document_tool' when the exact original snippet is present.\n"
-                "2. If the exact snippet is not present, do NOT attempt to patch a demo chat transcript directly.\n"
-                "   Instead, use 'insert_after_anchor_tool' or provide an 'anchor_for_insertion' with 'patch_document_tool'.\n"
-                "3. Provide the EXACT original snippet when using 'patch_document_tool' whenever possible.\n"
-                "4. The 'anchor_for_insertion' can be a short, guaranteed-to-exist heading or line such as '# Notes:' or '# Task:' etc.\n"
-                "5. Your 'explanation' must be a clear, descriptive summary of the change.\n"
-                "6. If the user quotes a demo conversation line that is not present in the document, DO NOT try to patch that quoted line. Instead, add or modify a relevant section (Role, Notes, Conversational Style) using an insertion or anchor-based replacement.\n"
-                "7. When you intend to insert new instructions, prefer 'insert_after_anchor_tool' with an insertion anchor that exists in the document.\n\n"
+                "1. Default to 'patch_document_tool' to update existing text precisely and keep overall length conservative.\n"
+                "2. Use 'insert_after_anchor_tool' ONLY for entirely new insertions that are not already present in the document.\n"
+                "3. If the exact snippet is not present, do NOT attempt to patch a demo chat transcript directly.\n"
+                "   Instead, use 'patch_document_tool' with 'anchor_for_insertion' to place the new text after a stable anchor.\n"
+                "4. Provide the EXACT original snippet when using 'patch_document_tool' whenever possible.\n"
+                "5. The 'anchor_for_insertion' must be a short, guaranteed-to-exist heading or line such as '# Notes:' or '# Task:'.\n"
+                "6. Your 'explanation' must be a clear, descriptive summary of the change.\n"
+                "7. Keep changes minimal: avoid expanding the prompt unless the user explicitly asks for more detail.\n"
+                "8. If content already exists in the document, update it instead of inserting a duplicate.\n\n"
                 f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
             ))
@@ -166,7 +167,7 @@ def run_updater_agent():
 
             last_msg = state["messages"][-1]
             new_doc = state["document"]
-            summary = state.get("change_summary")
+            summary = state.get("change_summary") or []
             updated = state.get("is_updated", False)
             err = state.get("error_log")
 
@@ -186,6 +187,10 @@ def run_updater_agent():
                 if not isinstance(args, dict) and hasattr(args, "__dict__"):
                     args = vars(args)
 
+                def _append_summary(text: str):
+                    if text:
+                        summary.append(text)
+
                 # Patch action
                 if name == "patch_document_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "patch_document_tool"):
                     old = args.get("original_snippet", "") or ""
@@ -195,7 +200,7 @@ def run_updater_agent():
 
                     if old and old in new_doc:
                         new_doc = new_doc.replace(old, new, 1)
-                        summary = expl or f"Replaced an exact matching snippet."
+                        _append_summary(expl or "Replaced an exact matching snippet.")
                         updated = True
                         err = None
                     else:
@@ -205,19 +210,19 @@ def run_updater_agent():
                             if end_idx is not None:
                                 insertion = f"\n{new}\n"
                                 new_doc = new_doc[:end_idx] + insertion + new_doc[end_idx:]
-                                summary = expl or f"Inserted new text after provided anchor."
+                                _append_summary(expl or "Inserted new text after provided anchor.")
                                 updated = True
                                 err = None
                             else:
                                 # fallback 2: true secondary fallback, append at end
                                 new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
-                                summary = expl or f"Anchor not found, appended new section at end."
+                                _append_summary(expl or "Anchor not found, appended new section at end.")
                                 updated = True
                                 err = None
                         else:
                             # fallback 2: true secondary fallback, append at end
                             new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
-                            summary = expl or summary or f"No snippet match and no anchor provided, appended new section at end."
+                            _append_summary(expl or "No snippet match and no anchor provided, appended new section at end.")
                             updated = True
                             err = None
 
@@ -227,18 +232,24 @@ def run_updater_agent():
                     insertion_text = args.get("insertion_text", "") or ""
                     expl = args.get("explanation", "") or ""
 
+                    if insertion_text and insertion_text in new_doc:
+                        _append_summary(expl or "Insertion skipped because the text already exists.")
+                        updated = True
+                        err = None
+                        continue
+
                     end_idx = _find_anchor_end(new_doc, anchor)
                     insertion = f"\n{insertion_text}\n"
 
                     if end_idx is not None:
                         new_doc = new_doc[:end_idx] + insertion + new_doc[end_idx:]
-                        summary = expl or f"Inserted text after anchor."
+                        _append_summary(expl or "Inserted text after anchor.")
                         updated = True
                         err = None
                     else:
                         # true secondary fallback: append at end
                         new_doc = (new_doc.rstrip() + "\n\n" + insertion_text.strip() + "\n")
-                        summary = expl or f"Anchor not found, appended new section at end."
+                        _append_summary(expl or "Anchor not found, appended new section at end.")
                         updated = True
                         err = None
 
@@ -286,7 +297,7 @@ def run_updater_agent():
         inputs = {
             "messages": history + [HumanMessage(content=user_message)],
             "document": long_text,
-            "change_summary": None,
+            "change_summary": [],
             "is_updated": False,
             "error_log": None
         }
@@ -300,11 +311,13 @@ def run_updater_agent():
 
         if final_state.get("is_updated"):
             # Scenario A: Tool worked perfectly
-            final_reply = f"I have updated the text as requested. {final_state.get('change_summary')}"
+            summary = "; ".join(final_state.get("change_summary") or [])
+            final_reply = f"I have updated the text as requested. {summary}".strip()
         elif final_state.get("error_log"):
             # Scenario B: Tool was called but the snippet didn't match
+            summary = "; ".join(final_state.get("change_summary") or [])
             final_reply = (
-                f"I tried to make the following change: '{final_state.get('change_summary')}', "
+                f"I tried to make the following change: '{summary}', "
                 f"but I couldn't find the exact matching text in the document to replace or the anchor was missing. "
                 "Please ensure the text or an anchor (for example '# Notes:' or '# Task:') is present exactly as you'd like it changed."
             )
