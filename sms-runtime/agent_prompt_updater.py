@@ -1,6 +1,7 @@
 import os
 import json
 import traceback
+import re
 from typing import List, Dict, Any, Optional, Annotated, TypedDict
 from pydantic import BaseModel, Field
 
@@ -113,7 +114,7 @@ def run_updater_agent():
                 "2. If the exact snippet is not present, do NOT attempt to patch a demo chat transcript directly.\n"
                 "   Instead, use 'insert_after_anchor_tool' or provide an 'anchor_for_insertion' with 'patch_document_tool'.\n"
                 "3. Provide the EXACT original snippet when using 'patch_document_tool' whenever possible.\n"
-                "4. The 'anchor_for_insertion' can be a short, guaranteed-to-exist heading or line such as '#Notes:' or '#Task:' etc.\n"
+                "4. The 'anchor_for_insertion' can be a short, guaranteed-to-exist heading or line such as '# Notes:' or '# Task:' etc.\n"
                 "5. Your 'explanation' must be a clear, descriptive summary of the change.\n"
                 "6. If the user quotes a demo conversation line that is not present in the document, DO NOT try to patch that quoted line. Instead, add or modify a relevant section (Role, Notes, Conversational Style) using an insertion or anchor-based replacement.\n"
                 "7. When you intend to insert new instructions, prefer 'insert_after_anchor_tool' with an insertion anchor that exists in the document.\n\n"
@@ -125,6 +126,44 @@ def run_updater_agent():
 
         # 2. THE TOOL EXECUTION NODE (The Surgical Update)
         def tool_executor(state: AgentState):
+            def _find_anchor_end(doc: str, anchor: str) -> Optional[int]:
+                """
+                Returns the insertion index right after the first matched anchor.
+                Tries exact match first, then a relaxed match that tolerates whitespace differences,
+                common markdown heading formatting differences, and case differences.
+                """
+                if not anchor:
+                    return None
+
+                # 1) Exact match
+                idx = doc.find(anchor)
+                if idx != -1:
+                    return idx + len(anchor)
+
+                a = anchor.strip()
+                if not a:
+                    return None
+
+                # 2) Relaxed match
+                # Special handling for markdown heading-like anchors, eg "#Notes:" vs "# Notes:"
+                if a.startswith("#"):
+                    core = a.lstrip("#").strip()
+                    if not core:
+                        return None
+                    core_escaped = re.escape(core).replace(r"\ ", r"\s+")
+                    pattern = rf"#+\s*{core_escaped}"
+                else:
+                    pattern = re.escape(a).replace(r"\ ", r"\s+")
+
+                # If anchor included a colon, allow optional whitespace before it
+                pattern = pattern.replace(r"\:", r"\s*:")
+
+                m = re.search(pattern, doc, flags=re.IGNORECASE)
+                if m:
+                    return m.end()
+
+                return None
+
             last_msg = state["messages"][-1]
             new_doc = state["document"]
             summary = state.get("change_summary")
@@ -158,19 +197,29 @@ def run_updater_agent():
                         new_doc = new_doc.replace(old, new, 1)
                         summary = expl or f"Replaced an exact matching snippet."
                         updated = True
+                        err = None
                     else:
-                        # fallback: if anchor provided and anchor exists, insert after anchor
-                        if anchor and anchor in new_doc:
-                            insertion = f"\n{new}\n"
-                            # insert after first occurrence of anchor
-                            idx = new_doc.find(anchor) + len(anchor)
-                            new_doc = new_doc[:idx] + insertion + new_doc[idx:]
-                            summary = expl or f"Inserted new text after provided anchor."
-                            updated = True
+                        # fallback 1: if anchor provided, try relaxed anchor match and insert after anchor
+                        if anchor:
+                            end_idx = _find_anchor_end(new_doc, anchor)
+                            if end_idx is not None:
+                                insertion = f"\n{new}\n"
+                                new_doc = new_doc[:end_idx] + insertion + new_doc[end_idx:]
+                                summary = expl or f"Inserted new text after provided anchor."
+                                updated = True
+                                err = None
+                            else:
+                                # fallback 2: true secondary fallback, append at end
+                                new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
+                                summary = expl or f"Anchor not found, appended new section at end."
+                                updated = True
+                                err = None
                         else:
-                            # not found; keep the intent for reporting
-                            err = f"Failed to update: original snippet not found and no usable anchor provided."
-                            summary = expl or summary
+                            # fallback 2: true secondary fallback, append at end
+                            new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
+                            summary = expl or summary or f"No snippet match and no anchor provided, appended new section at end."
+                            updated = True
+                            err = None
 
                 # Insert-after-anchor action
                 elif name == "insert_after_anchor_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "insert_after_anchor_tool"):
@@ -178,16 +227,20 @@ def run_updater_agent():
                     insertion_text = args.get("insertion_text", "") or ""
                     expl = args.get("explanation", "") or ""
 
-                    if anchor and anchor in new_doc:
-                        idx = new_doc.find(anchor) + len(anchor)
-                        # ensure insertion has newlines for separation
-                        insertion = f"\n{insertion_text}\n"
-                        new_doc = new_doc[:idx] + insertion + new_doc[idx:]
+                    end_idx = _find_anchor_end(new_doc, anchor)
+                    insertion = f"\n{insertion_text}\n"
+
+                    if end_idx is not None:
+                        new_doc = new_doc[:end_idx] + insertion + new_doc[end_idx:]
                         summary = expl or f"Inserted text after anchor."
                         updated = True
+                        err = None
                     else:
-                        err = f"Failed to insert: anchor snippet not found."
-                        summary = expl or summary
+                        # true secondary fallback: append at end
+                        new_doc = (new_doc.rstrip() + "\n\n" + insertion_text.strip() + "\n")
+                        summary = expl or f"Anchor not found, appended new section at end."
+                        updated = True
+                        err = None
 
                 else:
                     # Unknown tool name: capture for diagnostics
@@ -253,7 +306,7 @@ def run_updater_agent():
             final_reply = (
                 f"I tried to make the following change: '{final_state.get('change_summary')}', "
                 f"but I couldn't find the exact matching text in the document to replace or the anchor was missing. "
-                "Please ensure the text or an anchor (for example '#Notes:' or '#Task:') is present exactly as you'd like it changed."
+                "Please ensure the text or an anchor (for example '# Notes:' or '# Task:') is present exactly as you'd like it changed."
             )
         else:
             # Scenario C: Chatting or no tool was used
