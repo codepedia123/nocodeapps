@@ -469,10 +469,12 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             payload_builder_system = (
                 f"{agent_prompt}\n\n"
                 "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
-                "You MUST follow the chosen tool's instructions including AskGuidance and AskNote.\n"
-                "SHOULD_BE_ASKED means: if missing or uncertain, ask the user ONE precise question and do NOT call the tool.\n"
-                "NOT_TO_BE_ASKED means: never ask, derive or set safe defaults if possible.\n"
-                "CAN_BE_ASKED means: derive first, ask only if needed for correctness.\n\n"
+                "Reason from: the agent's global purpose, the tool's when_run, instructions, payload_template, and the conversation to decide which details truly matter.\n"
+                "AskGuidance/AskNote tags are secondary hints only; prioritize common sense about what the tool needs.\n"
+                "SHOULD_BE_ASKED: if critical info is missing or uncertain, ask ONE clear question and do NOT call the tool.\n"
+                "NOT_TO_BE_ASKED: never ask, derive or set safe defaults if possible.\n"
+                "CAN_BE_ASKED: derive first; ask only if correctness would suffer.\n\n"
+                "Be explicit about exactly what you need; avoid generic questions.\n"
                 "You may NOT switch tools. Only prepare for the chosen tool below.\n"
                 "Do NOT plan or mention retries.\n\n"
                 f"Chosen tool: {chosen_tool_name}\n"
@@ -482,7 +484,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 "Output MUST be strict JSON with keys:\n"
                 '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
                 "Rules:\n"
-                "- If should_call=false, question MUST be a single question to the user.\n"
+                "- If should_call=false, question MUST be a single, specific question to the user.\n"
                 "- If should_call=true, payload MUST match the template structure.\n"
                 "No extra text."
             )
