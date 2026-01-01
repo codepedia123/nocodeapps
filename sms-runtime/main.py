@@ -366,6 +366,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             "If any tool returns ok=false, you must report the failure and the error. "
             "If tools return ok=true, you may confirm success using details from response_json or response_text. "
             "If the user is asking general questions, do NOT use any tools. Just answer naturally."
+            "When a value guide includes AskGuidance and AskNote, treat AskGuidance as the decision authority. SHOULD_BE_ASKED means you must ask the user if the value is missing or uncertain, using AskNote to frame a precise question; NOT_TO_BE_ASKED means never ask and instead derive or safely generate the value from payload, context, or defaults, and if impossible, report it as unavailable; CAN_BE_ASKED means try to derive first and ask only if it materially affects correctness, compliance, or intent. Always ask the minimum necessary, prefer SHOULD_BE_ASKED items, and never request sensitive data unless the guide explicitly tags it SHOULD_BE_ASKED and it matches user intent."
             "For the values of the paylaod objects, fill it with the info you have, and only ask for what you don't have ( eg: case specific info, contact info, etc. which you don't know )"
         )
 
