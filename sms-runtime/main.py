@@ -387,17 +387,17 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         tool_registry_text = "\n".join(tool_registry_lines) if tool_registry_lines else "(no tools)"
 
         # ---------------------------
-        # STEP A: Decide the single best tool (or no tool)
+        # STEP A: Decide which tools to run (zero or many, ordered)
         # ---------------------------
         decision_system = (
             f"{agent_prompt}\n\n"
-            "You must choose AT MOST ONE tool for this request.\n"
-            "If a tool is chosen and it fails, you MUST NOT try any other tools in this same run.\n"
-            "If no tool matches, choose no_tool.\n\n"
+            "You may choose ZERO or MORE tools (ordered list) for this request.\n"
+            "Choose every tool whose when_run conditions match; order them sensibly. If none match, select no_tool.\n"
+            "Do NOT plan retries. A failed tool must NOT be retried and does NOT unblock choosing others.\n\n"
             "Available tools:\n"
             f"{tool_registry_text}\n\n"
             "Output MUST be strict JSON with keys:\n"
-            '{"action":"use_tool"|"no_tool","tool_name":string|null,"reason":string}\n'
+            '{"action":"use_tools"|"no_tool","tool_names":array|null,"reason":string}\n'
             "No extra text."
         )
 
@@ -416,17 +416,31 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         decision_clean = _strip_code_fences(decision_raw or "")
         decision_obj = _safe_json_loads(decision_clean) if decision_clean else None
         if not isinstance(decision_obj, dict):
-            decision_obj = {"action": "no_tool", "tool_name": None, "reason": "Decision parsing failed; defaulting to no_tool."}
+            decision_obj = {"action": "no_tool", "tool_names": None, "reason": "Decision parsing failed; defaulting to no_tool."}
 
         action = str(decision_obj.get("action") or "no_tool").strip()
-        chosen_tool_name = decision_obj.get("tool_name")
-        if chosen_tool_name is not None:
-            chosen_tool_name = str(chosen_tool_name).strip()
+        chosen_tool_names_raw = decision_obj.get("tool_names")
+        chosen_tool_names: List[str] = []
+        if isinstance(chosen_tool_names_raw, list):
+            for nm in chosen_tool_names_raw:
+                try:
+                    nm_str = str(nm).strip()
+                    if nm_str:
+                        chosen_tool_names.append(nm_str)
+                except Exception:
+                    continue
 
-        logger.log("tool.decide", "Tool decision made", {"action": action, "tool_name": chosen_tool_name, "reason": decision_obj.get("reason", "")})
+        # Keep only tools that exist, preserve order, dedupe
+        seen_tools = set()
+        chosen_tool_names = [
+            t for t in chosen_tool_names
+            if t in tools_by_name and not (t in seen_tools or seen_tools.add(t))
+        ]
+
+        logger.log("tool.decide", "Tool decision made", {"action": action, "tool_names": chosen_tool_names, "reason": decision_obj.get("reason", "")})
 
         # If no tool, answer normally (no tools)
-        if action != "use_tool" or not chosen_tool_name or chosen_tool_name not in tools_by_name:
+        if action != "use_tools" or not chosen_tool_names:
             answer_system = agent_prompt
             answer_user = (
                 "Conversation history:\n"
@@ -441,112 +455,128 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             return {"reply": answer or "", "logs": logger.to_list()}
 
         # ---------------------------
-        # STEP B: For the chosen tool only, construct payload OR ask a single question
+        # STEP B: For each chosen tool, construct payload OR ask a single question
         # ---------------------------
-        # Extract tool_id from "sync_data_tool_<id>"
-        tool_id_part = chosen_tool_name.replace("sync_data_tool_", "", 1).strip()
-        chosen_cfg = merged_config.get(tool_id_part, {}) if isinstance(merged_config, dict) else {}
-        chosen_instructions = str(chosen_cfg.get("instructions", "") or "")
-        chosen_when_run = str(chosen_cfg.get("when_run", "") or "")
-        chosen_payload_template_raw = urllib.parse.unquote(str(chosen_cfg.get("api_payload_json", "") or ""))
-        chosen_payload_template_obj = _safe_json_loads(chosen_payload_template_raw)
+        payload_plans: List[Tuple[str, Dict[str, Any]]] = []
+        for chosen_tool_name in chosen_tool_names:
+            tool_id_part = chosen_tool_name.replace("sync_data_tool_", "", 1).strip()
+            chosen_cfg = merged_config.get(tool_id_part, {}) if isinstance(merged_config, dict) else {}
+            chosen_instructions = str(chosen_cfg.get("instructions", "") or "")
+            chosen_when_run = str(chosen_cfg.get("when_run", "") or "")
+            chosen_payload_template_raw = urllib.parse.unquote(str(chosen_cfg.get("api_payload_json", "") or ""))
+            chosen_payload_template_obj = _safe_json_loads(chosen_payload_template_raw)
 
-        payload_builder_system = (
-            f"{agent_prompt}\n\n"
-            "You are preparing inputs for exactly ONE tool call.\n"
-            "You MUST follow the chosen tool's instructions including AskGuidance and AskNote.\n"
-            "SHOULD_BE_ASKED means: if missing or uncertain, ask the user ONE precise question and do NOT call the tool.\n"
-            "NOT_TO_BE_ASKED means: never ask, derive or set safe defaults if possible.\n"
-            "CAN_BE_ASKED means: derive first, ask only if needed for correctness.\n\n"
-            "You may NOT switch tools. Only prepare for the chosen tool below.\n\n"
-            f"Chosen tool: {chosen_tool_name}\n"
-            f"when_run: {chosen_when_run}\n"
-            f"instructions: {chosen_instructions}\n"
-            f"payload_template: {chosen_payload_template_raw}\n\n"
-            "Output MUST be strict JSON with keys:\n"
-            '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
-            "Rules:\n"
-            "- If should_call=false, question MUST be a single question to the user.\n"
-            "- If should_call=true, payload MUST match the template structure.\n"
-            "No extra text."
-        )
+            payload_builder_system = (
+                f"{agent_prompt}\n\n"
+                "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
+                "You MUST follow the chosen tool's instructions including AskGuidance and AskNote.\n"
+                "SHOULD_BE_ASKED means: if missing or uncertain, ask the user ONE precise question and do NOT call the tool.\n"
+                "NOT_TO_BE_ASKED means: never ask, derive or set safe defaults if possible.\n"
+                "CAN_BE_ASKED means: derive first, ask only if needed for correctness.\n\n"
+                "You may NOT switch tools. Only prepare for the chosen tool below.\n"
+                "Do NOT plan or mention retries.\n\n"
+                f"Chosen tool: {chosen_tool_name}\n"
+                f"when_run: {chosen_when_run}\n"
+                f"instructions: {chosen_instructions}\n"
+                f"payload_template: {chosen_payload_template_raw}\n\n"
+                "Output MUST be strict JSON with keys:\n"
+                '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
+                "Rules:\n"
+                "- If should_call=false, question MUST be a single question to the user.\n"
+                "- If should_call=true, payload MUST match the template structure.\n"
+                "No extra text."
+            )
 
-        payload_builder_user = (
-            "Conversation history:\n"
-            + json.dumps(history_msgs, ensure_ascii=False)
-            + "\n\nUser message:\n"
-            + (message or "")
-        )
+            payload_builder_user = (
+                "Conversation history:\n"
+                + json.dumps(history_msgs, ensure_ascii=False)
+                + "\n\nUser message:\n"
+                + (message or "")
+            )
 
-        pb_raw = llm.invoke([
-            {"role": "system", "content": payload_builder_system},
-            {"role": "user", "content": payload_builder_user},
-        ]).content
+            pb_raw = llm.invoke([
+                {"role": "system", "content": payload_builder_system},
+                {"role": "user", "content": payload_builder_user},
+            ]).content
 
-        pb_clean = _strip_code_fences(pb_raw or "")
-        pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
-        if not isinstance(pb_obj, dict):
-            pb_obj = {"should_call": False, "payload": None, "question": "Could you share the missing details needed to proceed?", "reason": "Payload parsing failed."}
+            pb_clean = _strip_code_fences(pb_raw or "")
+            pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
+            if not isinstance(pb_obj, dict):
+                pb_obj = {"should_call": False, "payload": None, "question": "Could you share the missing details needed to proceed?", "reason": "Payload parsing failed."}
 
-        should_call = bool(pb_obj.get("should_call"))
-        question = pb_obj.get("question")
-        if question is not None:
-            question = str(question).strip()
+            should_call = bool(pb_obj.get("should_call"))
+            question = pb_obj.get("question")
+            if question is not None:
+                question = str(question).strip()
 
-        payload = pb_obj.get("payload")
+            payload = pb_obj.get("payload")
 
-        logger.log("tool.payload_plan", "Payload plan prepared", {"tool_name": chosen_tool_name, "should_call": should_call, "reason": pb_obj.get("reason", "")})
+            logger.log("tool.payload_plan", "Payload plan prepared", {"tool_name": chosen_tool_name, "should_call": should_call, "reason": pb_obj.get("reason", "")})
 
-        if not should_call:
-            return {"reply": question or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
+            if not should_call:
+                return {"reply": question or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
 
-        if not isinstance(payload, dict):
-            return {"reply": "Error: Tool payload must be an object.", "logs": logger.to_list()}
+            if not isinstance(payload, dict):
+                return {"reply": "Error: Tool payload must be an object.", "logs": logger.to_list()}
 
-        # Optional: basic structural check against template if template parses as dict
-        if isinstance(chosen_payload_template_obj, dict):
-            for k in chosen_payload_template_obj.keys():
-                if k not in payload:
-                    return {"reply": f"Error: Missing required top-level field '{k}' for {chosen_tool_name}.", "logs": logger.to_list()}
+            # Optional: basic structural check against template if template parses as dict
+            if isinstance(chosen_payload_template_obj, dict):
+                for k in chosen_payload_template_obj.keys():
+                    if k not in payload:
+                        return {"reply": f"Error: Missing required top-level field '{k}' for {chosen_tool_name}.", "logs": logger.to_list()}
 
-        # ---------------------------
-        # STEP C: Execute exactly ONE tool call
-        # ---------------------------
-        chosen_tool = tools_by_name[chosen_tool_name]
-
-        tool_result_raw = None
-        try:
-            tool_result_raw = chosen_tool.invoke(payload)
-        except Exception as e:
-            logger.log("tool.error", "Tool invocation error", {"tool_name": chosen_tool_name, "error": str(e), "traceback": traceback.format_exc()})
-            tool_result_raw = json.dumps({"ok": False, "error": str(e), "status_code": None, "response": None, "event_id": str(uuid.uuid4())})
-
-        # Parse tool result (your tools return JSON string)
-        tool_result_text = tool_result_raw if isinstance(tool_result_raw, str) else json.dumps(tool_result_raw)
-        tool_result_obj = _safe_json_loads(tool_result_text) if isinstance(tool_result_text, str) else None
-        if not isinstance(tool_result_obj, dict):
-            tool_result_obj = {"ok": False, "error": "Tool returned non-JSON result", "raw": tool_result_text}
-
-        ok = bool(tool_result_obj.get("ok"))
+            payload_plans.append((chosen_tool_name, payload))
 
         # ---------------------------
-        # STEP D: Final response grounded on tool result (NO additional tools)
+        # STEP C: Execute all chosen tools exactly once each (no retries)
+        # ---------------------------
+        tool_run_results: List[Dict[str, Any]] = []
+        for chosen_tool_name, payload in payload_plans:
+            chosen_tool = tools_by_name[chosen_tool_name]
+
+            tool_result_raw = None
+            try:
+                tool_result_raw = chosen_tool.invoke(payload)
+            except Exception as e:
+                logger.log("tool.error", "Tool invocation error", {"tool_name": chosen_tool_name, "error": str(e), "traceback": traceback.format_exc()})
+                tool_result_raw = json.dumps({"ok": False, "error": str(e), "status_code": None, "response": None, "event_id": str(uuid.uuid4())})
+
+            tool_result_text = tool_result_raw if isinstance(tool_result_raw, str) else json.dumps(tool_result_raw)
+            tool_result_obj = _safe_json_loads(tool_result_text) if isinstance(tool_result_text, str) else None
+            if not isinstance(tool_result_obj, dict):
+                tool_result_obj = {"ok": False, "error": "Tool returned non-JSON result", "raw": tool_result_text}
+
+            tool_run_results.append({
+                "tool_name": chosen_tool_name,
+                "payload": payload,
+                "result": tool_result_obj
+            })
+
+        # ---------------------------
+        # STEP D: Final response grounded on ALL tool results (NO additional tools)
         # ---------------------------
         final_system = (
             f"{agent_prompt}\n\n"
-            "You have executed exactly one tool call.\n"
+            "You have executed the listed tool calls (possibly more than one).\n"
             "You MUST NOT call any more tools.\n"
-            "Base your reply strictly on the tool result provided.\n"
+            "Do NOT invent retries. If a tool failed, state it plainly once.\n"
+            "Base your reply strictly on the tool results provided.\n"
         )
+
+        tool_runs_text_parts: List[str] = []
+        for tr in tool_run_results:
+            tool_runs_text_parts.append(
+                f"Tool: {tr['tool_name']}\n"
+                f"Payload: {json.dumps(tr['payload'], ensure_ascii=False)}\n"
+                f"Result: {json.dumps(tr['result'], ensure_ascii=False)}"
+            )
+        tool_runs_text = "\n\n".join(tool_runs_text_parts)
+
         final_user = (
             "User message:\n"
             + (message or "")
-            + "\n\nTool used:\n"
-            + chosen_tool_name
-            + "\n\nTool payload:\n"
-            + json.dumps(payload, ensure_ascii=False)
-            + "\n\nTool result:\n"
-            + json.dumps(tool_result_obj, ensure_ascii=False)
+            + "\n\nTool runs:\n"
+            + tool_runs_text
         )
 
         final_reply = llm.invoke([
