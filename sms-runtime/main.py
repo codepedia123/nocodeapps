@@ -583,7 +583,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         tool_runs_text = "\n\n".join(tool_runs_text_parts)
 
         final_user = (
-            "User message:\n"
+            "Conversation history:\n"
+            + json.dumps(history_msgs, ensure_ascii=False)
+            + "\n\nUser message:\n"
             + (message or "")
             + "\n\nTool runs:\n"
             + tool_runs_text
