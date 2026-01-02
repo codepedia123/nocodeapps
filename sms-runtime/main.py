@@ -6,8 +6,9 @@ import traceback
 import time
 import uuid
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -295,6 +296,66 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
 
     return generated_tools
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_OPTIONAL_KEYS = {"description", "notes", "memo", "comments", "comment"}
+
+def _is_empty(val: Any) -> bool:
+    return val is None or (isinstance(val, str) and val.strip() == "") or (isinstance(val, (list, dict)) and len(val) == 0)
+
+def _looks_like_email_field(name: str) -> bool:
+    n = name.lower()
+    return "email" in n or n in {"attendees", "emails", "invitees"}
+
+def _normalize_email_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str) and _EMAIL_RE.match(v)]
+    if isinstance(value, str) and _EMAIL_RE.match(value):
+        return [value]
+    return []
+
+def _validate_and_fill_payload(payload: Dict[str, Any], template_obj: Optional[Any]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Validate payload essentials generically.
+    - Enforce non-empty values for template keys unless clearly optional.
+    - For email-like fields, require at least one valid email.
+    - If both start_date_time and end_date_time are in template and end is missing, default to start+30m when parseable.
+    Returns (ok, question, payload). If ok is False, question is a single user-facing ask.
+    """
+    missing: List[str] = []
+
+    if isinstance(template_obj, dict):
+        keys = list(template_obj.keys())
+        for k in keys:
+            if k in _OPTIONAL_KEYS:
+                continue
+            if _looks_like_email_field(k):
+                emails = _normalize_email_list(payload.get(k))
+                if not emails:
+                    missing.append(k)
+                else:
+                    payload[k] = emails
+                continue
+
+            if k not in payload or _is_empty(payload.get(k)):
+                missing.append(k)
+
+        # Simple default: if both start_date_time and end_date_time exist in template and end is empty, set end = start + 30m when parseable
+        if "start_date_time" in template_obj and "end_date_time" in template_obj and _is_empty(payload.get("end_date_time")):
+            start_val = payload.get("start_date_time")
+            if isinstance(start_val, str):
+                try:
+                    dt = datetime.fromisoformat(start_val)
+                    payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
+                except Exception:
+                    pass
+
+    if missing:
+        if len(missing) == 1:
+            return False, f"Could you share the value for '{missing[0]}' to proceed?", payload
+        return False, f"Could you share the values for {', '.join(missing[:-1])} and {missing[-1]} to proceed?", payload
+
+    return True, None, payload
+
 
 # ---------------------------
 # Core Execution logic
@@ -477,7 +538,8 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 f"{agent_prompt}\n\n"
                 "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
                 "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, and the live conversation to decide what truly must be filled.\n"
-                "Use AskGuidance/AskNote tags only as secondary hints; rely primarily on what the tool actually needs (e.g., events often need title, start/end time, attendee emails, location/meet link, description).\n"
+                "Use AskGuidance/AskNote tags as hints only; rely primarily on what the tool needs. For any tool, non-optional fields must be non-empty. If a field is empty and not clearly optional, ask for it once.\n"
+                "If a field name implies emails (email, emails, attendees, invitees), ensure valid email strings; if none exist, ask for them. If the template has start/end date-times and end is missing, you may default end to start+30m only if start is parseable; otherwise ask.\n"
                 "Fill fields from conversation context when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
                 "SHOULD_BE_ASKED: if an essential is missing or uncertain, ask ONE precise question and do NOT call the tool.\n"
                 "NOT_TO_BE_ASKED: never ask; derive or set a safe explicit default if viable.\n"
@@ -534,6 +596,11 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 for k in chosen_payload_template_obj.keys():
                     if k not in payload:
                         return {"reply": f"Error: Missing required top-level field '{k}' for {chosen_tool_name}.", "logs": logger.to_list()}
+
+            # Heuristic validation for required fields (generic with light email/time handling)
+            ok_payload, ask_msg, payload = _validate_and_fill_payload(payload, chosen_payload_template_obj)
+            if not ok_payload:
+                return {"reply": ask_msg or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
 
             payload_plans.append((chosen_tool_name, payload))
 
