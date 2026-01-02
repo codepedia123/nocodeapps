@@ -442,183 +442,216 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             else:
                 history_msgs.append({"role": "assistant", "content": content})
 
-        # 6. Build a concise tool registry for the LLM to choose from
-        tool_registry_lines: List[str] = []
-        for _tid, _cfg in merged_config.items():
-            _name = f"sync_data_tool_{_tid}"
-            _when = str(_cfg.get("when_run", "") or "").strip()
-            _instr = str(_cfg.get("instructions", "") or "").strip()
-            _tpl = urllib.parse.unquote(str(_cfg.get("api_payload_json", "") or ""))
-            tool_registry_lines.append(
-                f"- name={_name}\n  when_run={_when}\n  instructions={_instr}\n  payload_template={_tpl}"
-            )
-        tool_registry_text = "\n".join(tool_registry_lines) if tool_registry_lines else "(no tools)"
+        def _compact_json(obj: Any, max_chars: int = 1800) -> str:
+            try:
+                s = json.dumps(obj, ensure_ascii=False)
+            except Exception:
+                s = str(obj)
+            return s if len(s) <= max_chars else (s[:max_chars] + "…")
 
-        # ---------------------------
-        # STEP A: Decide which tools to run (zero or many, ordered)
-        # ---------------------------
-        decision_system = (
-            f"{agent_prompt}\n\n"
-            "You may choose ZERO or MORE tools (ordered list) for this request.\n"
-            "Choose every tool whose when_run conditions match; order them sensibly. Include dependent steps (e.g., check availability then create booking) if they logically follow. If none match, select no_tool.\n"
-            "Do NOT plan retries. A failed tool must NOT be retried and does NOT unblock choosing others.\n\n"
-            "Available tools:\n"
-            f"{tool_registry_text}\n\n"
-            "Output MUST be strict JSON with keys:\n"
-            '{"action":"use_tools"|"no_tool","tool_names":array|null,"reason":string}\n'
-            "No extra text."
-        )
+        def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
+            """
+            Extract AskGuidance per field path from tool instructions.
+            Supports keys like 'title' and 'values.A'.
+            """
+            out: Dict[str, str] = {}
+            if not instructions_text:
+                return out
+            for m in re.finditer(r"'([^']+)'.*?AskGuidance=([A-Z_]+)", instructions_text):
+                field_path = m.group(1).strip()
+                guidance = m.group(2).strip()
+                if field_path:
+                    out[field_path] = guidance
+            return out
 
-        decision_user = (
-            "Conversation history:\n"
-            + json.dumps(history_msgs, ensure_ascii=False)
-            + "\n\nUser message:\n"
-            + (message or "")
-        )
+        def _build_tool_specs() -> List[Dict[str, Any]]:
+            specs: List[Dict[str, Any]] = []
+            for tid, cfg in (merged_config.items() if isinstance(merged_config, dict) else []):
+                name = f"sync_data_tool_{tid}"
+                tpl_raw = urllib.parse.unquote(str(cfg.get("api_payload_json", "") or ""))
+                tpl_obj = _safe_json_loads(tpl_raw)
+                instr = str(cfg.get("instructions", "") or "")
+                ask_map = _parse_ask_guidance(instr)
+                specs.append({
+                    "name": name,
+                    "when_run": str(cfg.get("when_run", "") or "").strip(),
+                    "payload_template": tpl_obj if tpl_obj is not None else tpl_raw,
+                    "ask_guidance": ask_map,
+                    "instructions": (instr[:800] + "…") if len(instr) > 800 else instr,
+                })
+            return specs
 
-        decision_raw = llm.invoke([
-            {"role": "system", "content": decision_system},
-            {"role": "user", "content": decision_user},
-        ], response_format={"type": "json_object"}).content
+        tool_specs = _build_tool_specs()
 
-        decision_clean = _strip_code_fences(decision_raw or "")
-        decision_obj = _safe_json_loads(decision_clean) if decision_clean else None
-        if not isinstance(decision_obj, dict):
-            logger.log("tool.decide.raw", "Decision parse failed", {"raw": decision_raw})
-            decision_obj = {"action": "no_tool", "tool_names": None, "reason": "Decision parsing failed; defaulting to no_tool."}
+        def _tool_spec_by_name(nm: str) -> Optional[Dict[str, Any]]:
+            for s in tool_specs:
+                if s.get("name") == nm:
+                    return s
+            return None
 
-        action = str(decision_obj.get("action") or "no_tool").strip()
-        chosen_tool_names_raw = decision_obj.get("tool_names")
-        chosen_tool_names: List[str] = []
-        if isinstance(chosen_tool_names_raw, list):
-            for nm in chosen_tool_names_raw:
-                try:
-                    nm_str = str(nm).strip()
-                    if nm_str:
-                        chosen_tool_names.append(nm_str)
-                except Exception:
+        def _is_missing_value(v: Any) -> bool:
+            return v is None or (isinstance(v, str) and v.strip() == "") or (isinstance(v, (list, dict)) and len(v) == 0)
+
+        def _validate_payload_with_askmap(payload: Dict[str, Any], template_obj: Any, ask_map: Dict[str, str]) -> Tuple[bool, Optional[str]]:
+            """
+            Generic validation:
+            - Payload must include all top-level keys present in template (structure match).
+            - Fields with AskGuidance=SHOULD_BE_ASKED must be present and non-empty.
+            - If there are email-like fields, enforce valid emails when non-empty (or when SHOULD_BE_ASKED).
+            Returns (ok, question_if_missing).
+            """
+            if not isinstance(template_obj, dict):
+                return True, None
+
+            # Ensure structure keys exist
+            for k in template_obj.keys():
+                if k not in payload:
+                    return False, f"Could you share the value for '{k}' to proceed?"
+
+            # Validate required fields from AskGuidance
+            missing_required: List[str] = []
+            for field_path, guidance in ask_map.items():
+                if guidance != "SHOULD_BE_ASKED":
                     continue
+                # Only enforce paths that exist in the template (top-level or dot-path)
+                parts = field_path.split(".")
+                cur: Any = payload
+                for p in parts:
+                    if not isinstance(cur, dict) or p not in cur:
+                        cur = None
+                        break
+                    cur = cur[p]
+                if _is_missing_value(cur):
+                    missing_required.append(field_path)
 
-        # Keep only tools that exist, preserve order, dedupe
-        seen_tools = set()
-        chosen_tool_names = [
-            t for t in chosen_tool_names
-            if t in tools_by_name and not (t in seen_tools or seen_tools.add(t))
-        ]
+            # Email heuristic: if any required field looks email-like, enforce format
+            invalid_emails: List[str] = []
+            for field_path, guidance in ask_map.items():
+                if guidance != "SHOULD_BE_ASKED":
+                    continue
+                if not _looks_like_email_field(field_path.split(".")[-1]):
+                    continue
+                parts = field_path.split(".")
+                cur: Any = payload
+                for p in parts:
+                    if not isinstance(cur, dict) or p not in cur:
+                        cur = None
+                        break
+                    cur = cur[p]
+                emails = _normalize_email_list(cur)
+                if not emails:
+                    invalid_emails.append(field_path)
 
-        logger.log("tool.decide", "Tool decision made", {"action": action, "tool_names": chosen_tool_names, "reason": decision_obj.get("reason", "")})
+            if invalid_emails:
+                return False, "Please share a valid email address to proceed."
 
-        # If no tool, answer normally (no tools)
-        if action != "use_tools" or not chosen_tool_names:
-            answer_system = agent_prompt
-            answer_user = (
-                "Conversation history:\n"
-                + json.dumps(history_msgs, ensure_ascii=False)
-                + "\n\nUser message:\n"
-                + (message or "")
-            )
-            answer = llm.invoke([
-                {"role": "system", "content": answer_system},
-                {"role": "user", "content": answer_user},
-            ]).content
-            return {"reply": answer or "", "logs": logger.to_list()}
+            if missing_required:
+                if len(missing_required) == 1:
+                    return False, f"Could you share {missing_required[0]} to proceed?"
+                return False, f"Could you share {', '.join(missing_required[:-1])} and {missing_required[-1]} to proceed?"
+
+            return True, None
 
         # ---------------------------
-        # STEP B/C: Sequentially plan and execute each chosen tool (no retries)
+        # Planner loop: decide next question or tool, execute, repeat (no retries)
         # ---------------------------
         tool_run_results: List[Dict[str, Any]] = []
-        for chosen_tool_name in chosen_tool_names:
-            tool_id_part = chosen_tool_name.replace("sync_data_tool_", "", 1).strip()
-            chosen_cfg = merged_config.get(tool_id_part, {}) if isinstance(merged_config, dict) else {}
-            chosen_instructions = str(chosen_cfg.get("instructions", "") or "")
-            chosen_when_run = str(chosen_cfg.get("when_run", "") or "")
-            chosen_payload_template_raw = urllib.parse.unquote(str(chosen_cfg.get("api_payload_json", "") or ""))
-            chosen_payload_template_obj = _safe_json_loads(chosen_payload_template_raw)
+        executed_tools: set[str] = set()
+        failed_tools: set[str] = set()
 
-            # Summarize prior tool runs to inform dependent steps
-            prior_runs_text_parts: List[str] = []
-            for tr in tool_run_results:
-                prior_runs_text_parts.append(
-                    f"Tool: {tr['tool_name']}\nPayload: {json.dumps(tr['payload'], ensure_ascii=False)}\nResult: {json.dumps(tr['result'], ensure_ascii=False)}"
-                )
-            prior_runs_text = "\n\n".join(prior_runs_text_parts) if prior_runs_text_parts else "(none)"
+        max_steps = 6
+        for step_idx in range(max_steps):
+            remaining_specs = [s for s in tool_specs if s.get("name") not in executed_tools and s.get("name") not in failed_tools]
 
-            payload_builder_system = (
+            planner_system = (
                 f"{agent_prompt}\n\n"
-                "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
-                "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, the live conversation, and prior tool results to decide what truly must be filled.\n"
-                "Use AskGuidance/AskNote tags as hints only; rely primarily on what the tool needs. For any tool, non-optional fields must be non-empty. If a field is empty and not clearly optional, ask for it once.\n"
-                "If a field name implies emails (email, emails, attendees, invitees), ensure valid email strings; if none exist, ask for them. If the template has start/end date-times and end is missing, you may default end to start+30m only if start is parseable; otherwise ask.\n"
-                "Fill fields from conversation context and prior tool results when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
-                "SHOULD_BE_ASKED: if an essential is missing or uncertain, ask ONE precise question and do NOT call the tool.\n"
-                "NOT_TO_BE_ASKED: never ask; derive or set a safe explicit default if viable.\n"
-                "CAN_BE_ASKED: derive first; ask only if correctness would suffer.\n\n"
-                "Be explicit about exactly what you need; avoid generic questions. Do not ask for details already known in conversation or prior tool results.\n"
-                "You may NOT switch tools. Only prepare for the chosen tool below.\n"
-                "Do NOT plan or mention retries.\n\n"
-                f"Chosen tool: {chosen_tool_name}\n"
-                f"when_run: {chosen_when_run}\n"
-                f"instructions: {chosen_instructions}\n"
-                f"payload_template: {chosen_payload_template_raw}\n"
-                f"Prior tool runs: {prior_runs_text}\n\n"
+                "You are the runtime planner.\n"
+                "Goal: help the user by asking for missing details (one question at a time) and running tools when ready.\n"
+                "You MUST follow tool when_run and instructions, and match payload_template structure exactly.\n"
+                "Use all available tools; plan dependencies (e.g., check availability, then book) based on prior tool results.\n"
+                "Never retry a failed tool in this request.\n"
+                "Do not claim an external action succeeded unless a tool result clearly confirms it.\n\n"
                 "Output MUST be strict JSON with keys:\n"
-                '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
+                '{"action":"ask"|"run_tool"|"done","question":string|null,"tool_name":string|null,"payload":object|null,"reply":string|null,"reason":string}\n'
                 "Rules:\n"
-                "- If should_call=false, question MUST be a single question to the user.\n"
-                "- If should_call=true, payload MUST match the template structure.\n"
+                "- If action=ask: question must be one specific question; tool_name/payload must be null.\n"
+                "- If action=run_tool: tool_name and payload required; question/reply must be null.\n"
+                "- If action=done: reply required; question/tool_name/payload must be null.\n"
                 "No extra text."
             )
 
-            payload_builder_user = (
+            planner_user = (
                 "Conversation history:\n"
-                + json.dumps(history_msgs, ensure_ascii=False)
+                + _compact_json(history_msgs, 2200)
                 + "\n\nUser message:\n"
                 + (message or "")
+                + "\n\nAvailable tools (compact):\n"
+                + _compact_json(remaining_specs, 2600)
+                + "\n\nPrior tool runs (compact):\n"
+                + _compact_json(tool_run_results, 2200)
             )
 
-            pb_raw = llm.invoke([
-                {"role": "system", "content": payload_builder_system},
-                {"role": "user", "content": payload_builder_user},
-            ], response_format={"type": "json_object"}).content
+            plan_raw = llm.invoke(
+                [{"role": "system", "content": planner_system}, {"role": "user", "content": planner_user}],
+                response_format={"type": "json_object"},
+            ).content
 
-            pb_clean = _strip_code_fences(pb_raw or "")
-            pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
-            if not isinstance(pb_obj, dict):
-                pb_obj = {"should_call": False, "payload": None, "question": "Could you share the missing details needed to proceed?", "reason": "Payload parsing failed."}
+            plan_clean = _strip_code_fences(plan_raw or "")
+            plan_obj = _safe_json_loads(plan_clean) if plan_clean else None
+            if not isinstance(plan_obj, dict):
+                logger.log("planner.raw", "Planner parse failed", {"raw": plan_raw})
+                return {"reply": "Sorry — I couldn't understand the next step. Could you rephrase?", "logs": logger.to_list()}
 
-            should_call = bool(pb_obj.get("should_call"))
-            question = pb_obj.get("question")
-            if question is not None:
-                question = str(question).strip()
+            action = str(plan_obj.get("action") or "").strip()
+            logger.log("planner.step", "Planner step", {"step": step_idx, "action": action, "reason": plan_obj.get("reason", "")})
 
-            payload = pb_obj.get("payload")
+            if action == "ask":
+                q = plan_obj.get("question")
+                q = str(q).strip() if q is not None else ""
+                if not q:
+                    q = "Could you share the missing details needed to proceed?"
+                return {"reply": q, "logs": logger.to_list()}
 
-            logger.log("tool.payload_plan", "Payload plan prepared", {"tool_name": chosen_tool_name, "should_call": should_call, "reason": pb_obj.get("reason", "")})
+            if action == "done":
+                reply = plan_obj.get("reply")
+                reply = str(reply).strip() if reply is not None else ""
+                if not reply:
+                    reply = "Done."
+                return {"reply": reply, "logs": logger.to_list()}
 
-            if not should_call:
-                return {"reply": question or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
+            if action != "run_tool":
+                return {"reply": "Sorry — I couldn't determine the next step. Could you rephrase?", "logs": logger.to_list()}
 
+            tool_name = plan_obj.get("tool_name")
+            tool_name = str(tool_name).strip() if tool_name is not None else ""
+            payload = plan_obj.get("payload")
+
+            if not tool_name or tool_name not in tools_by_name:
+                return {"reply": "Error: Invalid tool selected.", "logs": logger.to_list()}
+            if tool_name in executed_tools or tool_name in failed_tools:
+                return {"reply": "Error: Tool already used in this request.", "logs": logger.to_list()}
             if not isinstance(payload, dict):
                 return {"reply": "Error: Tool payload must be an object.", "logs": logger.to_list()}
 
-            # Optional: basic structural check against template if template parses as dict
-            if isinstance(chosen_payload_template_obj, dict):
-                for k in chosen_payload_template_obj.keys():
-                    if k not in payload:
-                        return {"reply": f"Error: Missing required top-level field '{k}' for {chosen_tool_name}.", "logs": logger.to_list()}
+            spec = _tool_spec_by_name(tool_name) or {}
+            tpl_obj = spec.get("payload_template")
+            ask_map = spec.get("ask_guidance") or {}
+            if isinstance(tpl_obj, str):
+                tpl_obj_parsed = _safe_json_loads(tpl_obj)
+                tpl_obj = tpl_obj_parsed if tpl_obj_parsed is not None else tpl_obj
 
-            # Heuristic validation for required fields (generic with light email/time handling)
-            ok_payload, ask_msg, payload = _validate_and_fill_payload(payload, chosen_payload_template_obj)
-            if not ok_payload:
-                return {"reply": ask_msg or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
+            # Validate structure and required fields
+            ok, ask_q = _validate_payload_with_askmap(payload, tpl_obj, ask_map)
+            if not ok:
+                return {"reply": ask_q or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
 
-            chosen_tool = tools_by_name[chosen_tool_name]
-
-            tool_result_raw = None
+            # Execute exactly once
+            logger.log("tool.payload_plan", "Payload plan prepared", {"tool_name": tool_name, "should_call": True, "reason": plan_obj.get("reason", "")})
+            chosen_tool = tools_by_name[tool_name]
             try:
                 tool_result_raw = chosen_tool.invoke(payload)
             except Exception as e:
-                logger.log("tool.error", "Tool invocation error", {"tool_name": chosen_tool_name, "error": str(e), "traceback": traceback.format_exc()})
+                logger.log("tool.error", "Tool invocation error", {"tool_name": tool_name, "error": str(e), "traceback": traceback.format_exc()})
                 tool_result_raw = json.dumps({"ok": False, "error": str(e), "status_code": None, "response": None, "event_id": str(uuid.uuid4())})
 
             tool_result_text = tool_result_raw if isinstance(tool_result_raw, str) else json.dumps(tool_result_raw)
@@ -626,47 +659,17 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             if not isinstance(tool_result_obj, dict):
                 tool_result_obj = {"ok": False, "error": "Tool returned non-JSON result", "raw": tool_result_text}
 
-            tool_run_results.append({
-                "tool_name": chosen_tool_name,
-                "payload": payload,
-                "result": tool_result_obj
-            })
+            tool_run_results.append({"tool_name": tool_name, "payload": payload, "result": tool_result_obj})
+            executed_tools.add(tool_name)
+            if not bool(tool_result_obj.get("ok")):
+                failed_tools.add(tool_name)
 
-        # ---------------------------
-        # STEP D: Final response grounded on ALL tool results (NO additional tools)
-        # ---------------------------
-        final_system = (
-            f"{agent_prompt}\n\n"
-            "You have executed the listed tool calls (possibly more than one).\n"
-            "You MUST NOT call any more tools.\n"
-            "Do NOT invent retries. If a tool failed, state it plainly once.\n"
-            "Base your reply strictly on the tool results provided.\n"
-        )
+            # Continue loop to allow dependent follow-up tools in the same request.
+            continue
 
-        tool_runs_text_parts: List[str] = []
-        for tr in tool_run_results:
-            tool_runs_text_parts.append(
-                f"Tool: {tr['tool_name']}\n"
-                f"Payload: {json.dumps(tr['payload'], ensure_ascii=False)}\n"
-                f"Result: {json.dumps(tr['result'], ensure_ascii=False)}"
-            )
-        tool_runs_text = "\n\n".join(tool_runs_text_parts)
-
-        final_user = (
-            "Conversation history:\n"
-            + json.dumps(history_msgs, ensure_ascii=False)
-            + "\n\nUser message:\n"
-            + (message or "")
-            + "\n\nTool runs:\n"
-            + tool_runs_text
-        )
-
-        final_reply = llm.invoke([
-            {"role": "system", "content": final_system},
-            {"role": "user", "content": final_user},
-        ]).content
-
-        return {"reply": final_reply or "", "logs": logger.to_list()}
+        # If we hit max steps, produce a final response based on what we did.
+        fallback_reply = "I’ve completed the available steps for now. What would you like to do next?"
+        return {"reply": fallback_reply, "logs": logger.to_list()}
 
     except Exception as e:
         logger.log("run.error", str(e), {"traceback": traceback.format_exc()})
