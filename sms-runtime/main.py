@@ -460,7 +460,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         decision_system = (
             f"{agent_prompt}\n\n"
             "You may choose ZERO or MORE tools (ordered list) for this request.\n"
-            "Choose every tool whose when_run conditions match; order them sensibly. If none match, select no_tool.\n"
+            "Choose every tool whose when_run conditions match; order them sensibly. Include dependent steps (e.g., check availability then create booking) if they logically follow. If none match, select no_tool.\n"
             "Do NOT plan retries. A failed tool must NOT be retried and does NOT unblock choosing others.\n\n"
             "Available tools:\n"
             f"{tool_registry_text}\n\n"
@@ -524,9 +524,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             return {"reply": answer or "", "logs": logger.to_list()}
 
         # ---------------------------
-        # STEP B: For each chosen tool, construct payload OR ask a single question
+        # STEP B/C: Sequentially plan and execute each chosen tool (no retries)
         # ---------------------------
-        payload_plans: List[Tuple[str, Dict[str, Any]]] = []
+        tool_run_results: List[Dict[str, Any]] = []
         for chosen_tool_name in chosen_tool_names:
             tool_id_part = chosen_tool_name.replace("sync_data_tool_", "", 1).strip()
             chosen_cfg = merged_config.get(tool_id_part, {}) if isinstance(merged_config, dict) else {}
@@ -535,23 +535,32 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             chosen_payload_template_raw = urllib.parse.unquote(str(chosen_cfg.get("api_payload_json", "") or ""))
             chosen_payload_template_obj = _safe_json_loads(chosen_payload_template_raw)
 
+            # Summarize prior tool runs to inform dependent steps
+            prior_runs_text_parts: List[str] = []
+            for tr in tool_run_results:
+                prior_runs_text_parts.append(
+                    f"Tool: {tr['tool_name']}\nPayload: {json.dumps(tr['payload'], ensure_ascii=False)}\nResult: {json.dumps(tr['result'], ensure_ascii=False)}"
+                )
+            prior_runs_text = "\n\n".join(prior_runs_text_parts) if prior_runs_text_parts else "(none)"
+
             payload_builder_system = (
                 f"{agent_prompt}\n\n"
                 "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
-                "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, and the live conversation to decide what truly must be filled.\n"
+                "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, the live conversation, and prior tool results to decide what truly must be filled.\n"
                 "Use AskGuidance/AskNote tags as hints only; rely primarily on what the tool needs. For any tool, non-optional fields must be non-empty. If a field is empty and not clearly optional, ask for it once.\n"
                 "If a field name implies emails (email, emails, attendees, invitees), ensure valid email strings; if none exist, ask for them. If the template has start/end date-times and end is missing, you may default end to start+30m only if start is parseable; otherwise ask.\n"
-                "Fill fields from conversation context when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
+                "Fill fields from conversation context and prior tool results when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
                 "SHOULD_BE_ASKED: if an essential is missing or uncertain, ask ONE precise question and do NOT call the tool.\n"
                 "NOT_TO_BE_ASKED: never ask; derive or set a safe explicit default if viable.\n"
                 "CAN_BE_ASKED: derive first; ask only if correctness would suffer.\n\n"
-                "Be explicit about exactly what you need; avoid generic questions. Do not ask for details already known in conversation.\n"
+                "Be explicit about exactly what you need; avoid generic questions. Do not ask for details already known in conversation or prior tool results.\n"
                 "You may NOT switch tools. Only prepare for the chosen tool below.\n"
                 "Do NOT plan or mention retries.\n\n"
                 f"Chosen tool: {chosen_tool_name}\n"
                 f"when_run: {chosen_when_run}\n"
                 f"instructions: {chosen_instructions}\n"
-                f"payload_template: {chosen_payload_template_raw}\n\n"
+                f"payload_template: {chosen_payload_template_raw}\n"
+                f"Prior tool runs: {prior_runs_text}\n\n"
                 "Output MUST be strict JSON with keys:\n"
                 '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
                 "Rules:\n"
@@ -603,13 +612,6 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             if not ok_payload:
                 return {"reply": ask_msg or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
 
-            payload_plans.append((chosen_tool_name, payload))
-
-        # ---------------------------
-        # STEP C: Execute all chosen tools exactly once each (no retries)
-        # ---------------------------
-        tool_run_results: List[Dict[str, Any]] = []
-        for chosen_tool_name, payload in payload_plans:
             chosen_tool = tools_by_name[chosen_tool_name]
 
             tool_result_raw = None
