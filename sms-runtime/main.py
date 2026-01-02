@@ -328,9 +328,8 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     # Get agent prompt (instruction)
     agent_prompt = agent_resp.get("prompt", "You are a helpful assistant.")
 
-    # 2. Fetch tools associated with this agent (Redis-only)
-    agent_user_id = agent_resp.get("user_id", agent_id)
-    fetched_tools = fetch_agent_tools(agent_user_id)
+    # 2. Fetch tools associated with this agent (Redis-only) using the agent_id from payload
+    fetched_tools = fetch_agent_tools(agent_id)
     merged_config = DYNAMIC_CONFIG.copy()
 
     # If fetched_tools is a mapping of ids to tool definitions, merge them
