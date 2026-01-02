@@ -567,14 +567,14 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 + (message or "")
             )
 
-        pb_raw = llm.invoke([
-            {"role": "system", "content": payload_builder_system},
-            {"role": "user", "content": payload_builder_user},
-        ], response_format={"type": "json_object"}).content
+            pb_raw = llm.invoke([
+                {"role": "system", "content": payload_builder_system},
+                {"role": "user", "content": payload_builder_user},
+            ], response_format={"type": "json_object"}).content
 
-        pb_clean = _strip_code_fences(pb_raw or "")
-        pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
-        if not isinstance(pb_obj, dict):
+            pb_clean = _strip_code_fences(pb_raw or "")
+            pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
+            if not isinstance(pb_obj, dict):
                 pb_obj = {"should_call": False, "payload": None, "question": "Could you share the missing details needed to proceed?", "reason": "Payload parsing failed."}
 
             should_call = bool(pb_obj.get("should_call"))
