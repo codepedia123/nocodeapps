@@ -6,9 +6,8 @@ import traceback
 import time
 import uuid
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -163,14 +162,6 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
         return None
 
-    def _agent_match(row_val: Any, target: Any) -> bool:
-        """Allow matching on '3' vs 'agent3' by normalizing forms."""
-        row_str = str(row_val)
-        tgt_str = str(target)
-        row_core = row_str[5:] if row_str.startswith("agent") else row_str
-        tgt_core = tgt_str[5:] if tgt_str.startswith("agent") else tgt_str
-        return row_str == tgt_str or row_core == tgt_core
-
     try:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
@@ -190,9 +181,9 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
             if not row:
                 continue
 
-            # normalize stored agent_id and compare as strings (accept '3' or 'agent3')
+            # normalize stored agent_id and compare as strings
             row_agent_val = row.get("agent_id", "")
-            if not _agent_match(row_agent_val, agent_user_id):
+            if str(row_agent_val) != str(agent_user_id):
                 continue
 
             tool_map[str(row_id)] = {
@@ -296,66 +287,6 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
 
     return generated_tools
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_OPTIONAL_KEYS = {"description", "notes", "memo", "comments", "comment"}
-
-def _is_empty(val: Any) -> bool:
-    return val is None or (isinstance(val, str) and val.strip() == "") or (isinstance(val, (list, dict)) and len(val) == 0)
-
-def _looks_like_email_field(name: str) -> bool:
-    n = name.lower()
-    return "email" in n or n in {"attendees", "emails", "invitees"}
-
-def _normalize_email_list(value: Any) -> List[str]:
-    if isinstance(value, list):
-        return [v for v in value if isinstance(v, str) and _EMAIL_RE.match(v)]
-    if isinstance(value, str) and _EMAIL_RE.match(value):
-        return [value]
-    return []
-
-def _validate_and_fill_payload(payload: Dict[str, Any], template_obj: Optional[Any]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    """
-    Validate payload essentials generically.
-    - Enforce non-empty values for template keys unless clearly optional.
-    - For email-like fields, require at least one valid email.
-    - If both start_date_time and end_date_time are in template and end is missing, default to start+30m when parseable.
-    Returns (ok, question, payload). If ok is False, question is a single user-facing ask.
-    """
-    missing: List[str] = []
-
-    if isinstance(template_obj, dict):
-        keys = list(template_obj.keys())
-        for k in keys:
-            if k in _OPTIONAL_KEYS:
-                continue
-            if _looks_like_email_field(k):
-                emails = _normalize_email_list(payload.get(k))
-                if not emails:
-                    missing.append(k)
-                else:
-                    payload[k] = emails
-                continue
-
-            if k not in payload or _is_empty(payload.get(k)):
-                missing.append(k)
-
-        # Simple default: if both start_date_time and end_date_time exist in template and end is empty, set end = start + 30m when parseable
-        if "start_date_time" in template_obj and "end_date_time" in template_obj and _is_empty(payload.get("end_date_time")):
-            start_val = payload.get("start_date_time")
-            if isinstance(start_val, str):
-                try:
-                    dt = datetime.fromisoformat(start_val)
-                    payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
-                except Exception:
-                    pass
-
-    if missing:
-        if len(missing) == 1:
-            return False, f"Could you share the value for '{missing[0]}' to proceed?", payload
-        return False, f"Could you share the values for {', '.join(missing[:-1])} and {missing[-1]} to proceed?", payload
-
-    return True, None, payload
-
 
 # ---------------------------
 # Core Execution logic
@@ -397,8 +328,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     # Get agent prompt (instruction)
     agent_prompt = agent_resp.get("prompt", "You are a helpful assistant.")
 
-    # 2. Fetch tools associated with this agent (Redis-only) using the agent_id from payload
-    fetched_tools = fetch_agent_tools(str(agent_id))
+    # 2. Fetch tools associated with this agent (Redis-only)
+    agent_user_id = agent_resp.get("user_id", agent_id)
+    fetched_tools = fetch_agent_tools(agent_user_id)
     merged_config = DYNAMIC_CONFIG.copy()
 
     # If fetched_tools is a mapping of ids to tool definitions, merge them
@@ -460,7 +392,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         decision_system = (
             f"{agent_prompt}\n\n"
             "You may choose ZERO or MORE tools (ordered list) for this request.\n"
-            "Choose every tool whose when_run conditions match; order them sensibly. Include dependent steps (e.g., check availability then create booking) if they logically follow. If none match, select no_tool.\n"
+            "Choose every tool whose when_run conditions match; order them sensibly. If none match, select no_tool.\n"
             "Do NOT plan retries. A failed tool must NOT be retried and does NOT unblock choosing others.\n\n"
             "Available tools:\n"
             f"{tool_registry_text}\n\n"
@@ -479,12 +411,11 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         decision_raw = llm.invoke([
             {"role": "system", "content": decision_system},
             {"role": "user", "content": decision_user},
-        ], response_format={"type": "json_object"}).content
+        ]).content
 
         decision_clean = _strip_code_fences(decision_raw or "")
         decision_obj = _safe_json_loads(decision_clean) if decision_clean else None
         if not isinstance(decision_obj, dict):
-            logger.log("tool.decide.raw", "Decision parse failed", {"raw": decision_raw})
             decision_obj = {"action": "no_tool", "tool_names": None, "reason": "Decision parsing failed; defaulting to no_tool."}
 
         action = str(decision_obj.get("action") or "no_tool").strip()
@@ -524,9 +455,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             return {"reply": answer or "", "logs": logger.to_list()}
 
         # ---------------------------
-        # STEP B/C: Sequentially plan and execute each chosen tool (no retries)
+        # STEP B: For each chosen tool, construct payload OR ask a single question
         # ---------------------------
-        tool_run_results: List[Dict[str, Any]] = []
+        payload_plans: List[Tuple[str, Dict[str, Any]]] = []
         for chosen_tool_name in chosen_tool_names:
             tool_id_part = chosen_tool_name.replace("sync_data_tool_", "", 1).strip()
             chosen_cfg = merged_config.get(tool_id_part, {}) if isinstance(merged_config, dict) else {}
@@ -535,32 +466,22 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             chosen_payload_template_raw = urllib.parse.unquote(str(chosen_cfg.get("api_payload_json", "") or ""))
             chosen_payload_template_obj = _safe_json_loads(chosen_payload_template_raw)
 
-            # Summarize prior tool runs to inform dependent steps
-            prior_runs_text_parts: List[str] = []
-            for tr in tool_run_results:
-                prior_runs_text_parts.append(
-                    f"Tool: {tr['tool_name']}\nPayload: {json.dumps(tr['payload'], ensure_ascii=False)}\nResult: {json.dumps(tr['result'], ensure_ascii=False)}"
-                )
-            prior_runs_text = "\n\n".join(prior_runs_text_parts) if prior_runs_text_parts else "(none)"
-
             payload_builder_system = (
                 f"{agent_prompt}\n\n"
                 "You are preparing inputs for exactly ONE tool call (the tool listed below).\n"
-                "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, the live conversation, and prior tool results to decide what truly must be filled.\n"
-                "Use AskGuidance/AskNote tags as hints only; rely primarily on what the tool needs. For any tool, non-optional fields must be non-empty. If a field is empty and not clearly optional, ask for it once.\n"
-                "If a field name implies emails (email, emails, attendees, invitees), ensure valid email strings; if none exist, ask for them. If the template has start/end date-times and end is missing, you may default end to start+30m only if start is parseable; otherwise ask.\n"
-                "Fill fields from conversation context and prior tool results when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
+                "Think using: the agent's global purpose, the tool's when_run, instructions, payload_template, and the live conversation to decide what truly must be filled.\n"
+                "Use AskGuidance/AskNote tags only as secondary hints; rely primarily on what the tool actually needs (e.g., events often need title, start/end time, attendee emails, location/meet link, description).\n"
+                "Fill fields from conversation context when possible. Set a safe explicit default only when it is clearly acceptable. Ask the user only for essentials that are missing or uncertain.\n"
                 "SHOULD_BE_ASKED: if an essential is missing or uncertain, ask ONE precise question and do NOT call the tool.\n"
                 "NOT_TO_BE_ASKED: never ask; derive or set a safe explicit default if viable.\n"
                 "CAN_BE_ASKED: derive first; ask only if correctness would suffer.\n\n"
-                "Be explicit about exactly what you need; avoid generic questions. Do not ask for details already known in conversation or prior tool results.\n"
+                "Be explicit about exactly what you need; avoid generic questions. Do not ask for details already known in conversation.\n"
                 "You may NOT switch tools. Only prepare for the chosen tool below.\n"
                 "Do NOT plan or mention retries.\n\n"
                 f"Chosen tool: {chosen_tool_name}\n"
                 f"when_run: {chosen_when_run}\n"
                 f"instructions: {chosen_instructions}\n"
-                f"payload_template: {chosen_payload_template_raw}\n"
-                f"Prior tool runs: {prior_runs_text}\n\n"
+                f"payload_template: {chosen_payload_template_raw}\n\n"
                 "Output MUST be strict JSON with keys:\n"
                 '{"should_call":true|false,"payload":object|null,"question":string|null,"reason":string}\n'
                 "Rules:\n"
@@ -579,7 +500,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             pb_raw = llm.invoke([
                 {"role": "system", "content": payload_builder_system},
                 {"role": "user", "content": payload_builder_user},
-            ], response_format={"type": "json_object"}).content
+            ]).content
 
             pb_clean = _strip_code_fences(pb_raw or "")
             pb_obj = _safe_json_loads(pb_clean) if pb_clean else None
@@ -607,11 +528,13 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     if k not in payload:
                         return {"reply": f"Error: Missing required top-level field '{k}' for {chosen_tool_name}.", "logs": logger.to_list()}
 
-            # Heuristic validation for required fields (generic with light email/time handling)
-            ok_payload, ask_msg, payload = _validate_and_fill_payload(payload, chosen_payload_template_obj)
-            if not ok_payload:
-                return {"reply": ask_msg or "Could you share the missing details needed to proceed?", "logs": logger.to_list()}
+            payload_plans.append((chosen_tool_name, payload))
 
+        # ---------------------------
+        # STEP C: Execute all chosen tools exactly once each (no retries)
+        # ---------------------------
+        tool_run_results: List[Dict[str, Any]] = []
+        for chosen_tool_name, payload in payload_plans:
             chosen_tool = tools_by_name[chosen_tool_name]
 
             tool_result_raw = None
@@ -653,9 +576,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         tool_runs_text = "\n\n".join(tool_runs_text_parts)
 
         final_user = (
-            "Conversation history:\n"
-            + json.dumps(history_msgs, ensure_ascii=False)
-            + "\n\nUser message:\n"
+            "User message:\n"
             + (message or "")
             + "\n\nTool runs:\n"
             + tool_runs_text
