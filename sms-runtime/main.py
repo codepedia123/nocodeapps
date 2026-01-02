@@ -162,6 +162,14 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
         return None
 
+    def _agent_match(row_val: Any, target: Any) -> bool:
+        """Allow matching on '3' vs 'agent3' by normalizing forms."""
+        row_str = str(row_val)
+        tgt_str = str(target)
+        row_core = row_str[5:] if row_str.startswith("agent") else row_str
+        tgt_core = tgt_str[5:] if tgt_str.startswith("agent") else tgt_str
+        return row_str == tgt_str or row_core == tgt_core
+
     try:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
@@ -181,9 +189,9 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
             if not row:
                 continue
 
-            # normalize stored agent_id and compare as strings
+            # normalize stored agent_id and compare as strings (accept '3' or 'agent3')
             row_agent_val = row.get("agent_id", "")
-            if str(row_agent_val) != str(agent_user_id):
+            if not _agent_match(row_agent_val, agent_user_id):
                 continue
 
             tool_map[str(row_id)] = {
