@@ -4,6 +4,7 @@ import json
 import uuid
 import time
 import traceback
+from fastapi.middleware.cors import CORSMiddleware
 import urllib.parse
 import re
 from datetime import datetime, timezone, timedelta
@@ -705,6 +706,13 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
 # API Wrapper
 # ---------------------------
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/run-agent")
