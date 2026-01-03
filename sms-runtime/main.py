@@ -212,48 +212,173 @@ def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
             out[field_path] = guidance
     return out
 
-def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template_obj: Any, ask_map: Dict[str, str]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+# ---------------------------
+# Field Resolution Engine (NEW)
+# ---------------------------
+# Lightweight evidence extraction regexes
+_PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\d{10}|\d{3}[\s-]\d{3}[\s-]\d{4}|\d{5}[\s-]\d{5})")
+_DATE_KEYWORDS = re.compile(r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|tomorrow|today|next\s+\w+)\b", re.I)
+
+def _gather_evidence_from_conversation(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {"emails": [], "phones": [], "dates": [], "intent_keywords": [], "names": []}
+    if not conversation:
+        return evidence
+    text = " ".join((turn.get("content") or turn.get("message") or "") for turn in (conversation or [])).strip()
+    if not text:
+        return evidence
+    # emails
+    for m in re.finditer(r"[\w.+-]+@[\w-]+\.[\w.-]+", text):
+        evidence["emails"].append(m.group(0))
+    # phones
+    for m in _PHONE_RE.finditer(text):
+        evidence["phones"].append(m.group(0))
+    # dates / date keywords
+    for m in _DATE_KEYWORDS.finditer(text):
+        evidence["dates"].append(m.group(0))
+    # simple intent keywords for appointment types
+    for kw in ("cleaning", "checkup", "extraction", "consult", "filling", "root canal", "crown", "book", "appointment", "reschedule", "resched"):
+        if re.search(r"\b" + re.escape(kw) + r"\b", text, re.I):
+            evidence["intent_keywords"].append(kw)
+    # simple name heuristics: "My name is X"
+    nm = re.search(r"\b(?:my name is|i am|this is)\s+([A-Z][a-z]{2,20})\b", text)
+    if nm:
+        evidence["names"].append(nm.group(1))
+    return evidence
+
+def _auto_fill_for_field(field: str, payload: Dict[str, Any], template: Dict[str, Any], evidence: Dict[str, Any], agent_prompt: str) -> Optional[Any]:
+    # end_date_time -> default +30 minutes if start provided and isoparseable
+    if field in ("end_date_time", "endTime", "end") and _is_empty(payload.get(field)):
+        start = payload.get("start_date_time") or payload.get("start") or payload.get("dtstart")
+        if isinstance(start, str) and start:
+            try:
+                dt = datetime.fromisoformat(start)
+                return (dt + timedelta(minutes=30)).isoformat()
+            except Exception:
+                return None
+    # title generation: use intent keywords to create a sensible title
+    if field in ("title", "summary") and (_is_empty(payload.get(field))):
+        if evidence.get("intent_keywords"):
+            kw = evidence["intent_keywords"][0]
+            return f"{kw.capitalize()} Appointment"
+        if re.search(r"\bdental\b|\bclinic\b", agent_prompt, re.I) and evidence.get("intent_keywords"):
+            return "Clinic Appointment"
+        return "Appointment"
+    # attendees: avoid inventing emails
+    return None
+
+def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: Dict[str, str], payload: Dict[str, Any], conversation: List[Dict[str, Any]], agent_prompt: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Returns (ok, question_if_any, final_payload).
+    ok True means ready to call. If not ok, question is the single question to ask user.
+    """
+    tpl = template_obj or {}
+    evidence = _gather_evidence_from_conversation(conversation or [])
+    final = dict(payload or {})
+    missing_should: List[str] = []
+
+    preferred_not_ask = {"title", "summary", "id", "start_date_time", "end_date_time", "dtstart", "dtend"}
+
+    booking_mode = bool(re.search(r"\b(book|appointment|schedule|resched|reschedule)\b", agent_prompt, re.I))
+
+    for field in tpl.keys():
+        cur_val = final.get(field)
+        # if non-empty, ok
+        if not _is_empty(cur_val):
+            continue
+        # try deterministic autofill
+        auto = _auto_fill_for_field(field, final, tpl, evidence, agent_prompt)
+        if auto is not None:
+            final[field] = auto
+            logger.log("autofill", f"Auto-filled field {field}", {"value": auto})
+            continue
+        guidance = (ask_map or {}).get(field, None)
+        # system preference for not asking certain fields
+        if field in preferred_not_ask:
+            if guidance == "SHOULD_BE_ASKED":
+                pass
+            else:
+                continue
+        # booking mode: treat emails/attendees as required
+        if booking_mode and _looks_like_email_field(field):
+            missing_should.append(field)
+            continue
+        # respect ask_map
+        if guidance == "SHOULD_BE_ASKED":
+            missing_should.append(field)
+            continue
+        if guidance == "CAN_BE_ASKED":
+            # optional, do not block
+            continue
+        # optional keys skip
+        if field in _OPTIONAL_KEYS:
+            continue
+        # if field looks like email/attendee, ask
+        if _looks_like_email_field(field):
+            missing_should.append(field)
+            continue
+        # otherwise skip
+        continue
+
+    # Validate email-like fields for basic format if present
+    invalid_email_fields: List[str] = []
+    for f in list(final.keys()):
+        if _looks_like_email_field(f):
+            norm = _normalize_email_list(final.get(f))
+            if not norm and not _is_empty(final.get(f)):
+                invalid_email_fields.append(f)
+            else:
+                final[f] = norm if norm else final.get(f)
+
+    if invalid_email_fields:
+        if len(invalid_email_fields) == 1:
+            return False, f"Could you share a valid email address for {invalid_email_fields[0]}?", final
+        else:
+            return False, f"Could you share valid email addresses for {', '.join(invalid_email_fields)}?", final
+
+    if missing_should:
+        priority = ["attendees", "email", "emails", "invitees", "phone", "contact", "name"]
+        chosen = None
+        for p in priority:
+            for m in missing_should:
+                if p in m.lower():
+                    chosen = m
+                    break
+            if chosen:
+                break
+        if not chosen:
+            chosen = missing_should[0]
+        q = f"Could you provide {chosen} so I can complete the booking?"
+        return False, q, final
+
+    return True, None, final
+
+def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template_obj: Any, ask_map: Dict[str, str], conversation: Optional[List[Dict[str, Any]]] = None, agent_prompt: str = "") -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Backwards-compatible wrapper that uses the deterministic resolver.
+    """
     if not isinstance(payload, dict):
         return False, "Payload must be a JSON object.", {}
     if not isinstance(template_obj, dict):
         return True, None, payload
+    # Ensure template keys exist in payload (allow empty so resolver can decide)
     for k in template_obj.keys():
         if k not in payload:
-            return False, f"Could you share the value for '{k}' to proceed?", payload
-    if "start_date_time" in template_obj and "end_date_time" in template_obj and _is_empty(payload.get("end_date_time")):
-        start_val = payload.get("start_date_time")
+            payload[k] = payload.get(k, "")
+    ok, question, final_payload = _resolve_fields_and_produce_question(template_obj, ask_map or {}, payload, conversation or [], agent_prompt or "")
+    # final end_date_time fill
+    if ok and "start_date_time" in final_payload and _is_empty(final_payload.get("end_date_time")) and "end_date_time" in template_obj:
+        start_val = final_payload.get("start_date_time")
         if isinstance(start_val, str):
             try:
                 dt = datetime.fromisoformat(start_val)
-                payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
+                final_payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
             except Exception:
                 pass
-    missing_required: List[str] = []
-    invalid_email_fields: List[str] = []
-    for field_path, guidance in (ask_map or {}).items():
-        if guidance != "SHOULD_BE_ASKED":
-            continue
-        parts = field_path.split(".")
-        cur: Any = payload
-        for p in parts:
-            if not isinstance(cur, dict) or p not in cur:
-                cur = None
-                break
-            cur = cur[p]
-        if _is_empty(cur):
-            missing_required.append(field_path)
-            continue
-        if _looks_like_email_field(parts[-1]):
-            emails = _normalize_email_list(cur)
-            if not emails:
-                invalid_email_fields.append(field_path)
-    if invalid_email_fields:
-        return False, "Please share a valid email address to proceed.", payload
-    if missing_required:
-        if len(missing_required) == 1:
-            return False, f"Could you share {missing_required[0]} to proceed?", payload
-        return False, f"Could you share {', '.join(missing_required[:-1])} and {missing_required[-1]} to proceed?", payload
-    return True, None, payload
+    return ok, question, final_payload
+
+# ---------------------------
+# End Field Resolution Engine
+# ---------------------------
 
 def _is_valid_api_url(u: str) -> bool:
     try:
@@ -286,8 +411,20 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 event_id = str(uuid.uuid4())
                 payload = dict(kwargs or {})
                 logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
-                # Validate
-                ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map)
+                # Determine conversation and agent_prompt context to pass to resolver.
+                # Prefer explicit kwargs override, otherwise fallback to runtime globals set before agent.invoke.
+                conversation_for_context = None
+                agent_prompt_for_context = None
+                if "_conversation" in payload:
+                    conversation_for_context = payload.pop("_conversation")
+                if "_agent_prompt" in payload:
+                    agent_prompt_for_context = payload.pop("_agent_prompt")
+                if conversation_for_context is None:
+                    conversation_for_context = globals().get("_CURRENT_RUNTIME_CONVERSATION", [])
+                if agent_prompt_for_context is None:
+                    agent_prompt_for_context = globals().get("_CURRENT_AGENT_PROMPT", "")
+                # Validate using the new resolver (passes conversation and agent prompt)
+                ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map, conversation_for_context, agent_prompt_for_context)
                 if not ok:
                     tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "needs_input": True, "question": question}
                     logger.log("tool.validation", f"api_tool_{_tool_id} needs user input", tool_result)
@@ -372,10 +509,16 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools = create_universal_tools(merged_config)
-    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
     # Build agent
     agent = create_react_agent(llm, tools, state_modifier=system_prompt)
     msgs = _to_messages(conversation_history, message)
+
+    # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
+    # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
+    globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
+    globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+
     try:
         # Log before model call
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
