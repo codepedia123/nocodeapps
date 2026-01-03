@@ -16,9 +16,11 @@ from fastapi.responses import JSONResponse
 
 # Upstash Redis (HTTP SDK)
 from upstash_redis import Redis as UpstashRedis
+from langgraph.prebuilt import create_react_agent
+
 
 # LangChain v1 agent loop
-from langchain.agents import create_agent
+
 from langchain.agents.middleware import (
     wrap_tool_call,
     before_agent,
@@ -635,20 +637,12 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o-mini", temperature=0)
 
     # 7. Create official agent graph with middleware for limits + logging + tool errors
-    agent_graph = create_agent(
-        model=llm,
-        tools=tools,
-        system_prompt=system_prompt,
-        middleware=[
-            mw_before_agent,
-            mw_before_model,
-            mw_after_model,
-            mw_after_agent,
-            mw_tool_errors_and_logging,
-            ModelCallLimitMiddleware(run_limit=10, exit_behavior="end"),
-            ToolCallLimitMiddleware(run_limit=10, exit_behavior="continue"),
-        ],
+    agent = create_react_agent(
+    llm,
+    tools,
+    state_modifier=system_prompt
     )
+
 
     # 8. Run agent
     msgs = _to_messages(conversation_history, message)
