@@ -50,8 +50,8 @@ logger = Logger()
 # ---------------------------
 _redis_client: Optional[UpstashRedis] = None
 try:
-    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "")
-    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    redis_url = "https://climbing-hyena-56303.upstash.io"
+    redis_token = "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM"
 
     # If you have local dev defaults, set them here, but never keep production secrets hardcoded
     if not redis_url or not redis_token:
