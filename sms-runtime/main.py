@@ -19,10 +19,11 @@ from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from pydantic import create_model, Field
+from langgraph.errors import GraphRecursionError
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
@@ -611,6 +612,18 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
         state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
         logger.log("agent.invoke.end", "Agent finished invoke")
+    except GraphRecursionError as ge:
+        # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
+        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
+        fallback_prompt = _state_modifier_fn({"variables": initial_vars})
+        try:
+            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_resp = llm.invoke(fallback_msgs)
+            reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
+        except Exception as le:
+            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
+            reply_text = f"Error: {str(ge)}"
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
         return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
