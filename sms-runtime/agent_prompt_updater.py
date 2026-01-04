@@ -3,13 +3,6 @@ import json
 import traceback
 import re
 from typing import List, Dict, Any, Optional, Annotated, TypedDict
-from urllib import request as urllib_request
-from urllib.error import URLError, HTTPError
-
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # Fallback to urllib when requests is unavailable
 from pydantic import BaseModel, Field
 
 # LangChain & LangGraph Imports
@@ -30,7 +23,7 @@ for key in ("inputs", "input", "payload"):
     if isinstance(candidate, dict) and candidate:
         data.update(candidate)
 
-for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key", "agent_id", "agentId", "agent"):
+for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key", "agent_id", "agentId", "agent", "when_run"):
     if k in _raw_globals and _raw_globals.get(k) not in (None, "", {}):
         if k not in data:
             data[k] = _raw_globals.get(k)
@@ -52,6 +45,10 @@ else:
         env_agent = os.getenv("AGENT_ID")
         if env_agent:
             data["agent_id"] = env_agent
+    if "when_run" not in data:
+        env_when = os.getenv("WHEN_RUN_JSON")
+        if env_when:
+            data["when_run"] = env_when
 
 long_text = data.get("long_text", "")
 user_message = data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
@@ -59,112 +56,59 @@ conversation = data.get("conversation", []) or data.get("chat_history", [])
 api_key_to_use = (data.get("api_key") or data.get("openai_api_key") or data.get("apiKey") or os.getenv("OPENAI_API_KEY"))
 
 # Helper utilities for tool management
-def _extract_agent_id_from_context() -> Optional[str]:
+def _parse_when_run_payload(raw_payload: Any) -> Dict[str, Any]:
     """
-    Attempts to locate an agent id in the form 'agent7' or 'agent 7' from
-    known inputs. Returns the numeric portion as a string, or None if missing.
+    Accepts a stringified JSON array or a list of objects shaped like:
+      [{"tool1": ["When Run 1", "When Run 2"]}, {"tool2": ["When Run A"]}]
+    Returns { "tools": [ { "tool_id": str, "when_run": list[str] } ], "error": Optional[str] }.
     """
-    candidates: List[str] = []
-    for key in ("agent_id", "agentId", "agent"):
-        val = data.get(key)
-        if isinstance(val, str):
-            candidates.append(val)
-        elif isinstance(val, (int, float)):
-            candidates.append(str(val))
+    if raw_payload is None or raw_payload == "":
+        return {"tools": [], "error": "No when_run payload provided."}
 
-    # Search the user message and long_text for patterns like 'agent7'
-    candidates.extend([user_message, long_text])
-    for turn in conversation:
-        content = turn.get("content") or turn.get("message") or ""
-        if isinstance(content, str):
-            candidates.append(content)
-
-    pattern = re.compile(r"agent\s*-?\s*(\d+)", flags=re.IGNORECASE)
-    for cand in candidates:
-        if not cand:
-            continue
-        m = pattern.search(str(cand))
-        if m:
-            return m.group(1)
-    return None
-
-
-def _split_when_run(raw: str) -> List[str]:
-    """
-    Splits a when_run string into a list. Primary delimiter is '|'.
-    If no delimiter is found, returns a single-item list when text exists.
-    """
-    if not raw:
-        return []
-    if "|" in raw:
-        parts = [p.strip() for p in raw.split("|") if p.strip()]
+    parsed = None
+    if isinstance(raw_payload, str):
+        try:
+            parsed = json.loads(raw_payload)
+        except Exception:
+            return {"tools": [], "error": "Invalid when_run JSON."}
+    elif isinstance(raw_payload, list):
+        parsed = raw_payload
     else:
-        parts = [raw.strip()] if raw.strip() else []
-    return parts
+        return {"tools": [], "error": "Unsupported when_run payload type."}
 
-
-def _http_get_json(url: str) -> Optional[Dict[str, Any]]:
-    try:
-        if requests:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
-        with urllib_request.urlopen(url, timeout=10) as resp:
-            if resp.status >= 400:
-                return None
-            data_bytes = resp.read()
-            return json.loads(data_bytes.decode("utf-8"))
-    except (URLError, HTTPError, json.JSONDecodeError, Exception):
-        return None
-
-
-def _http_post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        if requests:
-            resp = requests.post(url, json=payload, timeout=10)
-            return {"status": resp.status_code, "body": resp.text}
-        data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib_request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-        with urllib_request.urlopen(req, timeout=10) as resp:
-            return {"status": resp.status, "body": resp.read().decode("utf-8")}
-    except Exception as e:
-        return {"status": "error", "body": str(e)}
-
-
-def _fetch_tools_for_agent(agent_id_number: Optional[str]) -> Dict[str, Any]:
-    """
-    Fetches all tools and returns:
-    {
-        "tools": [ { "tool_id": str, "piece_id": str, "when_run": [..], "raw_when_run": str } ],
-        "error": Optional[str]
-    }
-    """
-    if not agent_id_number:
-        return {"tools": [], "error": "No agent id found in context."}
-
-    url = "https://adequate-compassion-production.up.railway.app/fetch?table=all-agents-tools"
-    payload = _http_get_json(url)
-    if not isinstance(payload, dict):
-        return {"tools": [], "error": "Failed to fetch tools for agent."}
+    if not isinstance(parsed, list):
+        return {"tools": [], "error": "when_run payload must be a list of objects."}
 
     tools: List[Dict[str, Any]] = []
-    for db_id, tool in payload.items():
-        try:
-            tool_agent_id = str(tool.get("agent_id", "")).strip()
-        except Exception:
-            tool_agent_id = ""
-        if not tool_agent_id or tool_agent_id != str(agent_id_number):
+    for entry in parsed:
+        if not isinstance(entry, dict):
             continue
-
-        when_raw = tool.get("when_run") or ""
-        tools.append({
-            "tool_id": str(db_id),
-            "piece_id": tool.get("piece-id") or tool.get("piece_id"),
-            "when_run": _split_when_run(when_raw),
-            "raw_when_run": when_raw
-        })
-
+        for key, val in entry.items():
+            if not key:
+                continue
+            if isinstance(val, list):
+                cleaned = [str(x) for x in val if str(x).strip()]
+            elif isinstance(val, str):
+                cleaned = [v for v in [val.strip()] if v]
+            else:
+                cleaned = []
+            tools.append({"tool_id": str(key), "when_run": cleaned})
+    if not tools:
+        return {"tools": [], "error": "No valid tools found in when_run payload."}
     return {"tools": tools, "error": None}
+
+
+def _serialize_tools_catalog(tools_catalog: List[Dict[str, Any]]) -> str:
+    """
+    Converts internal tools catalog back to the expected stringified JSON array format:
+      [{"tool1":["...","..."]},{"tool2":["..."]}]
+    """
+    output = []
+    for tool in tools_catalog:
+        tool_id = tool.get("tool_id")
+        when = tool.get("when_run") or []
+        output.append({tool_id: when})
+    return json.dumps(output, ensure_ascii=True)
 
 # ------------------------------------------------------------------
 # 2. DEFINE THE STATE & TOOLS
@@ -178,7 +122,8 @@ class AgentState(TypedDict):
     is_updated: bool
     error_log: Optional[str]  # Added to track why an update might fail
     tools_catalog: Optional[List[Dict[str, Any]]]
-    agent_id_number: Optional[str]
+    tools_change_summary: Optional[List[str]]
+    when_run_updated: bool
 
 @tool
 def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str, anchor_for_insertion: Optional[str] = None):
@@ -216,9 +161,9 @@ def insert_after_anchor_tool(anchor_snippet: str, insertion_text: str, explanati
 @tool
 def update_when_run_tool(tool_id: str, scenario_updates: List[Dict[str, Any]], explanation: str):
     """
-    Requests updates to a tool's when_run scenarios for the current agent.
+    Requests updates to a tool's when_run scenarios for the current agent payload (no remote calls).
     Provide 'scenario_updates' as a list of {'index': 1-based index to replace or append, 'text': full replacement scenario}.
-    Only request this when changing when_run is essential to satisfy the user's update.
+    Only request this when changing when_run is essential to satisfy the user's update and stays within the provided tool arrays.
     """
     return {
         "status": "planned",
@@ -237,9 +182,10 @@ def run_updater_agent():
         return {"error": "Missing 'api_key' in request payload."}
 
     try:
-        agent_id_number = _extract_agent_id_from_context()
-        tool_fetch_result = _fetch_tools_for_agent(agent_id_number)
-        tools_catalog = tool_fetch_result.get("tools") or []
+        when_run_payload = data.get("when_run")
+        tool_parse_result = _parse_when_run_payload(when_run_payload)
+        tools_catalog = tool_parse_result.get("tools") or []
+        tools_parse_error = tool_parse_result.get("error")
 
         # Initialize LLM
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
@@ -262,19 +208,20 @@ def run_updater_agent():
                 "6. Your 'explanation' must be a clear, descriptive summary of the change.\n"
                 "7. Keep changes minimal: avoid expanding the prompt unless the user explicitly asks for more detail.\n"
                 "8. If content already exists in the document, update it instead of inserting a duplicate.\n\n"
-                "TOOLS CATALOG (agent {agent}):\n{tools}\n\n"
+                "TOOLS CATALOG (from input):\n{tools}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
                 "- Update a tool's when_run scenarios ONLY when it is necessary to fulfill the user's requested change.\n"
                 "- Prefer editing existing scenarios; append a new one only when clearly required and with minimal wording.\n"
-                "- Use the exact 'tool_id' from the catalog when calling 'update_when_run_tool'.\n"
+                "- Use the exact 'tool_id' from the catalog when calling 'update_when_run_tool'. Do not invent new tools.\n"
                 "- Call 'update_when_run_tool' with 1-based 'index' entries for every scenario you change; supply the full replacement text for each index.\n"
                 "- Provide the full replacement scenario text for every index you modify (no partial fragments).\n"
                 "- If you need to add a scenario, use index = current_length + 1 (no gaps). Do not invent indices.\n"
                 "- Only change when_run entries that align the tool trigger with the requested behavior; avoid unrelated changes.\n"
+                "- Never expand beyond the provided tool arrays; no external fetch or updates are available.\n"
                 "- Always include an 'explanation' describing why the when_run change is essential.\n\n"
                 f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
-            ).format(agent=state.get("agent_id_number") or "unknown", tools=tools_json))
+            ).format(tools=tools_json))
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
 
@@ -324,6 +271,8 @@ def run_updater_agent():
             updated = state.get("is_updated", False)
             err = state.get("error_log")
             tools_catalog = state.get("tools_catalog") or []
+            tools_summary = state.get("tools_change_summary") or []
+            when_run_updated = state.get("when_run_updated", False)
 
             # Normalize potential tool calls representation
             tool_calls = []
@@ -344,6 +293,10 @@ def run_updater_agent():
                 def _append_summary(text: str):
                     if text:
                         summary.append(text)
+
+                def _append_tool_summary(text: str):
+                    if text:
+                        tools_summary.append(text)
 
                 # Patch action
                 if name == "patch_document_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "patch_document_tool"):
@@ -415,18 +368,18 @@ def run_updater_agent():
 
                     if not tool_id:
                         err = "Missing tool_id for when_run update."
-                        _append_summary(expl or err)
+                        _append_tool_summary(expl or err)
                         continue
 
                     if not isinstance(scenario_updates, list) or not scenario_updates:
                         err = f"No scenario_updates provided for tool {tool_id}."
-                        _append_summary(expl or err)
+                        _append_tool_summary(expl or err)
                         continue
 
                     target_tool = next((t for t in tools_catalog if str(t.get("tool_id")) == tool_id), None)
                     if not target_tool:
                         err = f"Tool {tool_id} not found for current agent."
-                        _append_summary(expl or err)
+                        _append_tool_summary(expl or err)
                         continue
 
                     current_when = list(target_tool.get("when_run") or [])
@@ -457,35 +410,20 @@ def run_updater_agent():
                             out_of_range_note = err
 
                     if not changed:
-                        _append_summary(expl or "No when_run changes applied.")
+                        _append_tool_summary(expl or "No when_run changes applied.")
                         continue
 
                     new_when_raw = "|".join(current_when)
                     target_tool["when_run"] = current_when
-                    target_tool["raw_when_run"] = new_when_raw
-
-                    update_payload = {
-                        "table": "all-agents-tools",
-                        "id": tool_id,
-                        "updates": {"when_run": new_when_raw}
-                    }
-                    update_resp = _http_post_json("https://adequate-compassion-production.up.railway.app/update", update_payload)
-
-                    resp_status = update_resp.get("status")
-                    status_line = f"when_run for tool {tool_id} updated (status={resp_status})."
-                    is_error_status = (resp_status == "error") or (isinstance(resp_status, int) and resp_status >= 400)
-                    if is_error_status:
-                        err = f"Update call failed for tool {tool_id}: {update_resp.get('body')}"
-                        _append_summary(err)
+                    if out_of_range_note:
+                        _append_tool_summary(out_of_range_note)
+                    _append_tool_summary(expl or f"when_run for tool {tool_id} updated locally.")
+                    when_run_updated = True
+                    updated = True
+                    if out_of_range:
+                        err = err or "One or more indices were out of range."
                     else:
-                        if out_of_range_note:
-                            _append_summary(out_of_range_note)
-                        _append_summary(expl or status_line)
-                        updated = True
-                        if out_of_range:
-                            err = err or "One or more indices were out of range."
-                        else:
-                            err = None
+                        err = None
 
                 else:
                     # Unknown tool name: capture for diagnostics
@@ -497,7 +435,9 @@ def run_updater_agent():
                 "change_summary": summary,
                 "is_updated": updated,
                 "error_log": err,
-                "tools_catalog": tools_catalog
+                "tools_catalog": tools_catalog,
+                "tools_change_summary": tools_summary,
+                "when_run_updated": when_run_updated
             }
 
         # 3. BUILD THE GRAPH
@@ -539,9 +479,10 @@ def run_updater_agent():
             "document": long_text,
             "change_summary": [],
             "is_updated": False,
-            "error_log": None,
+            "error_log": tools_parse_error,
             "tools_catalog": tools_catalog,
-            "agent_id_number": agent_id_number
+            "tools_change_summary": [],
+            "when_run_updated": False
         }
 
         final_state = app.invoke(inputs)
@@ -554,12 +495,16 @@ def run_updater_agent():
         if final_state.get("is_updated"):
             # Scenario A: Tool worked perfectly
             summary = "; ".join(final_state.get("change_summary") or [])
-            final_reply = f"I have updated the text as requested. {summary}".strip()
+            tool_summary = "; ".join(final_state.get("tools_change_summary") or [])
+            combined = "; ".join([s for s in [summary, tool_summary] if s])
+            final_reply = f"I have updated the text as requested. {combined}".strip()
         elif final_state.get("error_log"):
             # Scenario B: Tool was called but the snippet didn't match
             summary = "; ".join(final_state.get("change_summary") or [])
+            tool_summary = "; ".join(final_state.get("tools_change_summary") or [])
+            combined = "; ".join([s for s in [summary, tool_summary] if s])
             final_reply = (
-                f"I tried to make the following change: '{summary}', but hit an issue: {final_state.get('error_log')}. "
+                f"I tried to make the following change: '{combined}', but hit an issue: {final_state.get('error_log')}. "
                 "For document edits, ensure the snippet or anchor (for example '# Notes:' or '# Task:') is present. "
                 "For tool updates, verify the tool_id and 1-based when_run indices match the catalog."
             )
@@ -578,6 +523,9 @@ def run_updater_agent():
             "updated_long_text": final_state.get("document"),
             "is_updated": final_state.get("is_updated"),
             "change_summary": final_state.get("change_summary"),
+            "tools_change_summary": final_state.get("tools_change_summary"),
+            "when_run_updated": final_state.get("when_run_updated"),
+            "current_when_run_json": _serialize_tools_catalog(final_state.get("tools_catalog") or []),
             "error_details": final_state.get("error_log")
         }
 
