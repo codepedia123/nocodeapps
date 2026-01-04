@@ -22,7 +22,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-from pydantic import create_model, Field
+from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 
 # Minimal dynamic config
@@ -252,15 +252,22 @@ def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
 # ---------------------------
 # Variable management tool
 # ---------------------------
-def manage_variables(updates: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+class ManageVariablesArgs(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    updates: Optional[Dict[str, str]] = None
+
+def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Dict[str, Dict[str, str]]:
     """
     Use this tool to save, update, or create variables in your internal memory.
-    Example: {'user_preference': 'prefers_email'}
+    Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
     """
-    if not isinstance(updates, dict):
-        updates = {}
+    merged: Dict[str, str] = {}
+    if isinstance(updates, dict):
+        merged.update(updates)
+    for k, v in (kwargs or {}).items():
+        merged[str(k)] = "" if v is None else str(v)
     sanitized: Dict[str, str] = {}
-    for k, v in updates.items():
+    for k, v in merged.items():
         if k is None:
             continue
         sanitized[str(k)] = "" if v is None else str(v)
@@ -271,6 +278,7 @@ MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
     func=manage_variables,
     name="manage_variables",
     description="Use this tool to save, update, or create variables in memory for later turns."
+    ,args_schema=ManageVariablesArgs
 )
 
 # ---------------------------
