@@ -609,7 +609,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     try:
         # Log before model call
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
-        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False})
+        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
         logger.log("agent.invoke.end", "Agent finished invoke")
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
