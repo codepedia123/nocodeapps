@@ -30,7 +30,7 @@ for key in ("inputs", "input", "payload"):
     if isinstance(candidate, dict) and candidate:
         data.update(candidate)
 
-for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key"):
+for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key", "agent_id", "agentId", "agent"):
     if k in _raw_globals and _raw_globals.get(k) not in (None, "", {}):
         if k not in data:
             data[k] = _raw_globals.get(k)
@@ -46,6 +46,12 @@ if not data:
                     data.update(parsed)
                     break
             except: pass
+else:
+    # Secondary env fallback for agent id if provided separately
+    if "agent_id" not in data:
+        env_agent = os.getenv("AGENT_ID")
+        if env_agent:
+            data["agent_id"] = env_agent
 
 long_text = data.get("long_text", "")
 user_message = data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
