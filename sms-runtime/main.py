@@ -585,7 +585,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             vars_str = str(current_vars)
         return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
 
-    def _state_modifier_fn(state: AgentState) -> Dict[str, Any]:
+    def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
         try:
             if isinstance(state, dict):
@@ -593,18 +593,12 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         except Exception:
             current_vars = {}
         system_msg = SystemMessage(content=_render_system_prompt(current_vars))
-        messages = []
-        base_state: Dict[str, Any] = {}
+        messages: List[Any] = []
         if isinstance(state, dict):
-            base_state = dict(state)
-            messages = base_state.get("messages", []) or []
+            messages = state.get("messages", []) or []
         # Avoid stacking multiple system messages across steps
         filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        base_state["messages"] = [system_msg] + filtered
-        base_state["variables"] = current_vars
-        if "is_last_step" not in base_state:
-            base_state["is_last_step"] = False
-        return base_state
+        return [system_msg] + filtered
     fetched_tools = fetch_agent_tools(str(agent_id))
     merged_config = dict(DYNAMIC_CONFIG)
     if isinstance(fetched_tools, dict):
