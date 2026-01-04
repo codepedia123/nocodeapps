@@ -207,7 +207,8 @@ def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
         return out
     for m in re.finditer(r"'([^']+)'.*?AskGuidance=([A-Z_]+)", instructions_text):
         field_path = m.group(1).strip()
-        guidance = m.group(2).strip()
+        guidance_raw = m.group(2).strip()
+        guidance = "SHOULD_BE_ASKED" if guidance_raw == "SHOULD_BE_ASKED" else "NOT_TO_BE_ASKED"
         if field_path:
             out[field_path] = guidance
     return out
