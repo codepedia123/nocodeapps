@@ -578,18 +578,33 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
         "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
     )
-    def _state_modifier_fn(state: AgentState) -> str:
+    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
+        try:
+            vars_str = json.dumps(current_vars, ensure_ascii=False)
+        except Exception:
+            vars_str = str(current_vars)
+        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    def _state_modifier_fn(state: AgentState) -> Dict[str, Any]:
         current_vars: Dict[str, Any] = {}
         try:
             if isinstance(state, dict):
                 current_vars = state.get("variables", {}) or {}
         except Exception:
             current_vars = {}
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        messages = []
+        base_state: Dict[str, Any] = {}
+        if isinstance(state, dict):
+            base_state = dict(state)
+            messages = base_state.get("messages", []) or []
+        # Avoid stacking multiple system messages across steps
+        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
+        base_state["messages"] = [system_msg] + filtered
+        base_state["variables"] = current_vars
+        if "is_last_step" not in base_state:
+            base_state["is_last_step"] = False
+        return base_state
     fetched_tools = fetch_agent_tools(str(agent_id))
     merged_config = dict(DYNAMIC_CONFIG)
     if isinstance(fetched_tools, dict):
@@ -615,7 +630,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     except GraphRecursionError as ge:
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = _state_modifier_fn({"variables": initial_vars})
+        fallback_prompt = _render_system_prompt(initial_vars)
         try:
             fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
