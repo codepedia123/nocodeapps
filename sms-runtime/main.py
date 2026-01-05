@@ -602,6 +602,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
         "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
         "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
     )
     def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
         try:
