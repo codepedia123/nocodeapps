@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.graph import MessagesState
+from langgraph.types import Command
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -256,7 +257,7 @@ class ManageVariablesArgs(BaseModel):
     model_config = ConfigDict(extra="allow")
     updates: Optional[Dict[str, str]] = None
 
-def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Dict[str, Dict[str, str]]:
+def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Command:
     """
     Use this tool to save, update, or create variables in your internal memory.
     Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
@@ -271,8 +272,8 @@ def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) ->
         if k is None:
             continue
         sanitized[str(k)] = "" if v is None else str(v)
-    # Returning this shape allows LangGraph to merge into the 'variables' state
-    return {"variables": sanitized}
+    # Update LangGraph state and also return a tool-visible output
+    return Command(update={"variables": sanitized}, output={"variables": sanitized})
 
 MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
     func=manage_variables,
