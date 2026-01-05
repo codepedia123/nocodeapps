@@ -212,6 +212,8 @@ def run_updater_agent():
                 "WHEN_RUN UPDATE RULES:\n"
                 "- Update a tool's when_run scenarios ONLY when it is necessary to fulfill the user's requested change.\n"
                 "- Prefer editing existing scenarios; append a new one only when clearly required and with minimal wording.\n"
+                "- Read and understand the format of the current when_run scenarios before making changes.\n"
+                "- When user changes query indirectly directs to update the sceneiro in which the tool should run, or thier behaviour ( basicaly udpating the when_run ) do update it then too"
                 "- Use the exact 'tool_id' from the catalog when calling 'update_when_run_tool'. Do not invent new tools.\n"
                 "- Call 'update_when_run_tool' with 1-based 'index' entries for every scenario you change; supply the full replacement text for each index.\n"
                 "- Provide the full replacement scenario text for every index you modify (no partial fragments).\n"
