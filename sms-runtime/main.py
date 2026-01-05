@@ -6,8 +6,7 @@ import traceback
 import urllib.parse
 import re
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Annotated
-from operator import ior
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from fastapi import FastAPI, Request
@@ -15,24 +14,16 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
-from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.graph import MessagesState
+from langgraph.prebuilt import create_react_agent
 
 from langchain_core.tools import StructuredTool
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
-from pydantic import create_model, Field, BaseModel, ConfigDict
-from langgraph.errors import GraphRecursionError
+from pydantic import create_model, Field
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
-
-class AgentState(MessagesState):
-    # This stores the dynamic variables in agent memory and merges updates
-    variables: Annotated[Dict[str, str], ior]
-    # Flag used by LangGraph prebuilt agents; keep default False
-    is_last_step: bool = False
 
 # Simple logger
 class Logger:
@@ -210,33 +201,6 @@ def _normalize_email_list(value: Any) -> List[str]:
         return [value]
     return []
 
-def _variables_array_to_dict(variables: Any) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    if isinstance(variables, dict):
-        for k, v in variables.items():
-            if k is None:
-                continue
-            out[str(k)] = "" if v is None else str(v)
-        return out
-    if not isinstance(variables, list):
-        return out
-    for item in variables:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name") or item.get("key")
-        if name is None:
-            continue
-        out[str(name)] = "" if item.get("value") is None else str(item.get("value"))
-    return out
-
-def _variables_dict_to_array(variables: Any) -> List[Dict[str, str]]:
-    if not isinstance(variables, dict):
-        return []
-    arr: List[Dict[str, str]] = []
-    for k, v in variables.items():
-        arr.append({"name": str(k), "value": "" if v is None else str(v)})
-    return arr
-
 def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not instructions_text:
@@ -248,38 +212,6 @@ def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
         if field_path:
             out[field_path] = guidance
     return out
-
-# ---------------------------
-# Variable management tool
-# ---------------------------
-class ManageVariablesArgs(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    updates: Optional[Dict[str, str]] = None
-
-def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Dict[str, Dict[str, str]]:
-    """
-    Use this tool to save, update, or create variables in your internal memory.
-    Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
-    """
-    merged: Dict[str, str] = {}
-    if isinstance(updates, dict):
-        merged.update(updates)
-    for k, v in (kwargs or {}).items():
-        merged[str(k)] = "" if v is None else str(v)
-    sanitized: Dict[str, str] = {}
-    for k, v in merged.items():
-        if k is None:
-            continue
-        sanitized[str(k)] = "" if v is None else str(v)
-    # Returning this shape allows LangGraph to merge into the 'variables' state
-    return {"variables": sanitized}
-
-MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
-    func=manage_variables,
-    name="manage_variables",
-    description="Use this tool to save, update, or create variables in memory for later turns."
-    ,args_schema=ManageVariablesArgs
-)
 
 # ---------------------------
 # Field Resolution Engine (NEW)
@@ -476,7 +408,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
             except Exception:
                 DynamicArgsModel = None
         def _make_api_call_factory(_tool_id: str, _api_url: str, _tpl_obj: Any, _ask_map: Dict[str, str]):
-            def make_api_call(state: Annotated[dict, InjectedState], **kwargs) -> str:
+            def make_api_call(**kwargs) -> str:
                 event_id = str(uuid.uuid4())
                 payload = dict(kwargs or {})
                 logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
@@ -492,12 +424,6 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     conversation_for_context = globals().get("_CURRENT_RUNTIME_CONVERSATION", [])
                 if agent_prompt_for_context is None:
                     agent_prompt_for_context = globals().get("_CURRENT_AGENT_PROMPT", "")
-                current_vars: Dict[str, Any] = {}
-                try:
-                    if isinstance(state, dict):
-                        current_vars = state.get("variables", {}) or {}
-                except Exception:
-                    current_vars = {}
                 # Validate using the new resolver (passes conversation and agent prompt)
                 ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map, conversation_for_context, agent_prompt_for_context)
                 if not ok:
@@ -509,14 +435,6 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
                     return json.dumps(error_data, ensure_ascii=False)
                 try:
-                    if isinstance(payload2, dict):
-                        context_vars: Dict[str, Any] = {}
-                        existing_ctx = payload2.get("context_variables")
-                        if isinstance(existing_ctx, dict):
-                            context_vars.update(existing_ctx)
-                        if isinstance(current_vars, dict):
-                            context_vars.update(current_vars)
-                        payload2["context_variables"] = context_vars
                     resp = requests.post(_api_url, json=payload2, timeout=20)
                     try:
                         response_data = resp.json()
@@ -559,14 +477,13 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
-    initial_vars = _variables_array_to_dict(variables)
     agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list()}
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -576,7 +493,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         api_key_to_use = os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
-        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list()}
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
     system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
         "Runtime rulebook for planning and tool calls.\n"
@@ -586,37 +503,16 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
         "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
     )
-    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
-
-    def _state_modifier_fn(state: AgentState) -> List[Any]:
-        current_vars: Dict[str, Any] = {}
-        try:
-            if isinstance(state, dict):
-                current_vars = state.get("variables", {}) or {}
-        except Exception:
-            current_vars = {}
-        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
-        messages: List[Any] = []
-        if isinstance(state, dict):
-            messages = state.get("messages", []) or []
-        # Avoid stacking multiple system messages across steps
-        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        return [system_msg] + filtered
     fetched_tools = fetch_agent_tools(str(agent_id))
     merged_config = dict(DYNAMIC_CONFIG)
     if isinstance(fetched_tools, dict):
         for tid, tcfg in fetched_tools.items():
             merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    tools = create_universal_tools(merged_config)
     llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
     # Build agent
-    agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    agent = create_react_agent(llm, tools, state_modifier=system_prompt)
     msgs = _to_messages(conversation_history, message)
 
     # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
@@ -627,23 +523,11 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     try:
         # Log before model call
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
-        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
+        state = agent.invoke({"messages": msgs})
         logger.log("agent.invoke.end", "Agent finished invoke")
-    except GraphRecursionError as ge:
-        # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
-        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = _render_system_prompt(initial_vars)
-        try:
-            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
-            fallback_resp = llm.invoke(fallback_msgs)
-            reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
-        except Exception as le:
-            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
-            reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list()}
     # Extract last assistant message
     reply_text = ""
     try:
@@ -661,12 +545,6 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             reply_text = "Done."
     except Exception:
         reply_text = "Done."
-    final_variables_dict = initial_vars
-    try:
-        if isinstance(state, dict) and isinstance(state.get("variables"), dict):
-            final_variables_dict = state.get("variables", initial_vars) or initial_vars
-    except Exception:
-        final_variables_dict = initial_vars
     # Detect if any tool result asked for more input and surface question
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
@@ -678,7 +556,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_array(final_variables_dict)}
+                        return {"reply": str(q), "logs": logger.to_list()}
     except Exception:
         pass
     # Compact trace for logs
@@ -696,7 +574,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_array(final_variables_dict)}
+    return {"reply": reply_text, "logs": logger.to_list()}
 
 # ---------------------------
 # FastAPI app
@@ -716,13 +594,12 @@ async def run_endpoint(request: Request):
         return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
     message = body.get("message", "")
     conversation = body.get("conversation", [])
-    variables_payload = body.get("variables", [])
-    res = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    res = run_agent(str(agent_id), conversation, str(message))
     return JSONResponse(res)
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
 if "inputs" in globals():
     data = globals().get("inputs", {})
     agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
-    _out = run_agent(str(agent_id), data.get("conversation", []), data.get("message", ""), data.get("variables", []))
+    _out = run_agent(str(agent_id), data.get("conversation", []), data.get("message", ""))
     globals()["result"] = _out
