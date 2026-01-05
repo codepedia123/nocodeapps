@@ -229,13 +229,13 @@ def _variables_array_to_dict(variables: Any) -> Dict[str, str]:
         out[str(name)] = "" if item.get("value") is None else str(item.get("value"))
     return out
 
-def _variables_dict_to_array(variables: Any) -> List[Dict[str, str]]:
+def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
     if not isinstance(variables, dict):
-        return []
-    arr: List[Dict[str, str]] = []
+        return {}
+    out: Dict[str, str] = {}
     for k, v in variables.items():
-        arr.append({"name": str(k), "value": "" if v is None else str(v)})
-    return arr
+        out[str(k)] = "" if v is None else str(v)
+    return out
 
 def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -583,7 +583,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -593,7 +593,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         api_key_to_use = os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
-        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
     system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
         "Runtime rulebook for planning and tool calls.\n"
@@ -661,10 +661,10 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         except Exception as le:
             logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_array(initial_vars)}
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     # Extract last assistant message
     reply_text = ""
     try:
@@ -703,7 +703,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_array(final_variables_dict)}
+                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
     except Exception:
         pass
     # Compact trace for logs
@@ -721,7 +721,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_array(final_variables_dict)}
+    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
 
 # ---------------------------
 # FastAPI app
