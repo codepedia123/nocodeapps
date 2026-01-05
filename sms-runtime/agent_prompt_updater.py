@@ -196,7 +196,7 @@ def run_updater_agent():
         def call_model(state: AgentState):
             tools_json = json.dumps(state.get("tools_catalog") or [], ensure_ascii=True)
             # Add explicit guidance to be conservative and prefer precise updates
-            sys_msg = SystemMessage(content=(
+            sys_msg_content = (
                 "You are a professional Editor.\n"
                 "IMPORTANT EDITING RULES (READ CAREFULLY):\n"
                 "1. Default to 'patch_document_tool' to update existing text precisely and keep overall length conservative.\n"
@@ -208,7 +208,7 @@ def run_updater_agent():
                 "6. Your 'explanation' must be a clear, descriptive summary of the change.\n"
                 "7. Keep changes minimal: avoid expanding the prompt unless the user explicitly asks for more detail.\n"
                 "8. If content already exists in the document, update it instead of inserting a duplicate.\n\n"
-                "TOOLS CATALOG (from input):\n{tools}\n\n"
+                f"TOOLS CATALOG (from input):\n{tools_json}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
                 "- Update a tool's when_run scenarios ONLY when it is necessary to fulfill the user's requested change.\n"
                 "- Prefer editing existing scenarios; append a new one only when clearly required and with minimal wording.\n"
@@ -221,7 +221,8 @@ def run_updater_agent():
                 "- Always include an 'explanation' describing why the when_run change is essential.\n\n"
                 f"CURRENT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
-            ).format(tools=tools_json))
+            )
+            sys_msg = SystemMessage(content=sys_msg_content)
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
 
