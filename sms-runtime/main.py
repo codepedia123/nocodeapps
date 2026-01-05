@@ -17,7 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.graph import MessagesState
-from langgraph.types import Command
+try:
+    from langgraph.types import Command as LGCommand
+except Exception:
+    LGCommand = None
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -257,7 +260,7 @@ class ManageVariablesArgs(BaseModel):
     model_config = ConfigDict(extra="allow")
     updates: Optional[Dict[str, str]] = None
 
-def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Command:
+def manage_variables(state: Annotated[dict, InjectedState], updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Any:
     """
     Use this tool to save, update, or create variables in your internal memory.
     Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
@@ -272,8 +275,17 @@ def manage_variables(updates: Optional[Dict[str, str]] = None, **kwargs: Any) ->
         if k is None:
             continue
         sanitized[str(k)] = "" if v is None else str(v)
-    # Update LangGraph state and also return a tool-visible output
-    return Command(update={"variables": sanitized}, output={"variables": sanitized})
+    # Attempt to update state in-place for older LangGraph versions
+    if isinstance(state, dict):
+        current = state.get("variables", {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update(sanitized)
+        state["variables"] = current
+    # Update LangGraph state if Command is available, otherwise return a plain dict
+    if LGCommand is not None:
+        return LGCommand(update={"variables": sanitized}, output={"variables": sanitized})
+    return {"variables": sanitized}
 
 MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
     func=manage_variables,
