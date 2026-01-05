@@ -17,10 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.graph import MessagesState
-try:
-    from langgraph.types import Command as LGCommand
-except Exception:
-    LGCommand = None
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -260,7 +256,7 @@ class ManageVariablesArgs(BaseModel):
     model_config = ConfigDict(extra="allow")
     updates: Optional[Dict[str, str]] = None
 
-def manage_variables(state: Annotated[dict, InjectedState], updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Any:
+def manage_variables(state: Optional[dict] = None, updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Any:
     """
     Use this tool to save, update, or create variables in your internal memory.
     Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
@@ -275,16 +271,19 @@ def manage_variables(state: Annotated[dict, InjectedState], updates: Optional[Di
         if k is None:
             continue
         sanitized[str(k)] = "" if v is None else str(v)
-    # Attempt to update state in-place for older LangGraph versions
+    # Update process-level runtime state for this request
+    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+    if not isinstance(runtime_vars, dict):
+        runtime_vars = {}
+    runtime_vars.update(sanitized)
+    globals()["_CURRENT_AGENT_VARIABLES"] = runtime_vars
+    # If state is injected (newer LangGraph), update it too
     if isinstance(state, dict):
         current = state.get("variables", {})
         if not isinstance(current, dict):
             current = {}
         current.update(sanitized)
         state["variables"] = current
-    # Update LangGraph state if Command is available, otherwise return a plain dict
-    if LGCommand is not None:
-        return LGCommand(update={"variables": sanitized}, output={"variables": sanitized})
     return {"variables": sanitized}
 
 MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
@@ -489,7 +488,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
             except Exception:
                 DynamicArgsModel = None
         def _make_api_call_factory(_tool_id: str, _api_url: str, _tpl_obj: Any, _ask_map: Dict[str, str]):
-            def make_api_call(state: Annotated[dict, InjectedState], **kwargs) -> str:
+            def make_api_call(state: Annotated[Optional[dict], InjectedState] = None, **kwargs) -> str:
                 event_id = str(uuid.uuid4())
                 payload = dict(kwargs or {})
                 logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
@@ -511,6 +510,10 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                         current_vars = state.get("variables", {}) or {}
                 except Exception:
                     current_vars = {}
+                if not current_vars:
+                    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+                    if isinstance(runtime_vars, dict):
+                        current_vars = runtime_vars
                 # Validate using the new resolver (passes conversation and agent prompt)
                 ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map, conversation_for_context, agent_prompt_for_context)
                 if not ok:
@@ -576,6 +579,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
+    globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
     agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
@@ -613,6 +617,10 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                 current_vars = state.get("variables", {}) or {}
         except Exception:
             current_vars = {}
+        if not current_vars:
+            runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+            if isinstance(runtime_vars, dict):
+                current_vars = runtime_vars
         system_msg = SystemMessage(content=_render_system_prompt(current_vars))
         messages: List[Any] = []
         if isinstance(state, dict):
@@ -680,6 +688,10 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             final_variables_dict = state.get("variables", initial_vars) or initial_vars
     except Exception:
         final_variables_dict = initial_vars
+    if not final_variables_dict:
+        runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+        if isinstance(runtime_vars, dict):
+            final_variables_dict = runtime_vars
     # Detect if any tool result asked for more input and surface question
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
