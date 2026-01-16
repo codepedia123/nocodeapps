@@ -725,8 +725,13 @@ async def int_endpoint(request: Request, file: str):
     except Exception:
         pass
 
-    payload = body.get("payload", {})
-    input_data = body.get("input", {})
+    raw_body = body if isinstance(body, dict) else {}
+    if isinstance(raw_body, dict) and "payload" not in raw_body and "input" not in raw_body:
+        payload = raw_body
+        input_data = {}
+    else:
+        payload = raw_body.get("payload", {})
+        input_data = raw_body.get("input", {})
     combined_input = {}
     if isinstance(payload, dict):
         combined_input.update(payload)
