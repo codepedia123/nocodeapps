@@ -212,6 +212,21 @@ def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
         logger.log("fetch.convo.exception", "Error fetching conversation by phone", {"phone": phone, "error": str(e)})
         return None
 
+def _hset_map(client: UpstashRedis, key: str, mapping: Dict[str, Any]) -> None:
+    if not mapping:
+        return
+    clean_map: Dict[str, str] = {}
+    for fld, val in mapping.items():
+        if isinstance(val, (dict, list)):
+            clean_map[fld] = json.dumps(val)
+        elif val is None:
+            clean_map[fld] = ""
+        elif isinstance(val, bool):
+            clean_map[fld] = "1" if val else "0"
+        else:
+            clean_map[fld] = str(val)
+    client.hset(key, values=clean_map)
+
 def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Optional[str]:
     if not _redis_client:
         logger.log("save.convo.no_redis", "Redis client not available", {})
@@ -235,7 +250,7 @@ def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Opt
             to_store[k] = str(v)
         _redis_client.sadd(ids_key, row_id)
         if to_store:
-            _redis_client.hset(row_key, to_store)
+            _hset_map(_redis_client, row_key, to_store)
         logger.log("save.convo", "Conversation upserted", {"row_id": row_id})
         return row_id
     except Exception as e:
