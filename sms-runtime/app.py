@@ -778,6 +778,10 @@ async def int_endpoint(request: Request, file: str):
         exec(compile(code, str(target), "exec"), env)
 
         result = env.get("result")
+        if isinstance(result, str):
+            stripped = result.lstrip()
+            if stripped.startswith("<?xml") or stripped.startswith("<Response"):
+                return Response(content=result, media_type="application/xml")
         if result is not None:
             return {"result": result, "output": redirected_output.getvalue().strip()}
 
