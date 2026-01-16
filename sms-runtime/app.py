@@ -709,6 +709,22 @@ async def int_endpoint(request: Request, file: str):
     except:
         body = {}
 
+    # Merge URL query params (excluding "file") into inputs
+    query_data = {}
+    try:
+        for key, value in request.query_params.multi_items():
+            if key == "file":
+                continue
+            if key in query_data:
+                if isinstance(query_data[key], list):
+                    query_data[key].append(value)
+                else:
+                    query_data[key] = [query_data[key], value]
+            else:
+                query_data[key] = value
+    except Exception:
+        pass
+
     payload = body.get("payload", {})
     input_data = body.get("input", {})
     combined_input = {}
@@ -716,6 +732,8 @@ async def int_endpoint(request: Request, file: str):
         combined_input.update(payload)
     if isinstance(input_data, dict):
         combined_input.update(input_data)
+    if query_data:
+        combined_input.update(query_data)
 
     # === ONLY hourly A2P job runs in background ===
     if target.stem == "a2p-profile-every-hour-check-runtime":
@@ -749,7 +767,8 @@ async def int_endpoint(request: Request, file: str):
             "__file__": str(target),
             "inputs": combined_input,        # ← now defined!
             "payload": payload,
-            "input": input_data
+            "input": input_data,
+            "query": query_data
         }
         exec(compile(code, str(target), "exec"), env)
 
