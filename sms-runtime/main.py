@@ -176,6 +176,75 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ---------------------------
+# Conversation persistence helpers (all_conversations table)
+# ---------------------------
+def _parse_json_field(val: Any) -> Any:
+    if isinstance(val, str):
+        return _safe_json_loads(val)
+    return val
+
+def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client or not phone:
+        return None
+    try:
+        table_name = "all_conversations"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.convo.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
+                continue
+            recv = row.get("reciever_phone") or row.get("receiver_phone")
+            if recv and str(recv) == str(phone):
+                row_data = {"id": row_id}
+                row_data.update(row)
+                # parse json fields if possible
+                for fld in ("conversation_json", "tool_run_logs", "variables"):
+                    if fld in row_data:
+                        row_data[fld] = _parse_json_field(row_data[fld])
+                return row_data
+        return None
+    except Exception as e:
+        logger.log("fetch.convo.exception", "Error fetching conversation by phone", {"phone": phone, "error": str(e)})
+        return None
+
+def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Optional[str]:
+    if not _redis_client:
+        logger.log("save.convo.no_redis", "Redis client not available", {})
+        return None
+    try:
+        table_name = "all_conversations"
+        if not row_id:
+            row_id = str(uuid.uuid4())
+        ids_key = f"table:{table_name}:ids"
+        row_key = f"table:{table_name}:row:{row_id}"
+        # serialize all fields to strings
+        to_store: Dict[str, str] = {}
+        for k, v in (data or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, (dict, list)):
+                try:
+                    to_store[k] = json.dumps(v, ensure_ascii=False)
+                    continue
+                except Exception:
+                    pass
+            to_store[k] = str(v)
+        _redis_client.sadd(ids_key, row_id)
+        if to_store:
+            _redis_client.hset(row_key, to_store)
+        logger.log("save.convo", "Conversation upserted", {"row_id": row_id})
+        return row_id
+    except Exception as e:
+        logger.log("save.convo.error", "Failed to upsert conversation", {"error": str(e)})
+        return None
+
+# ---------------------------
 # Utility validators and helpers
 # ---------------------------
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -235,6 +304,22 @@ def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for k, v in variables.items():
         out[str(k)] = "" if v is None else str(v)
+    return out
+
+def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        items = qp.multi_items() if hasattr(qp, "multi_items") else (qp.items() if hasattr(qp, "items") else [])
+        for k, v in items:
+            if k in out:
+                if isinstance(out[k], list):
+                    out[k].append(v)
+                else:
+                    out[k] = [out[k], v]
+            else:
+                out[k] = v
+    except Exception:
+        pass
     return out
 
 def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
@@ -736,13 +821,61 @@ async def run_endpoint(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"reply": "Error: Invalid JSON request body", "logs": logger.to_list()})
-    agent_id = body.get("agent_id") or body.get("agentId") or body.get("id")
+    query_params = _query_params_to_dict(request.query_params)
+    payload = body.get("input") if isinstance(body.get("input"), dict) else body
+    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or query_params.get("agent_id") or query_params.get("agentId") or query_params.get("id")
+    # Detect demo SMS payload (Twilio style)
+    is_demo_sms = isinstance(payload, dict) and ("Body" in payload and "From" in payload)
+    conversation = payload.get("conversation", []) if not is_demo_sms else []
+    variables_payload = payload.get("variables", [])
+    message = payload.get("message", "")
+    existing_convo_row = None
+    reciever_phone = None
+    if is_demo_sms:
+        reciever_phone = str(payload.get("From") or "")
+        message = str(payload.get("Body") or "")
+        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
+        if existing_convo_row:
+            if not agent_id:
+                agent_id = existing_convo_row.get("agent_id")
+            convo_json = existing_convo_row.get("conversation_json") or []
+            if isinstance(convo_json, list):
+                conversation = convo_json
+            stored_vars = existing_convo_row.get("variables") or {}
+            if isinstance(stored_vars, dict):
+                variables_payload = stored_vars
     if not agent_id:
         return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
-    message = body.get("message", "")
-    conversation = body.get("conversation", [])
-    variables_payload = body.get("variables", [])
     res = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    # Persist/update demo-sms conversation
+    if is_demo_sms and reciever_phone:
+        prev_convo = conversation if isinstance(conversation, list) else []
+        new_convo = list(prev_convo)
+        new_convo.append({"role": "user", "content": message})
+        new_convo.append({"role": "assistant", "content": res.get("reply", "")})
+        assistant_index = len(new_convo)  # 1-based position of last assistant message
+        prior_tool_logs = []
+        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
+            prior_tool_logs = existing_convo_row.get("tool_run_logs")
+        tool_events = []
+        for ev in res.get("logs", []):
+            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+                ev_copy = dict(ev)
+                ev_copy["assistant_index"] = assistant_index
+                tool_events.append(ev_copy)
+        updated_tool_logs = prior_tool_logs + tool_events
+        updated_variables = res.get("variables", {})
+        if not isinstance(updated_variables, dict):
+            updated_variables = {}
+        row_id = existing_convo_row.get("id") if existing_convo_row else None
+        _upsert_conversation_row(row_id, {
+            "agent_id": agent_id,
+            "conversation_json": new_convo,
+            "reciever_phone": reciever_phone,
+            "tool_run_logs": updated_tool_logs,
+            "type": "demo-sms",
+            "variables": updated_variables,
+        })
     return JSONResponse(res)
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
