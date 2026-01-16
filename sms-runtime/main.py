@@ -880,10 +880,56 @@ async def run_endpoint(request: Request):
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
 if "inputs" in globals():
-    data = globals().get("inputs", {})
-    agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
-    if not agent_id:
-        q = globals().get("query", {}) or {}
-        agent_id = q.get("agent_id") or q.get("agentId") or q.get("id")
-    _out = run_agent(str(agent_id), data.get("conversation", []), data.get("message", ""), data.get("variables", []))
+    data = globals().get("inputs", {}) or {}
+    q = globals().get("query", {}) or {}
+    payload = data.get("input") if isinstance(data.get("input"), dict) else data
+    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or q.get("agent_id") or q.get("agentId") or q.get("id")
+    is_demo_sms = isinstance(payload, dict) and ("Body" in payload and "From" in payload)
+    conversation = payload.get("conversation", []) if not is_demo_sms else []
+    variables_payload = payload.get("variables", [])
+    message = payload.get("message", "")
+    existing_convo_row = None
+    reciever_phone = None
+    if is_demo_sms:
+        reciever_phone = str(payload.get("From") or "")
+        message = str(payload.get("Body") or "")
+        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
+        if existing_convo_row:
+            if not agent_id:
+                agent_id = existing_convo_row.get("agent_id")
+            convo_json = existing_convo_row.get("conversation_json") or []
+            if isinstance(convo_json, list):
+                conversation = convo_json
+            stored_vars = existing_convo_row.get("variables") or {}
+            if isinstance(stored_vars, dict):
+                variables_payload = stored_vars
+    _out = run_agent(str(agent_id), conversation, message, variables_payload)
+    if is_demo_sms and reciever_phone:
+        prev_convo = conversation if isinstance(conversation, list) else []
+        new_convo = list(prev_convo)
+        new_convo.append({"role": "user", "content": message})
+        new_convo.append({"role": "assistant", "content": _out.get("reply", "")})
+        assistant_index = len(new_convo)
+        prior_tool_logs = []
+        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
+            prior_tool_logs = existing_convo_row.get("tool_run_logs")
+        tool_events = []
+        for ev in _out.get("logs", []):
+            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+                ev_copy = dict(ev)
+                ev_copy["assistant_index"] = assistant_index
+                tool_events.append(ev_copy)
+        updated_tool_logs = prior_tool_logs + tool_events
+        updated_variables = _out.get("variables", {})
+        if not isinstance(updated_variables, dict):
+            updated_variables = {}
+        row_id = existing_convo_row.get("id") if existing_convo_row else None
+        _upsert_conversation_row(row_id, {
+            "agent_id": agent_id,
+            "conversation_json": new_convo,
+            "reciever_phone": reciever_phone,
+            "tool_run_logs": updated_tool_logs,
+            "type": "demo-sms",
+            "variables": updated_variables,
+        })
     globals()["result"] = _out
