@@ -872,6 +872,8 @@ async def run_endpoint(request: Request):
             stored_vars = existing_convo_row.get("variables") or {}
             if isinstance(stored_vars, dict):
                 variables_payload = stored_vars
+        elif message and not message.startswith("Demo by SaaS: "):
+            message = f"Demo by SaaS: {message}"
     if not agent_id:
         return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
     res = run_agent(str(agent_id), conversation, str(message), variables_payload)
@@ -932,6 +934,8 @@ if "inputs" in globals():
             stored_vars = existing_convo_row.get("variables") or {}
             if isinstance(stored_vars, dict):
                 variables_payload = stored_vars
+        elif message and not message.startswith("Demo by SaaS: "):
+            message = f"Demo by SaaS: {message}"
     _out = run_agent(str(agent_id), conversation, str(message), variables_payload)
     if is_demo_sms and reciever_phone:
         prev_convo = conversation if isinstance(conversation, list) else []
