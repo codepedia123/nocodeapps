@@ -939,4 +939,13 @@ if "inputs" in globals():
             "type": "demo-sms",
             "variables": updated_variables,
         })
+    try:
+        _out["debug_inputs"] = {
+            "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
+            "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+            "from": _get_case_insensitive(payload, "From"),
+            "body": _get_case_insensitive(payload, "Body"),
+        }
+    except Exception:
+        pass
     globals()["result"] = _out
