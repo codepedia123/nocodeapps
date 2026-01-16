@@ -858,6 +858,7 @@ async def run_endpoint(request: Request):
     variables_payload = payload.get("variables", [])
     message = payload.get("message", "")
     existing_convo_row = None
+    is_first_demo_sms = False
     reciever_phone = None
     if is_demo_sms:
         reciever_phone = str(_get_case_insensitive(payload, "From") or "")
@@ -872,11 +873,15 @@ async def run_endpoint(request: Request):
             stored_vars = existing_convo_row.get("variables") or {}
             if isinstance(stored_vars, dict):
                 variables_payload = stored_vars
-        elif message and not message.startswith("Demo by SaaS: "):
-            message = f"Demo by SaaS: {message}"
+        else:
+            is_first_demo_sms = True
     if not agent_id:
         return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
     res = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    if is_demo_sms and is_first_demo_sms:
+        reply_text = res.get("reply", "")
+        if reply_text and not reply_text.startswith("Demo by SaaS: "):
+            res["reply"] = f"Demo by SaaS: {reply_text}"
     if is_demo_sms and reciever_phone:
         prev_convo = conversation if isinstance(conversation, list) else []
         new_convo = list(prev_convo)
@@ -920,6 +925,7 @@ if "inputs" in globals():
     variables_payload = payload.get("variables", [])
     message = payload.get("message", "")
     existing_convo_row = None
+    is_first_demo_sms = False
     reciever_phone = None
     if is_demo_sms:
         reciever_phone = str(_get_case_insensitive(payload, "From") or "")
@@ -934,9 +940,13 @@ if "inputs" in globals():
             stored_vars = existing_convo_row.get("variables") or {}
             if isinstance(stored_vars, dict):
                 variables_payload = stored_vars
-        elif message and not message.startswith("Demo by SaaS: "):
-            message = f"Demo by SaaS: {message}"
+        else:
+            is_first_demo_sms = True
     _out = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    if is_demo_sms and is_first_demo_sms:
+        reply_text = _out.get("reply", "")
+        if reply_text and not reply_text.startswith("Demo by SaaS: "):
+            _out["reply"] = f"Demo by SaaS: {reply_text}"
     if is_demo_sms and reciever_phone:
         prev_convo = conversation if isinstance(conversation, list) else []
         new_convo = list(prev_convo)
