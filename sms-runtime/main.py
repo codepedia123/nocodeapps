@@ -683,16 +683,15 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             reply_text = "Done."
     except Exception:
         reply_text = "Done."
-    final_variables_dict = initial_vars
+    final_variables_dict: Dict[str, Any] = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
-            final_variables_dict = state.get("variables", initial_vars) or initial_vars
+            final_variables_dict.update(state.get("variables", {}) or {})
     except Exception:
-        final_variables_dict = initial_vars
-    if not final_variables_dict:
-        runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
-        if isinstance(runtime_vars, dict):
-            final_variables_dict = runtime_vars
+        pass
+    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+    if isinstance(runtime_vars, dict):
+        final_variables_dict.update(runtime_vars)
     # Detect if any tool result asked for more input and surface question
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
@@ -750,5 +749,8 @@ async def run_endpoint(request: Request):
 if "inputs" in globals():
     data = globals().get("inputs", {})
     agent_id = data.get("agent_id") or data.get("agentId") or data.get("id")
+    if not agent_id:
+        q = globals().get("query", {}) or {}
+        agent_id = q.get("agent_id") or q.get("agentId") or q.get("id")
     _out = run_agent(str(agent_id), data.get("conversation", []), data.get("message", ""), data.get("variables", []))
     globals()["result"] = _out
