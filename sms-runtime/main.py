@@ -11,7 +11,7 @@ from operator import ior
 import requests
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
@@ -24,6 +24,7 @@ from langchain_openai import ChatOpenAI
 
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
+from xml.sax.saxutils import escape
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
@@ -277,6 +278,10 @@ def _strip_code_fences(s: str) -> str:
         t = t.strip("`")
         t = t.replace("json\n", "", 1).replace("json\r\n", "", 1)
     return t.strip()
+
+def _format_sms_xml(message: str) -> str:
+    safe_message = escape(message or "")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Message>' + safe_message + "</Message>\n</Response>"
 
 def _is_empty(val: Any) -> bool:
     return val is None or (isinstance(val, str) and val.strip() == "") or (isinstance(val, (list, dict)) and len(val) == 0)
@@ -898,6 +903,8 @@ async def run_endpoint(request: Request):
             "type": "demo-sms",
             "variables": updated_variables,
         })
+    if is_demo_sms:
+        return Response(content=_format_sms_xml(res.get("reply", "")), media_type="application/xml")
     return JSONResponse(res)
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
@@ -955,7 +962,15 @@ if "inputs" in globals():
             "variables": updated_variables,
         })
     try:
-        _out["debug_inputs"] = {}
+        _out["debug_inputs"] = {
+            "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
+            "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+            "from": _get_case_insensitive(payload, "From"),
+            "body": _get_case_insensitive(payload, "Body"),
+        }
     except Exception:
         pass
-    globals()["result"] = _out
+    if is_demo_sms:
+        globals()["result"] = _format_sms_xml(_out.get("reply", ""))
+    else:
+        globals()["result"] = _out
