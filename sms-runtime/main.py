@@ -203,7 +203,6 @@ def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
             if recv and str(recv) == str(phone):
                 row_data = {"id": row_id}
                 row_data.update(row)
-                # parse json fields if possible
                 for fld in ("conversation_json", "tool_run_logs", "variables"):
                     if fld in row_data:
                         row_data[fld] = _parse_json_field(row_data[fld])
@@ -223,7 +222,6 @@ def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Opt
             row_id = str(uuid.uuid4())
         ids_key = f"table:{table_name}:ids"
         row_key = f"table:{table_name}:row:{row_id}"
-        # serialize all fields to strings
         to_store: Dict[str, str] = {}
         for k, v in (data or {}).items():
             if v is None:
@@ -824,7 +822,6 @@ async def run_endpoint(request: Request):
     query_params = _query_params_to_dict(request.query_params)
     payload = body.get("input") if isinstance(body.get("input"), dict) else body
     agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or query_params.get("agent_id") or query_params.get("agentId") or query_params.get("id")
-    # Detect demo SMS payload (Twilio style)
     is_demo_sms = isinstance(payload, dict) and ("Body" in payload and "From" in payload)
     conversation = payload.get("conversation", []) if not is_demo_sms else []
     variables_payload = payload.get("variables", [])
@@ -847,13 +844,12 @@ async def run_endpoint(request: Request):
     if not agent_id:
         return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
     res = run_agent(str(agent_id), conversation, str(message), variables_payload)
-    # Persist/update demo-sms conversation
     if is_demo_sms and reciever_phone:
         prev_convo = conversation if isinstance(conversation, list) else []
         new_convo = list(prev_convo)
         new_convo.append({"role": "user", "content": message})
         new_convo.append({"role": "assistant", "content": res.get("reply", "")})
-        assistant_index = len(new_convo)  # 1-based position of last assistant message
+        assistant_index = len(new_convo)
         prior_tool_logs = []
         if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
             prior_tool_logs = existing_convo_row.get("tool_run_logs")
@@ -903,7 +899,7 @@ if "inputs" in globals():
             stored_vars = existing_convo_row.get("variables") or {}
             if isinstance(stored_vars, dict):
                 variables_payload = stored_vars
-    _out = run_agent(str(agent_id), conversation, message, variables_payload)
+    _out = run_agent(str(agent_id), conversation, str(message), variables_payload)
     if is_demo_sms and reciever_phone:
         prev_convo = conversation if isinstance(conversation, list) else []
         new_convo = list(prev_convo)
