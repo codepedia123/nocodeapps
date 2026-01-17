@@ -185,7 +185,7 @@ def run_updater_agent():
         when_run_payload = data.get("when_run")
         tool_parse_result = _parse_when_run_payload(when_run_payload)
         tools_catalog = tool_parse_result.get("tools") or []
-        tools_parse_error = tool_parse_result.get("error")
+        tools_parse_error = tool_parse_result.get("error") if data.get("when_run") is not None else None
 
         # Initialize LLM
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
