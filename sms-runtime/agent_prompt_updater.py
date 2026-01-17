@@ -183,9 +183,13 @@ def run_updater_agent():
 
     try:
         when_run_payload = data.get("when_run")
-        tool_parse_result = _parse_when_run_payload(when_run_payload)
-        tools_catalog = tool_parse_result.get("tools") or []
-        tools_parse_error = tool_parse_result.get("error") if data.get("when_run") is not None else None
+        if when_run_payload in (None, ""):
+            tools_catalog = []
+            tools_parse_error = None
+        else:
+            tool_parse_result = _parse_when_run_payload(when_run_payload)
+            tools_catalog = tool_parse_result.get("tools") or []
+            tools_parse_error = tool_parse_result.get("error")
 
         # Initialize LLM
         llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
@@ -518,7 +522,7 @@ def run_updater_agent():
             summary = "; ".join(final_state.get("change_summary") or [])
             tool_summary = "; ".join(final_state.get("tools_change_summary") or [])
             combined = "; ".join([s for s in [summary, tool_summary] if s])
-            final_reply = f"I have updated the text as requested. {combined}".strip()
+            final_reply = f"I have updated the agent accordingly. {combined}".strip()
         elif final_state.get("error_log"):
             # Scenario B: Tool was called but the snippet didn't match
             summary = "; ".join(final_state.get("change_summary") or [])
