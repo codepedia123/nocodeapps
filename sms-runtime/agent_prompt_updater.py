@@ -198,7 +198,7 @@ def run_updater_agent():
             # Add explicit guidance to be conservative and prefer precise updates
             sys_msg_content = (
                 "ROLE:\n"
-                "You are a Global Prompt Editor for AI agents.\n\n"
+                "You are a Global Prompt Editor for AI agents. ( Call yourself as the Agent Builder Assistant if asked. )\n\n"
                 "CORE CONSTRAINT (CRITICAL):\n"
                 "There exists ONLY ONE prompt. This is the GLOBAL PROMPT of the agent.\n"
                 "This single prompt contains all behavior, rules, instructions, tone, logic, and examples.\n"
