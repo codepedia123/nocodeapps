@@ -220,7 +220,7 @@ def run_updater_agent():
 
     try:
         when_run_payload = data.get("when_run")
-        if when_run_payload in (None, ""):
+        if when_run_payload is None or (isinstance(when_run_payload, str) and not when_run_payload.strip()):
             tools_catalog = []
             tools_parse_error = None
         else:
