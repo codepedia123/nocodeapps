@@ -23,7 +23,19 @@ for key in ("inputs", "input", "payload"):
     if isinstance(candidate, dict) and candidate:
         data.update(candidate)
 
-for k in ("long_text", "message", "conversation", "api_key", "apiKey", "openai_api_key", "key", "agent_id", "agentId", "agent", "when_run"):
+for k in (
+    "long_text",
+    "message",
+    "conversation",
+    "api_key",
+    "apiKey",
+    "openai_api_key",
+    "key",
+    "agent_id",
+    "agentId",
+    "agent",
+    "when_run",
+):
     if k in _raw_globals and _raw_globals.get(k) not in (None, "", {}):
         if k not in data:
             data[k] = _raw_globals.get(k)
@@ -38,7 +50,8 @@ if not data:
                 if isinstance(parsed, dict):
                     data.update(parsed)
                     break
-            except: pass
+            except:
+                pass
 else:
     # Secondary env fallback for agent id if provided separately
     if "agent_id" not in data:
@@ -51,9 +64,16 @@ else:
             data["when_run"] = env_when
 
 long_text = data.get("long_text", "")
-user_message = data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
+user_message = (
+    data.get("message", "") or data.get("input_message", "") or data.get("msg", "")
+)
 conversation = data.get("conversation", []) or data.get("chat_history", [])
-api_key_to_use = (data.get("api_key") or data.get("openai_api_key") or data.get("apiKey") or os.getenv("OPENAI_API_KEY"))
+api_key_to_use = (
+    data.get("api_key")
+    or data.get("openai_api_key")
+    or data.get("apiKey")
+    or os.getenv("OPENAI_API_KEY")
+)
 
 # Helper utilities for tool management
 def _parse_when_run_payload(raw_payload: Any) -> Dict[str, Any]:
@@ -110,12 +130,15 @@ def _serialize_tools_catalog(tools_catalog: List[Dict[str, Any]]) -> str:
         output.append({tool_id: when})
     return json.dumps(output, ensure_ascii=True)
 
+
 # ------------------------------------------------------------------
 # 2. DEFINE THE STATE & TOOLS
 # ------------------------------------------------------------------
 
+
 class AgentState(TypedDict):
     """The official way to track state across the agent's 'thought' process."""
+
     messages: Annotated[List[BaseMessage], "The conversation messages"]
     document: str
     change_summary: Optional[List[str]]
@@ -125,8 +148,14 @@ class AgentState(TypedDict):
     tools_change_summary: Optional[List[str]]
     when_run_updated: bool
 
+
 @tool
-def patch_document_tool(original_snippet: str, replacement_text: str, explanation: str, anchor_for_insertion: Optional[str] = None):
+def patch_document_tool(
+    original_snippet: str,
+    replacement_text: str,
+    explanation: str,
+    anchor_for_insertion: Optional[str] = None,
+):
     """
     Updates the document by replacing a specific snippet with new text.
     'explanation' should be a professional, descriptive summary of what you are changing.
@@ -141,11 +170,14 @@ def patch_document_tool(original_snippet: str, replacement_text: str, explanatio
         "original_snippet": original_snippet,
         "replacement_text": replacement_text,
         "explanation": explanation,
-        "anchor_for_insertion": anchor_for_insertion
+        "anchor_for_insertion": anchor_for_insertion,
     }
 
+
 @tool
-def insert_after_anchor_tool(anchor_snippet: str, insertion_text: str, explanation: str):
+def insert_after_anchor_tool(
+    anchor_snippet: str, insertion_text: str, explanation: str
+):
     """
     Requests insertion of insertion_text immediately after the first occurrence of anchor_snippet.
     The executor (tool_executor) will perform the insertion on the document.
@@ -155,11 +187,14 @@ def insert_after_anchor_tool(anchor_snippet: str, insertion_text: str, explanati
         "action": "insert_after_anchor",
         "anchor_snippet": anchor_snippet,
         "insertion_text": insertion_text,
-        "explanation": explanation
+        "explanation": explanation,
     }
 
+
 @tool
-def update_when_run_tool(tool_id: str, scenario_updates: List[Dict[str, Any]], explanation: str):
+def update_when_run_tool(
+    tool_id: str, scenario_updates: List[Dict[str, Any]], explanation: str
+):
     """
     Requests updates to a tool's when_run scenarios for the current agent payload (no remote calls).
     Provide 'scenario_updates' as a list of {'index': 1-based index to replace or append, 'text': full replacement scenario}.
@@ -170,12 +205,14 @@ def update_when_run_tool(tool_id: str, scenario_updates: List[Dict[str, Any]], e
         "action": "update_when_run",
         "tool_id": tool_id,
         "scenario_updates": scenario_updates,
-        "explanation": explanation
+        "explanation": explanation,
     }
+
 
 # ------------------------------------------------------------------
 # 3. AGENT LOGIC UNIT
 # ------------------------------------------------------------------
+
 
 def run_updater_agent():
     if not api_key_to_use:
@@ -232,27 +269,29 @@ def run_updater_agent():
                 "Explanations must describe WHAT changed and WHY, not HOW.\n\n"
                 f"TOOLS CATALOG (from input):\n{tools_json}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
-                "- Update a tool’s when_run scenarios ONLY when it is necessary to correctly fulfill the user’s requested change.\n"
-                "- A single user request may require updating the when_run scenarios of one tool or multiple tools; you must reason about each affected tool independently and update all relevant ones when the user’s intent clearly implies changes to execution order, conditions, confirmations, or dependencies.\n"
-                "- Prefer editing existing when_run scenarios; append a new scenario only when the required behavior cannot be represented by modifying an existing one, and keep all wording minimal and precise.\n"
-                "- Always read, understand, and reason about the current when_run scenarios for each tool before making any changes.\n"
+                "- For every user request that changes behavior, execution order, confirmation requirements, data flow, or dependencies between actions, you must explicitly evaluate all relevant tools in the catalog to determine whether their when_run scenarios are still correct before deciding on any prompt edits or partial updates.\n"
+                "- Update a tool’s when_run scenarios ONLY when it is necessary to correctly fulfill the user’s requested change, but do not skip this evaluation even if the user does not mention tools or when_run.\n"
+                "- A single user request may require updating the when_run scenarios of one tool or multiple tools; you must reason about each affected tool independently and update all relevant ones when the user’s intent implies changes to execution order, conditions, confirmations, gating, or dependencies.\n"
+                "- If multiple tools participate in the requested behavior, assume they are interdependent and verify that their when_run scenarios are mutually aligned; do not update a single tool in isolation unless you explicitly determine that the other tools are already correctly aligned.\n"
+                "- Prefer editing existing when_run scenarios; append a new scenario only when the required behavior cannot be represented by modifying an existing one, and keep all wording minimal, explicit, and precise.\n"
+                "- Always read, understand, and reason about the current when_run scenarios for each tool before making any changes or deciding that no change is needed.\n"
                 "- If the user explicitly asks to change when a tool should run, you must update that tool’s when_run scenarios.\n"
-                "- If the user does not mention tools or when_run, but asks for an edit, fix, or behavioral change, you must reason dynamically about the request and determine whether the existing when_run scenarios of one or more tools are now misaligned with the requested behavior.\n"
+                "- If the user does not mention tools or when_run, but asks for an edit, fix, sequencing change, or behavioral adjustment, you must reason dynamically about the request and determine whether the existing when_run scenarios of one or more tools are now misaligned with the requested behavior.\n"
                 "- In indirect cases, update when_run only when the current execution conditions would cause a tool to run too early, too late, automatically, without required confirmation, out of sequence, or in a way that partially or incorrectly fulfills the user’s intent.\n"
-                "- Do not update when_run by default or as a precaution; make updates only when they are clearly necessary and materially helpful to implementing the requested behavior.\n"
-                "- If the user’s request affects execution order, confirmation steps, conditional gating, or dependencies between multiple actions, you must evaluate all involved tools and update the when_run scenarios of every affected tool, not just the first or most obvious one.\n"
-                "- Always evaluate and correct when_run logic before removing, rewriting, or deleting prompt instructions; never use prompt edits as a substitute for fixing incorrect tool execution timing or conditions.\n"
+                "- Do not update when_run by default or as a precaution; make updates only when they are clearly necessary and materially helpful, but never avoid updating when_run simply because the user did not explicitly request it.\n"
+                "- If the user’s request affects execution order, confirmation steps, conditional gating, or dependencies between multiple actions, you must evaluate and update the when_run scenarios of every affected tool before considering prompt edits.\n"
+                "- Always evaluate and correct when_run logic before removing, rewriting, or deleting prompt instructions; never use prompt edits as a substitute for fixing incorrect tool execution timing, sequencing, or conditions.\n"
                 "- If a behavioral request could be satisfied either by removing prompt instructions or by correcting tool execution logic, always prefer correcting tool execution logic first.\n"
-                "- Use the exact 'tool_id' values from the provided tools catalog when calling 'update_when_run_tool'. Do not invent, rename, or assume tools.\n"
-                "- You may call 'update_when_run_tool' multiple times in a single response if multiple tools require when_run updates.\n"
+                "- Do not ask the user to clarify tool execution or sequencing requirements if the intent can be reasonably inferred from the request; infer sequencing and dependencies from context and update when_run accordingly.\n"
+                "- Use the exact 'tool_id' values from the provided tools catalog when calling 'update_when_run_tool'. Do not invent, rename, assume, or merge tools.\n"
+                "- You may call 'update_when_run_tool' multiple times in a single response when multiple tools require when_run updates, and you must do so when multiple tools are affected.\n"
                 "- For each tool update, call 'update_when_run_tool' with 1-based 'index' entries for every scenario you change and provide the full replacement scenario text for each index.\n"
-                "- If you need to add a new scenario, use index = current_length + 1 with no gaps; do not invent or skip indices.\n"
-                "- Only change when_run entries that directly align tool execution with the requested behavior; avoid unrelated, speculative, or defensive changes.\n"
+                "- If you need to add a new scenario, use index = current_length + 1 with no gaps; do not invent, skip, or reorder indices.\n"
+                "- Only change when_run entries that directly align tool execution with the requested behavior; avoid unrelated, speculative, defensive, or convenience-based changes.\n"
                 "- Never expand beyond the provided tool arrays; no external tools, fetches, or updates are available.\n"
                 "- Always include a clear, specific 'explanation' describing why each when_run change is essential to fulfilling the user’s request.\n\n"
                 f"CURRENT AGENT'S GLOBAL PROMPT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
-
             )
             sys_msg = SystemMessage(content=sys_msg_content)
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
@@ -332,7 +371,10 @@ def run_updater_agent():
                         tools_summary.append(text)
 
                 # Patch action
-                if name == "patch_document_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "patch_document_tool"):
+                if name == "patch_document_tool" or (
+                    isinstance(tool_call, dict)
+                    and tool_call.get("tool") == "patch_document_tool"
+                ):
                     old = args.get("original_snippet", "") or ""
                     new = args.get("replacement_text", "") or ""
                     expl = args.get("explanation", "") or ""
@@ -349,31 +391,46 @@ def run_updater_agent():
                             end_idx = _find_anchor_end(new_doc, anchor)
                             if end_idx is not None:
                                 insertion = f"\n{new}\n"
-                                new_doc = new_doc[:end_idx] + insertion + new_doc[end_idx:]
-                                _append_summary(expl or "Inserted new text after provided anchor.")
+                                new_doc = (
+                                    new_doc[:end_idx] + insertion + new_doc[end_idx:]
+                                )
+                                _append_summary(
+                                    expl or "Inserted new text after provided anchor."
+                                )
                                 updated = True
                                 err = None
                             else:
                                 # fallback 2: true secondary fallback, append at end
-                                new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
-                                _append_summary(expl or "Anchor not found, appended new section at end.")
+                                new_doc = new_doc.rstrip() + "\n\n" + new.strip() + "\n"
+                                _append_summary(
+                                    expl
+                                    or "Anchor not found, appended new section at end."
+                                )
                                 updated = True
                                 err = None
                         else:
                             # fallback 2: true secondary fallback, append at end
-                            new_doc = (new_doc.rstrip() + "\n\n" + new.strip() + "\n")
-                            _append_summary(expl or "No snippet match and no anchor provided, appended new section at end.")
+                            new_doc = new_doc.rstrip() + "\n\n" + new.strip() + "\n"
+                            _append_summary(
+                                expl
+                                or "No snippet match and no anchor provided, appended new section at end."
+                            )
                             updated = True
                             err = None
 
                 # Insert-after-anchor action
-                elif name == "insert_after_anchor_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "insert_after_anchor_tool"):
+                elif name == "insert_after_anchor_tool" or (
+                    isinstance(tool_call, dict)
+                    and tool_call.get("tool") == "insert_after_anchor_tool"
+                ):
                     anchor = args.get("anchor_snippet", "") or ""
                     insertion_text = args.get("insertion_text", "") or ""
                     expl = args.get("explanation", "") or ""
 
                     if insertion_text and insertion_text in new_doc:
-                        _append_summary(expl or "Insertion skipped because the text already exists.")
+                        _append_summary(
+                            expl or "Insertion skipped because the text already exists."
+                        )
                         updated = True
                         err = None
                         continue
@@ -388,13 +445,20 @@ def run_updater_agent():
                         err = None
                     else:
                         # true secondary fallback: append at end
-                        new_doc = (new_doc.rstrip() + "\n\n" + insertion_text.strip() + "\n")
-                        _append_summary(expl or "Anchor not found, appended new section at end.")
+                        new_doc = (
+                            new_doc.rstrip() + "\n\n" + insertion_text.strip() + "\n"
+                        )
+                        _append_summary(
+                            expl or "Anchor not found, appended new section at end."
+                        )
                         updated = True
                         err = None
 
                 # Update when_run action
-                elif name == "update_when_run_tool" or (isinstance(tool_call, dict) and tool_call.get("tool") == "update_when_run_tool"):
+                elif name == "update_when_run_tool" or (
+                    isinstance(tool_call, dict)
+                    and tool_call.get("tool") == "update_when_run_tool"
+                ):
                     tool_id = str(args.get("tool_id") or "").strip()
                     scenario_updates = args.get("scenario_updates") or []
                     expl = args.get("explanation", "") or ""
@@ -409,7 +473,10 @@ def run_updater_agent():
                         _append_tool_summary(expl or err)
                         continue
 
-                    target_tool = next((t for t in tools_catalog if str(t.get("tool_id")) == tool_id), None)
+                    target_tool = next(
+                        (t for t in tools_catalog if str(t.get("tool_id")) == tool_id),
+                        None,
+                    )
                     if not target_tool:
                         err = f"Tool {tool_id} not found for current agent."
                         _append_tool_summary(expl or err)
@@ -417,7 +484,9 @@ def run_updater_agent():
 
                     current_when = list(target_tool.get("when_run") or [])
                     if not current_when and target_tool.get("raw_when_run"):
-                        current_when = _split_when_run(target_tool.get("raw_when_run") or "")
+                        current_when = _split_when_run(
+                            target_tool.get("raw_when_run") or ""
+                        )
 
                     changed = False
                     out_of_range = False
@@ -450,7 +519,9 @@ def run_updater_agent():
                     target_tool["when_run"] = current_when
                     if out_of_range_note:
                         _append_tool_summary(out_of_range_note)
-                    _append_tool_summary(expl or f"when_run for tool {tool_id} updated locally.")
+                    _append_tool_summary(
+                        expl or f"when_run for tool {tool_id} updated locally."
+                    )
                     when_run_updated = True
                     updated = True
                     if out_of_range:
@@ -470,7 +541,7 @@ def run_updater_agent():
                 "error_log": err,
                 "tools_catalog": tools_catalog,
                 "tools_change_summary": tools_summary,
-                "when_run_updated": when_run_updated
+                "when_run_updated": when_run_updated,
             }
 
         # 3. BUILD THE GRAPH
@@ -515,7 +586,7 @@ def run_updater_agent():
             "error_log": tools_parse_error,
             "tools_catalog": tools_catalog,
             "tools_change_summary": [],
-            "when_run_updated": False
+            "when_run_updated": False,
         }
 
         final_state = app.invoke(inputs)
@@ -546,10 +617,19 @@ def run_updater_agent():
             # Prefer to return the assistant's final generated content if available
             assistant_content = None
             try:
-                assistant_content = last_msg.content if hasattr(last_msg, "content") else (last_msg.get("content") if isinstance(last_msg, dict) else None)
+                assistant_content = (
+                    last_msg.content
+                    if hasattr(last_msg, "content")
+                    else (
+                        last_msg.get("content") if isinstance(last_msg, dict) else None
+                    )
+                )
             except Exception:
                 assistant_content = None
-            final_reply = assistant_content or "I've processed your request, but no changes were made to the document."
+            final_reply = (
+                assistant_content
+                or "I've processed your request, but no changes were made to the document."
+            )
 
         return {
             "reply": final_reply,
@@ -558,12 +638,15 @@ def run_updater_agent():
             "change_summary": final_state.get("change_summary"),
             "tools_change_summary": final_state.get("tools_change_summary"),
             "when_run_updated": final_state.get("when_run_updated"),
-            "current_when_run_json": _serialize_tools_catalog(final_state.get("tools_catalog") or []),
-            "error_details": final_state.get("error_log")
+            "current_when_run_json": _serialize_tools_catalog(
+                final_state.get("tools_catalog") or []
+            ),
+            "error_details": final_state.get("error_log"),
         }
 
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
+
 
 # ------------------------------------------------------------------
 # 6. SET GLOBAL RESULT
