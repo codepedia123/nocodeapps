@@ -269,6 +269,7 @@ def run_updater_agent():
                 "Explanations must describe WHAT changed and WHY, not HOW.\n\n"
                 f"TOOLS CATALOG (from input):\n{tools_json}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
+                "- MOST IMPORTANT: Update the when_run scenerio of tool/s ( ONLY WHEN THE NEED IS CLEAR ) I HAVE EXPLAINED THE RULES BELOW IN DETAIL.\nMORE BELWOW.\n"
                 "- Definition: 'when_run' is the exact scenario text that decides when a specific tool should execute. If when_run is wrong, the tool will fire at the wrong time even if the global prompt text sounds correct.\n"
                 "- Primary goal: Keep tool execution correct, sequential (when required), and consent-safe. Treat when_run as the execution contract for each tool.\n"
                 "- Mandatory precheck (always): For every user request, first decide whether the request changes any of these: execution order, timing, triggers, prerequisites, consent requirements, conditional gating, dependencies between actions, or what data must exist before a tool runs. If YES to any, you must evaluate tool when_run alignment before making or finalizing prompt edits.\n"
