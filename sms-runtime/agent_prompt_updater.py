@@ -231,7 +231,7 @@ def run_updater_agent():
             tools_parse_error = tool_parse_result.get("error")
 
         # Initialize LLM
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
+        llm = ChatOpenAI(model="gpt-5", temperature=0, api_key=api_key_to_use)
         tools = [patch_document_tool, insert_after_anchor_tool, update_when_run_tool]
         llm_with_tools = llm.bind_tools(tools)
 
