@@ -268,6 +268,8 @@ def run_updater_agent():
                 "Use insert_after_anchor_tool ONLY when adding new content that does not exist.\n"
                 "Anchors must be stable, short, and guaranteed to exist.\n"
                 "Explanations must describe WHAT changed and WHY, not HOW.\n\n"
+                "SUMMARY STYLE:\n"
+                "All explanations and summaries must be short, plain, and agent-focused. Never mention the user. Only state what it now does or how it behaves.\n\n"
                 f"TOOLS CATALOG (from input):\n{tools_json}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
                 "- MOST IMPORTANT: Update the when_run scenerio of tool/s ( ONLY WHEN THE NEED IS CLEAR ) I HAVE EXPLAINED THE RULES BELOW IN DETAIL.\nMORE BELWOW.\n"
