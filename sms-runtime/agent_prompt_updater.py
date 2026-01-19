@@ -282,6 +282,7 @@ def run_updater_agent():
 "- Implementation constraints: Use only tools present in the provided catalog and their exact tool_id values. Scenario indices are 1-based and must be explicit."
 "- Explanation requirement: Every when_run update must include a concise explanation of why the execution condition needed to change."
 
+
                 f"CURRENT AGENT'S GLOBAL PROMPT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
             )
