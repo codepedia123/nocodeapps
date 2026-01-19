@@ -603,7 +603,10 @@ def run_updater_agent():
             summary = "; ".join(final_state.get("change_summary") or [])
             tool_summary = "; ".join(final_state.get("tools_change_summary") or [])
             combined = "; ".join([s for s in [summary, tool_summary] if s])
-            final_reply = f"I have updated the agent accordingly. {combined}".strip()
+            if combined:
+                final_reply = f"It now has these changes: {combined}".strip()
+            else:
+                final_reply = "It now has the requested changes."
         elif final_state.get("error_log"):
             # Scenario B: Tool was called but the snippet didn't match
             summary = "; ".join(final_state.get("change_summary") or [])
