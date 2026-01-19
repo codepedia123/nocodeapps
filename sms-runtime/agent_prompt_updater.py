@@ -334,6 +334,7 @@ def run_updater_agent():
                 "6. Do not add explanations, commentary, or meta text into the prompt.\n"
                 "7. Do not introduce placeholders, examples, or verbosity unless the user explicitly asks.\n"
                 "8. You may apply lengthy updates when required, up to 25 lines or 350 words total per request across the prompt.\n\n"
+                "9. You may update multiple, non-adjacent sections when the request requires it; changes can be anywhere in the prompt.\n\n"
                 "GLOBAL PROMPT OWNERSHIP:\n"
                 "The provided document IS the agent.\n"
                 "Any change you make directly changes the agent’s behavior.\n"
