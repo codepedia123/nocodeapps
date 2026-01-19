@@ -2,6 +2,7 @@ import os
 import json
 import traceback
 import re
+import difflib
 from typing import List, Dict, Any, Optional, Annotated, TypedDict
 from pydantic import BaseModel, Field
 
@@ -129,6 +130,79 @@ def _serialize_tools_catalog(tools_catalog: List[Dict[str, Any]]) -> str:
         when = tool.get("when_run") or []
         output.append({tool_id: when})
     return json.dumps(output, ensure_ascii=True)
+
+
+def _build_diff_hunks(before_text: str, after_text: str, context: int = 5) -> List[Dict[str, Any]]:
+    """
+    Returns unified diff hunks with context lines for client-side rendering.
+    Each hunk includes a header and its lines with +/ -/ space prefixes.
+    """
+    before_lines = before_text.splitlines()
+    after_lines = after_text.splitlines()
+    diff_lines = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            lineterm="",
+            n=context,
+        )
+    )
+
+    hunks: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for line in diff_lines:
+        if line.startswith("@@"):
+            if current:
+                hunks.append(current)
+            current = {"header": line, "lines": []}
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if current is None:
+            current = {"header": "", "lines": []}
+        current["lines"].append(line)
+
+    if current:
+        hunks.append(current)
+
+    return hunks
+
+
+def _build_word_diff_markup(before_text: str, after_text: str) -> str:
+    """
+    Builds a full-text, word-level diff with inline markers for additions and deletions.
+    Deleted text is wrapped in <del class="diff-del">...</del>
+    Added text is wrapped in <ins class="diff-add">...</ins>
+    """
+    def _tokenize(s: str) -> List[str]:
+        return re.findall(r"\S+|\s+", s)
+
+    a_tokens = _tokenize(before_text)
+    b_tokens = _tokenize(after_text)
+
+    matcher = difflib.SequenceMatcher(a=a_tokens, b=b_tokens)
+    out: List[str] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            out.extend(a_tokens[i1:i2])
+        elif tag == "delete":
+            segment = "".join(a_tokens[i1:i2])
+            if segment:
+                out.append(f'<del class="diff-del">{segment}</del>')
+        elif tag == "insert":
+            segment = "".join(b_tokens[j1:j2])
+            if segment:
+                out.append(f'<ins class="diff-add">{segment}</ins>')
+        elif tag == "replace":
+            old_seg = "".join(a_tokens[i1:i2])
+            new_seg = "".join(b_tokens[j1:j2])
+            if old_seg:
+                out.append(f'<del class="diff-del">{old_seg}</del>')
+            if new_seg:
+                out.append(f'<ins class="diff-add">{new_seg}</ins>')
+
+    return "".join(out)
 
 
 # ------------------------------------------------------------------
@@ -594,6 +668,11 @@ def run_updater_agent():
         }
 
         final_state = app.invoke(inputs)
+        original_text = long_text
+        updated_text = final_state.get("document") or ""
+        diff_context = 5
+        diff_hunks = _build_diff_hunks(original_text, updated_text, context=diff_context)
+        diff_full_marked_text = _build_word_diff_markup(original_text, updated_text)
 
         # ------------------------------------------------------------------
         # 5. CONSTRUCT FINAL RESPONSE (Improved Logic)
@@ -648,6 +727,9 @@ def run_updater_agent():
             "current_when_run_json": _serialize_tools_catalog(
                 final_state.get("tools_catalog") or []
             ),
+            "diff_context": diff_context,
+            "diff_hunks": diff_hunks,
+            "diff_full_marked_text": diff_full_marked_text,
             "error_details": final_state.get("error_log"),
         }
 
