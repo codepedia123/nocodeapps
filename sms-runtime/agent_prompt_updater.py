@@ -220,9 +220,7 @@ def run_updater_agent():
 
     try:
         when_run_payload = data.get("when_run")
-        if when_run_payload is None or (
-            isinstance(when_run_payload, str) and not when_run_payload.strip()
-        ):
+        if when_run_payload is None or (isinstance(when_run_payload, str) and not when_run_payload.strip()):
             tools_catalog = []
             tools_parse_error = None
         else:
@@ -231,7 +229,7 @@ def run_updater_agent():
             tools_parse_error = tool_parse_result.get("error")
 
         # Initialize LLM
-        llm = ChatOpenAI(model="gpt-4.1", temperature=0, api_key=api_key_to_use)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=api_key_to_use)
         tools = [patch_document_tool, insert_after_anchor_tool, update_when_run_tool]
         llm_with_tools = llm.bind_tools(tools)
 
@@ -261,8 +259,8 @@ def run_updater_agent():
                 "6. Do not add explanations, commentary, or meta text into the prompt.\n"
                 "7. Do not introduce placeholders, examples, or verbosity unless the user explicitly asks.\n\n"
                 "GLOBAL PROMPT OWNERSHIP:\n"
-                "The provided document IS the instruction prompt of the agent.\n"
-                "Any change you make directly changes the agent’s behavior, including what it says, how it reasons, and how it decides. Tool execution timing and eligibility are controlled exclusively through when_run scenarios.\n"
+                "The provided document IS the agent.\n"
+                "Any change you make directly changes the agent’s behavior.\n"
                 "Treat every edit as production-critical.\n\n"
                 "TOOL USAGE:\n"
                 "Use patch_document_tool to replace exact text whenever possible.\n"
@@ -271,28 +269,28 @@ def run_updater_agent():
                 "Explanations must describe WHAT changed and WHY, not HOW.\n\n"
                 f"TOOLS CATALOG (from input):\n{tools_json}\n\n"
                 "WHEN_RUN UPDATE RULES:\n"
-                "- Purpose: 'when_run' defines the exact condition under which a tool is allowed to execute. Treat it as execution logic, not descriptive text.\n"
-                "- Core principle: Update when_run when tool execution timing, conditions, or eligibility are part of fulfilling the user’s intent and the current scenarios do not already enforce them.\n"
-                "- Thinking first: For every request, decide whether the user’s change affects how or when any tool should be allowed to run. Make this decision before editing the global prompt.\n"
-                "- Evaluation is mandatory; updates are required only when evaluation reveals misalignment between tool execution and intended behavior.\n"
-                "- Tool authority: If a behavior depends on tools, the change is incomplete until tool execution logic is aligned. Prompt text alone does not control execution.\n"
-                "- Explicit intent: If the user directly asks to change when a tool runs, update that tool’s when_run.\n"
-                "- Implicit intent: If the user asks for a behavioral change without mentioning tools, infer whether tool execution must change. Do not assume prompt edits are sufficient.\n"
-                "- Decision boundary: Update when_run when existing scenarios would cause a tool to execute too early, too late, without required conditions, without required confirmation, or in conflict with the intended flow.\n"
-                "- Restraint rule: Do not update when_run if the requested change does not materially affect tool triggering, ordering, eligibility, or prerequisites.\n"
-                "- System thinking: When multiple tools participate in a flow, reason about them as a coordinated system. Ensure their when_run scenarios support each other and do not conflict.\n"
-                "- Isolation avoidance: Do not update a single tool in isolation if other tools are affected by the same behavioral change.\n"
-                "- Priority order: Correct tool execution logic before modifying or removing prompt instructions. Prompt edits must never compensate for incorrect tool timing or conditions.\n"
-                "- Completion rule: A change that affects tool behavior is not considered complete unless required when_run updates are applied.\n"
-                "- Communication rule: If the user’s intent is reasonably inferable, infer it. Do not ask clarifying questions solely to avoid updating when_run.\n"
-                "- Implementation constraint: Only use tools present in the provided tools catalog and reference them using their exact tool_id.\n"
-                "- Update flexibility: You may update one or multiple tools in a single request, depending on what the evaluation requires.\n"
-                "- Structural requirement: If you decide to update when_run, you must call 'update_when_run_tool' with at least one explicit index-based scenario replacement.\n"
-                "- Integrity rule: Never describe an intended when_run change without providing the corresponding scenario_updates payload.\n"
-                "- Editing discipline: Prefer modifying existing scenarios. Add a new scenario only when modification cannot express the required behavior.\n"
-                "- Index discipline: Scenario indices are 1-based and contiguous. Each update must include the full final scenario text.\n"
-                "- Scope discipline: Change only what is necessary to align execution with intent. Avoid unrelated or speculative edits.\n"
-                "- Explanation discipline: Every when_run update must include a concise explanation describing why the change is required to fulfill the user’s request.\n\n"
+                "- MOST IMPORTANT: Update the when_run scenerio of tool/s ( ONLY WHEN THE NEED IS CLEAR ) I HAVE EXPLAINED THE RULES BELOW IN DETAIL.\nMORE BELWOW.\n"
+                "- Definition: 'when_run' is the exact scenario text that decides when a specific tool should execute. If when_run is wrong, the tool will fire at the wrong time even if the global prompt text sounds correct.\n"
+                "- Primary goal: Keep tool execution correct, sequential (when required), and consent-safe. Treat when_run as the execution contract for each tool.\n"
+                "- Mandatory precheck (always): For every user request, first decide whether the request changes any of these: execution order, timing, triggers, prerequisites, consent requirements, conditional gating, dependencies between actions, or what data must exist before a tool runs. If YES to any, you must evaluate tool when_run alignment before making or finalizing prompt edits.\n"
+                "- Tool alignment is not optional: If a request affects behavior that depends on tools, you must not consider the change complete until the relevant tools’ when_run scenarios are aligned with the requested behavior.\n"
+                "- Direct request handling: If the user explicitly says to change when a tool should run, update that tool’s when_run scenarios.\n"
+                "- Indirect request handling (critical): If the user asks for an edit, fix, or behavioral change without mentioning tools or when_run, you must still infer whether tools are involved and whether one or more tools’ when_run scenarios must change to fulfill the request. Do not wait for the user to tell you to update a tool.\n"
+                "- When to update when_run (required conditions): Update a tool’s when_run when the current scenario would make the tool run too early, too late, automatically when it should be gated, without required user consent, without required prerequisites, out of sequence relative to other tools, or in a way that could partially or incorrectly fulfill the user’s intent.\n"
+                "- When NOT to update when_run: Do not update when_run if the requested change is purely conversational or wording-only and does not change tool triggering, sequencing, prerequisites, consent, or data dependencies. Avoid defensive or speculative updates.\n"
+                "- Multi-tool reasoning (required): If multiple tools are part of the requested workflow, treat them as an interdependent chain. Verify that their when_run scenarios cooperate and cannot collide. If the request changes any step in the chain, evaluate each tool and update every affected tool, not just the most obvious one.\n"
+                "- If you decide that a tool’s when_run must be updated, you must always call 'update_when_run_tool' with a non-empty 'scenario_updates' array containing at least one explicit index-based replacement; explanations alone are never sufficient."
+                "- Never describe an intended when_run change without providing the corresponding 'scenario_updates'; doing so is considered an invalid update."
+                "- Sequential execution rule: When the user wants tools to run sequentially, encode the sequence explicitly in when_run using clear prerequisites, for example: 'run Tool B only after Tool A succeeded' and 'run Tool C only after user confirmed X'. Make sure earlier tools do not trigger later tools prematurely.\n"
+                "- Consent gating rule: If a tool records, stores, inserts, sends, or persists user data (for example, inserting rows into a sheet), its when_run must explicitly require user consent when consent is part of the user’s request or the global prompt’s policy.\n"
+                "- Prompt edits vs tool fixes (priority): If a behavioral request can be solved by either changing the global prompt text or correcting tool execution logic, prefer correcting tool execution logic first. Never use prompt edits as a substitute for fixing incorrect tool timing, gating, prerequisites, or sequence.\n"
+                "- No unnecessary clarification: Do not ask the user to clarify tool sequencing if the intent is reasonably inferable (for example, 'book first then insert row', 'check availability before booking', 'ask consent before storing'). Infer it and update when_run accordingly.\n"
+                "- Implementation constraints: Use only tools that exist in the provided tools catalog. Use the exact 'tool_id' string from the catalog. Never invent, rename, or merge tools.\n"
+                "- Update method: You may update one tool or multiple tools in the same request. If multiple tools are affected, you must call 'update_when_run_tool' separately for each affected tool.\n"
+                "- Scenario editing method: Prefer editing existing scenarios. Append a new scenario only when the needed behavior cannot be represented by editing an existing one.\n"
+                "- Index rules: Scenario indices are 1-based. For every scenario you modify, send {'index': <n>, 'text': <full replacement scenario>} with the full final scenario text (no partial fragments). To add a scenario, use index = current_length + 1 with no gaps.\n"
+                "- Scope control: Only change when_run text that is necessary to align execution with the user’s request. Avoid unrelated edits.\n"
+                "- Explanation requirement: Every 'update_when_run_tool' call must include a clear, specific explanation of why the change is required to satisfy the user’s intent (for example: prevents premature execution, enforces consent, enforces sequence, enforces prerequisite).\n\n"
                 f"CURRENT AGENT'S GLOBAL PROMPT DOCUMENT CONTENT:\n--- START ---\n{state['document']}\n--- END ---\n\n"
                 "Answer format: If you want to call a tool, call the appropriate tool with JSON args. Otherwise reply normally.\n"
             )
