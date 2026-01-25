@@ -639,14 +639,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
                     return json.dumps(error_data, ensure_ascii=False)
                 try:
-                    if isinstance(payload2, dict):
-                        context_vars: Dict[str, Any] = {}
-                        existing_ctx = payload2.get("context_variables")
-                        if isinstance(existing_ctx, dict):
-                            context_vars.update(existing_ctx)
-                        if isinstance(current_vars, dict):
-                            context_vars.update(current_vars)
-                        payload2["context_variables"] = context_vars
+                    # Do not inject context variables into tool payloads.
                     resp = requests.post(_api_url, json=payload2, timeout=20)
                     try:
                         response_data = resp.json()
