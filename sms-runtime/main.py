@@ -775,11 +775,11 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                 if not ok:
                     tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "needs_input": True, "question": question}
                     logger.log("tool.validation", f"api_tool_{_tool_id} needs user input", tool_result)
-                    return json.dumps(tool_result, ensure_ascii=False)
+                    return tool_result
                 if not _is_valid_api_url(_api_url):
                     error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": "Invalid api_url"}
                     logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
-                    return json.dumps(error_data, ensure_ascii=False)
+                    return error_data
                 def _attach_error_details(base_result: Dict[str, Any]) -> Dict[str, Any]:
                     # Ensure we always mark this as an error and swap response with enriched context.
                     merged = dict(base_result)
@@ -800,12 +800,12 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     if resp.status_code == 500 or tool_result.get("ok") is False:
                         tool_result = _attach_error_details(tool_result)
                     logger.log("tool.response", f"api_tool_{_tool_id} result", tool_result)
-                    return json.dumps(tool_result, ensure_ascii=False)
+                    return tool_result
                 except Exception as e:
                     error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
                     error_data = _attach_error_details(error_data)
                     logger.log("tool.error", f"api_tool_{_tool_id} failed", error_data)
-                    return json.dumps(error_data, ensure_ascii=False)
+                    return error_data
             return make_api_call
         make_api_call = _make_api_call_factory(str(tool_id), api_url, tpl_obj, ask_map)
         description = (f"WHEN_RUN: {when_run}\nINSTRUCTIONS: {instructions}\nPAYLOAD_TEMPLATE: {raw_payload_template}\nDo not invent missing details. Ask if unsure.")
