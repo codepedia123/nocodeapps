@@ -585,7 +585,8 @@ def _is_valid_api_url(u: str) -> bool:
 def _extract_flow_id_from_api_url(api_url: str) -> Optional[str]:
     try:
         p = urllib.parse.urlparse(api_url)
-        parts = [seg for seg in p.path.split("/") if seg]
+        path = urllib.parse.unquote(p.path or "")
+        parts = [seg for seg in path.split("/") if seg]
         if "webhooks" in parts:
             idx = parts.index("webhooks")
             if idx + 1 < len(parts):
@@ -656,10 +657,20 @@ def _fetch_activepieces_error_details(api_url: str) -> Optional[Dict[str, Any]]:
         if not isinstance(run_data, dict):
             return None
         steps = run_data.get("steps") or {}
-        step_1 = steps.get("step_1") if isinstance(steps, dict) else None
+        failed_step = run_data.get("failedStep") or {}
+        step_name = None
+        if isinstance(failed_step, dict):
+            step_name = failed_step.get("name")
         error_message = ""
-        if isinstance(step_1, dict):
-            error_message = step_1.get("errorMessage") or ""
+        step_obj = steps.get(step_name) if isinstance(steps, dict) and step_name else None
+        if isinstance(step_obj, dict):
+            error_message = step_obj.get("errorMessage") or ""
+        if not error_message and isinstance(steps, dict):
+            for _, step in steps.items():
+                if isinstance(step, dict) and step.get("status") == "FAILED":
+                    error_message = step.get("errorMessage") or ""
+                    if error_message:
+                        break
         trigger = steps.get("trigger") if isinstance(steps, dict) else None
         trigger_body = ""
         if isinstance(trigger, dict):
@@ -668,6 +679,11 @@ def _fetch_activepieces_error_details(api_url: str) -> Optional[Dict[str, Any]]:
                 raw_body = output.get("rawBody")
                 if raw_body is not None:
                     trigger_body = raw_body
+                elif "body" in output and output.get("body") is not None:
+                    try:
+                        trigger_body = json.dumps(output.get("body"), ensure_ascii=False)
+                    except Exception:
+                        trigger_body = str(output.get("body"))
         return {"error_message": error_message, "trigger_raw_body": trigger_body, "run_id": run_id}
     except Exception as e:
         logger.log("activepieces.flowruns.exception", "Exception fetching flow run detail", {"error": str(e)})
