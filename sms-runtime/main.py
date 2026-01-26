@@ -588,6 +588,34 @@ def _is_valid_api_url(u: str) -> bool:
 _ACTIVE_PIECES_KEY_CACHE: Optional[str] = None
 _ACTIVE_PIECES_PROJECT_ID = "m6IFepCya4gsolsay8PoM"
 
+def _fetch_active_pieces_key_from_redis() -> Optional[str]:
+    if not _redis_client:
+        logger.log("error.fetch_active_pieces_key.redis_unavailable", "Redis client not available for API key lookup", {})
+        return None
+    try:
+        table_name = "API Keys"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        sorted_ids = sorted([rid for rid in row_ids if rid and rid != "_meta"])
+        if not sorted_ids:
+            logger.log("error.fetch_active_pieces_key.redis_empty", "No API key rows found in Redis", {"table": table_name})
+            return None
+        first_id = sorted_ids[0]
+        row_key = f"table:{table_name}:row:{first_id}"
+        row = _redis_client.hgetall(row_key) or {}
+        raw_value = row.get("value")
+        if isinstance(raw_value, str):
+            parsed = _safe_json_loads(raw_value)
+            if isinstance(parsed, dict) and parsed.get("value"):
+                return str(parsed.get("value"))
+        if raw_value:
+            return str(raw_value)
+        logger.log("error.fetch_active_pieces_key.redis_missing_value", "API key row missing value field", {"row_id": first_id})
+        return None
+    except Exception as e:
+        logger.log("error.fetch_active_pieces_key.redis_error", "Failed to fetch API key from Redis", {"error": str(e)})
+        return None
+
 def _extract_flow_id_from_url(api_url: str) -> Optional[str]:
     try:
         parsed = urllib.parse.urlparse(api_url)
@@ -606,35 +634,10 @@ def _fetch_active_pieces_key() -> Optional[str]:
     global _ACTIVE_PIECES_KEY_CACHE
     if _ACTIVE_PIECES_KEY_CACHE:
         return _ACTIVE_PIECES_KEY_CACHE
-    try:
-        logger.log("internal.request", "Fetching Activepieces API key", {"method": "GET", "url": "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys"})
-        resp = requests.get("https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys", timeout=20)
-        resp_text = None
-        try:
-            resp_text = resp.text
-        except Exception:
-            resp_text = None
-        logger.log("internal.response", "Activepieces API key response", {"status_code": resp.status_code, "body": (resp_text[:1000] + "…") if isinstance(resp_text, str) and len(resp_text) > 1000 else resp_text})
-        data = resp.json() if resp.ok else None
-        if isinstance(data, dict):
-            first_key = next(iter(data.keys()), None)
-            first_rec = data.get(first_key) if first_key is not None else None
-            if isinstance(first_rec, dict) and first_rec.get("value"):
-                name = str(first_rec.get("name", "")).strip().lower()
-                if name and name != "active_pieces":
-                    logger.log("error.fetch_active_pieces_key.name_mismatch", "First API key record is not active_pieces", {"name": name})
-                _ACTIVE_PIECES_KEY_CACHE = str(first_rec.get("value"))
-                return _ACTIVE_PIECES_KEY_CACHE
-            for rec in data.values():
-                if not isinstance(rec, dict):
-                    continue
-                name = str(rec.get("name", "")).strip().lower()
-                if name == "active_pieces" and rec.get("value"):
-                    _ACTIVE_PIECES_KEY_CACHE = str(rec.get("value"))
-                    return _ACTIVE_PIECES_KEY_CACHE
-        logger.log("error.fetch_active_pieces_key.notfound", "Activepieces key not found in response", {"status": getattr(resp, "status_code", None)})
-    except Exception as e:
-        logger.log("error.fetch_active_pieces_key", "Failed to fetch Activepieces key", {"error": str(e)})
+    redis_key = _fetch_active_pieces_key_from_redis()
+    if redis_key:
+        _ACTIVE_PIECES_KEY_CACHE = redis_key
+        return _ACTIVE_PIECES_KEY_CACHE
     return None
 
 def _fetch_failed_flow_run(flow_id: str, app_key: str) -> Optional[Dict[str, Any]]:
