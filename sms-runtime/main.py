@@ -610,6 +610,14 @@ def _fetch_active_pieces_key() -> Optional[str]:
         resp = requests.get("https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys", timeout=20)
         data = resp.json() if resp.ok else None
         if isinstance(data, dict):
+            first_key = next(iter(data.keys()), None)
+            first_rec = data.get(first_key) if first_key is not None else None
+            if isinstance(first_rec, dict) and first_rec.get("value"):
+                name = str(first_rec.get("name", "")).strip().lower()
+                if name and name != "active_pieces":
+                    logger.log("error.fetch_active_pieces_key.name_mismatch", "First API key record is not active_pieces", {"name": name})
+                _ACTIVE_PIECES_KEY_CACHE = str(first_rec.get("value"))
+                return _ACTIVE_PIECES_KEY_CACHE
             for rec in data.values():
                 if not isinstance(rec, dict):
                     continue
