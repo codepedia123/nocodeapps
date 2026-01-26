@@ -745,7 +745,7 @@ def run_updater_agent():
 
 
 # ------------------------------------------------------------------
-# 6. SET GLOBAL RESULT
+# 6. SET GLOBAL RESULTT
 # ------------------------------------------------------------------
 if any(k in globals() for k in ("inputs", "input", "payload")):
     globals()["result"] = run_updater_agent()
