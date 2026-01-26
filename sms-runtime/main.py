@@ -607,7 +607,14 @@ def _fetch_active_pieces_key() -> Optional[str]:
     if _ACTIVE_PIECES_KEY_CACHE:
         return _ACTIVE_PIECES_KEY_CACHE
     try:
+        logger.log("internal.request", "Fetching Activepieces API key", {"method": "GET", "url": "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys"})
         resp = requests.get("https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys", timeout=20)
+        resp_text = None
+        try:
+            resp_text = resp.text
+        except Exception:
+            resp_text = None
+        logger.log("internal.response", "Activepieces API key response", {"status_code": resp.status_code, "body": (resp_text[:1000] + "…") if isinstance(resp_text, str) and len(resp_text) > 1000 else resp_text})
         data = resp.json() if resp.ok else None
         if isinstance(data, dict):
             first_key = next(iter(data.keys()), None)
@@ -635,7 +642,14 @@ def _fetch_failed_flow_run(flow_id: str, app_key: str) -> Optional[Dict[str, Any
     headers = {"Authorization": app_key}
     list_url = f"{base_url}/flow-runs?flowId={flow_id}&projectId={_ACTIVE_PIECES_PROJECT_ID}&limit=1&status=FAILED"
     try:
+        logger.log("internal.request", "Fetching failed flow runs list", {"method": "GET", "url": list_url, "headers": {"Authorization": "(redacted)"}})
         list_resp = requests.get(list_url, headers=headers, timeout=20)
+        list_resp_text = None
+        try:
+            list_resp_text = list_resp.text
+        except Exception:
+            list_resp_text = None
+        logger.log("internal.response", "Failed flow runs list response", {"status_code": list_resp.status_code, "body": (list_resp_text[:1000] + "…") if isinstance(list_resp_text, str) and len(list_resp_text) > 1000 else list_resp_text})
         list_data = list_resp.json() if list_resp.ok else None
         if not isinstance(list_data, dict):
             logger.log("error.flow_runs.parse", "Failed to parse failed flow runs list", {"status": list_resp.status_code if list_resp else None})
@@ -649,7 +663,14 @@ def _fetch_failed_flow_run(flow_id: str, app_key: str) -> Optional[Dict[str, Any
             logger.log("error.flow_runs.no_id", "Failed run missing id", {"flow_id": flow_id})
             return None
         detail_url = f"{base_url}/flow-runs/{run_id}"
+        logger.log("internal.request", "Fetching failed flow run detail", {"method": "GET", "url": detail_url, "headers": {"Authorization": "(redacted)"}})
         detail_resp = requests.get(detail_url, headers=headers, timeout=20)
+        detail_resp_text = None
+        try:
+            detail_resp_text = detail_resp.text
+        except Exception:
+            detail_resp_text = None
+        logger.log("internal.response", "Failed flow run detail response", {"status_code": detail_resp.status_code, "body": (detail_resp_text[:1000] + "…") if isinstance(detail_resp_text, str) and len(detail_resp_text) > 1000 else detail_resp_text})
         detail_json = detail_resp.json() if detail_resp.ok else None
         if not isinstance(detail_json, dict):
             logger.log("error.flow_run.detail_parse", "Failed to parse flow run detail", {"status": detail_resp.status_code if detail_resp else None, "run_id": run_id})
