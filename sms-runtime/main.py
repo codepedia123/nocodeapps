@@ -720,7 +720,7 @@ def _build_activepieces_error_message(tool_display_name: str, api_url: str) -> T
     err_text = error_msg or "Unknown error"
     raw_body_text = trigger_raw_body if isinstance(trigger_raw_body, str) else json.dumps(trigger_raw_body, ensure_ascii=False) if trigger_raw_body is not None else "Unavailable"
     message = f"{tool_display_name} HAD AN ISSUE, DETAILS: {err_text} ; trriger raw body: {raw_body_text}"
-    detail_payload = {"flow_id": flow_id, "error_message": error_msg, "trigger_raw_body": trigger_raw_body, "run_detail": run_detail}
+    detail_payload = {"flow_id": flow_id, "error_message": error_msg, "trigger_raw_body": trigger_raw_body}
     return message, detail_payload
 
 # ---------------------------
