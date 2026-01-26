@@ -975,7 +975,17 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             if isinstance(m, HumanMessage):
                 compact_trace.append({"role": "user", "content": (m.content[:500] + "…") if len(m.content) > 500 else m.content})
             elif isinstance(m, ToolMessage):
-                compact_trace.append({"role": "tool", "content": (m.content[:700] + "…") if isinstance(m.content, str) and len(m.content) > 700 else m.content})
+                tool_content: Any = m.content
+                if isinstance(tool_content, str):
+                    parsed = _safe_json_loads(tool_content)
+                    if isinstance(parsed, dict):
+                        response_val = parsed.get("response")
+                        if isinstance(response_val, (dict, list)):
+                            parsed["response"] = json.dumps(response_val, ensure_ascii=False)
+                        tool_content = parsed
+                    if isinstance(tool_content, str) and len(tool_content) > 700:
+                        tool_content = tool_content[:700] + "…"
+                compact_trace.append({"role": "tool", "content": tool_content})
             elif isinstance(m, AIMessage):
                 tc = getattr(m, "tool_calls", None)
                 compact_trace.append({"role": "assistant", "content": (m.content[:500] + "…") if isinstance(m.content, str) and len(m.content) > 500 else m.content, "tool_calls": tc})
