@@ -582,112 +582,114 @@ def _is_valid_api_url(u: str) -> bool:
     except Exception:
         return False
 
-def _extract_flow_id_from_api_url(api_url: str) -> Optional[str]:
+# ---------------------------
+# Activepieces error helpers
+# ---------------------------
+_ACTIVE_PIECES_KEY_CACHE: Optional[str] = None
+_ACTIVE_PIECES_PROJECT_ID = "m6IFepCya4gsolsay8PoM"
+
+def _extract_flow_id_from_url(api_url: str) -> Optional[str]:
     try:
-        p = urllib.parse.urlparse(api_url)
-        path = urllib.parse.unquote(p.path or "")
-        parts = [seg for seg in path.split("/") if seg]
+        parsed = urllib.parse.urlparse(api_url)
+        parts = [p for p in parsed.path.split("/") if p]
         if "webhooks" in parts:
             idx = parts.index("webhooks")
             if idx + 1 < len(parts):
                 return parts[idx + 1]
+        if len(parts) >= 2:
+            return parts[-2]
+        return parts[-1] if parts else None
     except Exception:
         return None
-    return None
 
-_ACTIVEPIECES_KEY_CACHE: Optional[str] = None
-
-def _fetch_activepieces_key() -> Optional[str]:
-    global _ACTIVEPIECES_KEY_CACHE
-    if _ACTIVEPIECES_KEY_CACHE:
-        return _ACTIVEPIECES_KEY_CACHE
+def _fetch_active_pieces_key() -> Optional[str]:
+    global _ACTIVE_PIECES_KEY_CACHE
+    if _ACTIVE_PIECES_KEY_CACHE:
+        return _ACTIVE_PIECES_KEY_CACHE
     try:
-        resp = requests.get(
-            "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys",
-            timeout=15,
-        )
-        if not resp.ok:
-            logger.log("activepieces.key.error", "Failed to fetch API key list", {"status_code": resp.status_code})
-            return None
-        data = resp.json()
+        resp = requests.get("https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys", timeout=20)
+        data = resp.json() if resp.ok else None
         if isinstance(data, dict):
-            for _, row in data.items():
-                if isinstance(row, dict) and row.get("name") == "active_pieces":
-                    val = row.get("value")
-                    if isinstance(val, str) and val:
-                        _ACTIVEPIECES_KEY_CACHE = val
-                        return val
+            for rec in data.values():
+                if not isinstance(rec, dict):
+                    continue
+                name = str(rec.get("name", "")).strip().lower()
+                if name == "active_pieces" and rec.get("value"):
+                    _ACTIVE_PIECES_KEY_CACHE = str(rec.get("value"))
+                    return _ACTIVE_PIECES_KEY_CACHE
+        logger.log("error.fetch_active_pieces_key.notfound", "Activepieces key not found in response", {"status": getattr(resp, "status_code", None)})
     except Exception as e:
-        logger.log("activepieces.key.exception", "Exception fetching API key list", {"error": str(e)})
+        logger.log("error.fetch_active_pieces_key", "Failed to fetch Activepieces key", {"error": str(e)})
     return None
 
-def _fetch_activepieces_error_details(api_url: str) -> Optional[Dict[str, Any]]:
-    flow_id = _extract_flow_id_from_api_url(api_url)
-    if not flow_id:
-        return None
-    app_key = _fetch_activepieces_key()
-    if not app_key:
-        return None
+def _fetch_failed_flow_run(flow_id: str, app_key: str) -> Optional[Dict[str, Any]]:
+    base_url = "https://activepieces-production-0d12.up.railway.app/api/v1"
     headers = {"Authorization": app_key}
+    list_url = f"{base_url}/flow-runs?flowId={flow_id}&projectId={_ACTIVE_PIECES_PROJECT_ID}&limit=1&status=FAILED"
     try:
-        list_url = (
-            "https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs"
-            f"?flowId={flow_id}&projectId=m6IFepCya4gsolsay8PoM&limit=1&status=FAILED"
-        )
-        resp = requests.get(list_url, headers=headers, timeout=20)
-        if not resp.ok:
-            logger.log("activepieces.flowruns.error", "Failed to fetch flow runs", {"status_code": resp.status_code})
+        list_resp = requests.get(list_url, headers=headers, timeout=20)
+        list_data = list_resp.json() if list_resp.ok else None
+        if not isinstance(list_data, dict):
+            logger.log("error.flow_runs.parse", "Failed to parse failed flow runs list", {"status": list_resp.status_code if list_resp else None})
             return None
-        data = resp.json()
-        run_id = None
-        if isinstance(data, dict):
-            runs = data.get("data")
-            if isinstance(runs, list) and runs:
-                first = runs[0]
-                if isinstance(first, dict):
-                    run_id = first.get("id")
+        runs = list_data.get("data") if isinstance(list_data.get("data"), list) else []
+        if not runs:
+            logger.log("error.flow_runs.empty", "No failed flow runs found", {"flow_id": flow_id})
+            return None
+        run_id = runs[0].get("id")
         if not run_id:
+            logger.log("error.flow_runs.no_id", "Failed run missing id", {"flow_id": flow_id})
             return None
-        run_url = f"https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs/{run_id}"
-        run_resp = requests.get(run_url, headers=headers, timeout=20)
-        if not run_resp.ok:
-            logger.log("activepieces.run.error", "Failed to fetch flow run detail", {"status_code": run_resp.status_code})
+        detail_url = f"{base_url}/flow-runs/{run_id}"
+        detail_resp = requests.get(detail_url, headers=headers, timeout=20)
+        detail_json = detail_resp.json() if detail_resp.ok else None
+        if not isinstance(detail_json, dict):
+            logger.log("error.flow_run.detail_parse", "Failed to parse flow run detail", {"status": detail_resp.status_code if detail_resp else None, "run_id": run_id})
             return None
-        run_data = run_resp.json()
-        if not isinstance(run_data, dict):
-            return None
-        steps = run_data.get("steps") or {}
-        failed_step = run_data.get("failedStep") or {}
-        step_name = None
-        if isinstance(failed_step, dict):
-            step_name = failed_step.get("name")
-        error_message = ""
-        step_obj = steps.get(step_name) if isinstance(steps, dict) and step_name else None
-        if isinstance(step_obj, dict):
-            error_message = step_obj.get("errorMessage") or ""
-        if not error_message and isinstance(steps, dict):
-            for _, step in steps.items():
-                if isinstance(step, dict) and step.get("status") == "FAILED":
-                    error_message = step.get("errorMessage") or ""
-                    if error_message:
-                        break
-        trigger = steps.get("trigger") if isinstance(steps, dict) else None
-        trigger_body = ""
-        if isinstance(trigger, dict):
-            output = trigger.get("output") or {}
-            if isinstance(output, dict):
-                raw_body = output.get("rawBody")
-                if raw_body is not None:
-                    trigger_body = raw_body
-                elif "body" in output and output.get("body") is not None:
-                    try:
-                        trigger_body = json.dumps(output.get("body"), ensure_ascii=False)
-                    except Exception:
-                        trigger_body = str(output.get("body"))
-        return {"error_message": error_message, "trigger_raw_body": trigger_body, "run_id": run_id}
+        return detail_json
     except Exception as e:
-        logger.log("activepieces.flowruns.exception", "Exception fetching flow run detail", {"error": str(e)})
+        logger.log("error.flow_runs.fetch", "Failed to fetch failed flow run details", {"error": str(e), "flow_id": flow_id})
         return None
+
+def _extract_error_details_from_run(run_detail: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any]]:
+    error_msg = None
+    trigger_raw_body = None
+    steps = run_detail.get("steps") if isinstance(run_detail, dict) else {}
+    if isinstance(steps, dict):
+        failed_step_name = None
+        failed_step = run_detail.get("failedStep")
+        if isinstance(failed_step, dict):
+            failed_step_name = failed_step.get("name")
+        step_key = failed_step_name or "step_1"
+        step_info = steps.get(step_key) if isinstance(steps.get(step_key), dict) else steps.get("step_1")
+        if isinstance(step_info, dict):
+            error_msg = step_info.get("errorMessage")
+        trigger_info = steps.get("trigger")
+        if isinstance(trigger_info, dict):
+            output = trigger_info.get("output")
+            if isinstance(output, dict):
+                trigger_raw_body = output.get("rawBody")
+    return error_msg, trigger_raw_body
+
+def _build_activepieces_error_message(tool_display_name: str, api_url: str) -> Tuple[str, Dict[str, Any]]:
+    flow_id = _extract_flow_id_from_url(api_url)
+    if not flow_id:
+        msg = f"{tool_display_name} HAD AN ISSUE, DETAILS: Unable to parse flow id from API URL."
+        return msg, {"error": "flow_id_unavailable"}
+    app_key = _fetch_active_pieces_key()
+    if not app_key:
+        msg = f"{tool_display_name} HAD AN ISSUE, DETAILS: Unable to fetch Activepieces API key."
+        return msg, {"error": "app_key_unavailable", "flow_id": flow_id}
+    run_detail = _fetch_failed_flow_run(flow_id, app_key)
+    if not isinstance(run_detail, dict):
+        msg = f"{tool_display_name} HAD AN ISSUE, DETAILS: Unable to fetch flow run details."
+        return msg, {"error": "run_detail_unavailable", "flow_id": flow_id}
+    error_msg, trigger_raw_body = _extract_error_details_from_run(run_detail)
+    err_text = error_msg or "Unknown error"
+    raw_body_text = trigger_raw_body if isinstance(trigger_raw_body, str) else json.dumps(trigger_raw_body, ensure_ascii=False) if trigger_raw_body is not None else "Unavailable"
+    message = f"{tool_display_name} HAD AN ISSUE, DETAILS: {err_text} ; trriger raw body: {raw_body_text}"
+    detail_payload = {"flow_id": flow_id, "error_message": error_msg, "trigger_raw_body": trigger_raw_body, "run_detail": run_detail}
+    return message, detail_payload
 
 # ---------------------------
 # Tool factory
@@ -711,9 +713,9 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
         def _make_api_call_factory(_tool_id: str, _api_url: str, _tpl_obj: Any, _ask_map: Dict[str, str]):
             def make_api_call(state: Annotated[Optional[dict], InjectedState] = None, **kwargs) -> str:
                 event_id = str(uuid.uuid4())
+                tool_display_name = f"sync_data_tool_{_tool_id}"
                 payload = dict(kwargs or {})
                 logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
-                tool_display_name = f"sync_data_tool_{_tool_id}"
                 # Determine conversation and agent_prompt context to pass to resolver.
                 # Prefer explicit kwargs override, otherwise fallback to runtime globals set before agent.invoke.
                 conversation_for_context = None
@@ -746,6 +748,15 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": "Invalid api_url"}
                     logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
                     return json.dumps(error_data, ensure_ascii=False)
+                def _attach_error_details(base_result: Dict[str, Any]) -> Dict[str, Any]:
+                    # Ensure we always mark this as an error and swap response with enriched context.
+                    merged = dict(base_result)
+                    merged["ok"] = False
+                    merged["error"] = True
+                    message, detail_payload = _build_activepieces_error_message(tool_display_name, _api_url)
+                    merged["response"] = message
+                    merged["error_details"] = detail_payload
+                    return merged
                 try:
                     # Do not inject context variables into tool payloads.
                     resp = requests.post(_api_url, json=payload2, timeout=20)
@@ -754,33 +765,13 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     except Exception:
                         response_data = resp.text
                     tool_result = {"ok": bool(resp.ok), "status_code": resp.status_code, "response": response_data, "event_id": event_id}
-                    needs_error_details = (not resp.ok) or (resp.status_code == 500)
-                    if needs_error_details:
-                        tool_result["error"] = True
-                        details = _fetch_activepieces_error_details(_api_url)
-                        if details:
-                            err_msg = details.get("error_message") or ""
-                            raw_body = details.get("trigger_raw_body") or ""
-                        else:
-                            err_msg = str(response_data)
-                            raw_body = ""
-                        message = f"{tool_display_name} HAD AN ISSUE, DETAILS: {err_msg} ; {raw_body}"
-                        tool_result["response"] = message
-                        logger.log("tool.response", f"api_tool_{_tool_id} result", tool_result)
-                        return json.dumps(tool_result, ensure_ascii=False)
+                    if resp.status_code == 500 or tool_result.get("ok") is False:
+                        tool_result = _attach_error_details(tool_result)
                     logger.log("tool.response", f"api_tool_{_tool_id} result", tool_result)
                     return json.dumps(tool_result, ensure_ascii=False)
                 except Exception as e:
-                    error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": True, "error_message": str(e)}
-                    details = _fetch_activepieces_error_details(_api_url)
-                    if details:
-                        err_msg = details.get("error_message") or ""
-                        raw_body = details.get("trigger_raw_body") or ""
-                    else:
-                        err_msg = str(e)
-                        raw_body = ""
-                    message = f"{tool_display_name} HAD AN ISSUE, DETAILS: {err_msg} ; {raw_body}"
-                    error_data["response"] = message
+                    error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
+                    error_data = _attach_error_details(error_data)
                     logger.log("tool.error", f"api_tool_{_tool_id} failed", error_data)
                     return json.dumps(error_data, ensure_ascii=False)
             return make_api_call
