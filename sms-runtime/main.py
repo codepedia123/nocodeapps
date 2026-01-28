@@ -450,24 +450,6 @@ def _gather_evidence_from_conversation(conversation: List[Dict[str, Any]]) -> Di
     return evidence
 
 def _auto_fill_for_field(field: str, payload: Dict[str, Any], template: Dict[str, Any], evidence: Dict[str, Any], agent_prompt: str) -> Optional[Any]:
-    # end_date_time -> default +30 minutes if start provided and isoparseable
-    if field in ("end_date_time", "endTime", "end") and _is_empty(payload.get(field)):
-        start = payload.get("start_date_time") or payload.get("start") or payload.get("dtstart")
-        if isinstance(start, str) and start:
-            try:
-                dt = datetime.fromisoformat(start)
-                return (dt + timedelta(minutes=30)).isoformat()
-            except Exception:
-                return None
-    # title generation: use intent keywords to create a sensible title
-    if field in ("title", "summary") and (_is_empty(payload.get(field))):
-        if evidence.get("intent_keywords"):
-            kw = evidence["intent_keywords"][0]
-            return f"{kw.capitalize()} Appointment"
-        if re.search(r"\bdental\b|\bclinic\b", agent_prompt, re.I) and evidence.get("intent_keywords"):
-            return "Clinic Appointment"
-        return "Appointment"
-    # attendees: avoid inventing emails
     return None
 
 def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: Dict[str, str], payload: Dict[str, Any], conversation: List[Dict[str, Any]], agent_prompt: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
@@ -480,31 +462,14 @@ def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: 
     final = dict(payload or {})
     missing_should: List[str] = []
 
-    preferred_not_ask = {"title", "summary", "id", "start_date_time", "end_date_time", "dtstart", "dtend"}
-
-    booking_mode = bool(re.search(r"\b(book|appointment|schedule|resched|reschedule)\b", agent_prompt, re.I))
-
     for field in tpl.keys():
         cur_val = final.get(field)
         # if non-empty, ok
         if not _is_empty(cur_val):
             continue
-        # try deterministic autofill
-        auto = _auto_fill_for_field(field, final, tpl, evidence, agent_prompt)
-        if auto is not None:
-            final[field] = auto
-            logger.log("autofill", f"Auto-filled field {field}", {"value": auto})
-            continue
         guidance = (ask_map or {}).get(field, None)
-        # system preference for not asking certain fields
-        if field in preferred_not_ask:
-            if guidance == "SHOULD_BE_ASKED":
-                pass
-            else:
-                continue
-        # booking mode: treat emails/attendees as required
-        if booking_mode and _looks_like_email_field(field):
-            missing_should.append(field)
+        # Respect explicit ask guidance
+        if guidance == "NOT_TO_BE_ASKED":
             continue
         # respect ask_map
         if guidance == "SHOULD_BE_ASKED":
@@ -516,41 +481,11 @@ def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: 
         # optional keys skip
         if field in _OPTIONAL_KEYS:
             continue
-        # if field looks like email/attendee, ask
-        if _looks_like_email_field(field):
-            missing_should.append(field)
-            continue
         # otherwise skip
         continue
 
-    # Validate email-like fields for basic format if present
-    invalid_email_fields: List[str] = []
-    for f in list(final.keys()):
-        if _looks_like_email_field(f):
-            norm = _normalize_email_list(final.get(f))
-            if not norm and not _is_empty(final.get(f)):
-                invalid_email_fields.append(f)
-            else:
-                final[f] = norm if norm else final.get(f)
-
-    if invalid_email_fields:
-        if len(invalid_email_fields) == 1:
-            return False, f"Could you share a valid email address for {invalid_email_fields[0]}?", final
-        else:
-            return False, f"Could you share valid email addresses for {', '.join(invalid_email_fields)}?", final
-
     if missing_should:
-        priority = ["attendees", "email", "emails", "invitees", "phone", "contact", "name"]
-        chosen = None
-        for p in priority:
-            for m in missing_should:
-                if p in m.lower():
-                    chosen = m
-                    break
-            if chosen:
-                break
-        if not chosen:
-            chosen = missing_should[0]
+        chosen = missing_should[0]
         q = f"Could you provide {chosen} so I can complete the booking?"
         return False, q, final
 
@@ -569,15 +504,6 @@ def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template
         if k not in payload:
             payload[k] = payload.get(k, "")
     ok, question, final_payload = _resolve_fields_and_produce_question(template_obj, ask_map or {}, payload, conversation or [], agent_prompt or "")
-    # final end_date_time fill
-    if ok and "start_date_time" in final_payload and _is_empty(final_payload.get("end_date_time")) and "end_date_time" in template_obj:
-        start_val = final_payload.get("start_date_time")
-        if isinstance(start_val, str):
-            try:
-                dt = datetime.fromisoformat(start_val)
-                final_payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
-            except Exception:
-                pass
     return ok, question, final_payload
 
 # ---------------------------
@@ -869,6 +795,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         "Runtime rulebook for planning and tool calls.\n"
         "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
         "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
         "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
         "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
         "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
