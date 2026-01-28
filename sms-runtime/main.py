@@ -149,7 +149,7 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
         row_ids = _redis_client.smembers(ids_key) or set()
-        tool_map: Dict[str, Any] = {}
+        rows: List[Dict[str, Any]] = []
         for row_id in row_ids:
             if row_id == "_meta":
                 continue
@@ -164,7 +164,16 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
             row_agent_val = row.get("agent_id", "")
             if not _agent_match(row_agent_val, agent_user_id):
                 continue
-            tool_map[str(row_id)] = {
+            rows.append({"row_id": str(row_id), "row": row})
+        status_order = {"ENABLED": 0, "DISABLED": 1}
+        rows.sort(key=lambda r: status_order.get(str(r["row"].get("status", "")).upper(), 99))
+        tool_map: Dict[str, Any] = {}
+        for item in rows:
+            row = item["row"]
+            status = str(row.get("status", "") or "").upper()
+            if status == "DISABLED":
+                continue
+            tool_map[item["row_id"]] = {
                 "api_url": row.get("api_url", "") or "",
                 "api_payload_json": row.get("api_payload_json", "") or "",
                 "instructions": row.get("instructions", "") or "",
