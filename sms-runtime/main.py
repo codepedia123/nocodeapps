@@ -924,7 +924,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         max_tokens=150,
         top_p=0.9,
         n=1,
-        stream_options={"include_usage": True},
+        stream_options=None,
     )
     # Build agent
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
