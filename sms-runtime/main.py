@@ -917,7 +917,15 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     t_build_agent = time.perf_counter()
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
-    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
+    llm = ChatOpenAI(
+        api_key=api_key_to_use,
+        model="gpt-4o-mini",
+        temperature=0,
+        max_tokens=150,
+        top_p=0.9,
+        n=1,
+        stream_options={"include_usage": True},
+    )
     # Build agent
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
     _mark_latency("build_agent_ms", t_build_agent)
