@@ -5,6 +5,7 @@ import uuid
 import traceback
 import urllib.parse
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Annotated
 from operator import ior
@@ -377,6 +378,21 @@ def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
     for k, v in variables.items():
         out[str(k)] = "" if v is None else str(v)
     return out
+
+def _latency_dict_to_csv(lat_map: Dict[str, Any]) -> str:
+    """
+    Render a latency dictionary into a small CSV string.
+    """
+    if not isinstance(lat_map, dict):
+        return ""
+    lines = ["step,ms"]
+    for name, val in lat_map.items():
+        try:
+            ms = int(val)
+        except Exception:
+            ms = val
+        lines.append(f"{name},{ms}")
+    return "\n".join(lines)
 
 def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -819,12 +835,32 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
+    overall_start = time.perf_counter()
+    latencies: Dict[str, int] = {}
+
+    def _mark_latency(name: str, start_time: float):
+        try:
+            latencies[name] = max(int((time.perf_counter() - start_time) * 1000), 0)
+        except Exception:
+            latencies[name] = 0
+
+    def _finalize_output(base: Dict[str, Any]) -> Dict[str, Any]:
+        total_ms = max(int((time.perf_counter() - overall_start) * 1000), 0)
+        latencies["run_agent_total_ms"] = total_ms
+        latencies["combined_latency_ms"] = total_ms
+        base["latency_ms"] = dict(latencies)
+        base["combined_latency_ms"] = total_ms
+        base["latency_csv"] = _latency_dict_to_csv(base["latency_ms"])
+        return base
+
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
+    t_agent_fetch = time.perf_counter()
     agent_resp = fetch_agent_details(agent_id)
+    _mark_latency("fetch_agent_details_ms", t_agent_fetch)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        return _finalize_output({"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -834,7 +870,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         api_key_to_use = os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
-        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        return _finalize_output({"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
     system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
         "Runtime rulebook for planning and tool calls.\n"
@@ -871,22 +907,27 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         # Avoid stacking multiple system messages across steps
         filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
         return [system_msg] + filtered
+    t_tools = time.perf_counter()
     fetched_tools = fetch_agent_tools(str(agent_id))
+    _mark_latency("fetch_agent_tools_ms", t_tools)
     merged_config = dict(DYNAMIC_CONFIG)
     if isinstance(fetched_tools, dict):
         for tid, tcfg in fetched_tools.items():
             merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+    t_build_agent = time.perf_counter()
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
     llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
     # Build agent
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    _mark_latency("build_agent_ms", t_build_agent)
     msgs = _to_messages(conversation_history, message)
 
     # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
     # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+    invoke_start = time.perf_counter()
 
     try:
         # Log before model call
@@ -894,20 +935,25 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
         logger.log("agent.invoke.end", "Agent finished invoke")
     except GraphRecursionError as ge:
+        _mark_latency("agent_invoke_ms", invoke_start)
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         fallback_prompt = _render_system_prompt(initial_vars)
         try:
             fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_start = time.perf_counter()
             fallback_resp = llm.invoke(fallback_msgs)
+            _mark_latency("fallback_llm_ms", fallback_start)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
             logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     except Exception as e:
+        _mark_latency("agent_invoke_ms", invoke_start)
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        return _finalize_output({"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+    _mark_latency("agent_invoke_ms", invoke_start)
     # Extract last assistant message
     reply_text = ""
     try:
@@ -945,7 +991,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+                        return _finalize_output({"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)})
     except Exception:
         pass
     # Compact trace for logs
@@ -973,7 +1019,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)})
 
 # ---------------------------
 # FastAPI app
@@ -984,6 +1030,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.post("/run-agent")
 async def run_endpoint(request: Request):
+    request_start = time.perf_counter()
     try:
         body = await request.json()
     except Exception:
@@ -1014,7 +1061,15 @@ async def run_endpoint(request: Request):
         else:
             is_first_demo_sms = True
     if not agent_id:
-        return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
+        elapsed_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
+        latency_ms = {"http_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
+        return JSONResponse({
+            "reply": "Error: Missing agent_id in request",
+            "logs": logger.to_list(),
+            "latency_ms": latency_ms,
+            "combined_latency_ms": elapsed_ms,
+            "latency_report_csv": _latency_dict_to_csv(latency_ms)
+        })
     res = run_agent(str(agent_id), conversation, str(message), variables_payload)
     if is_demo_sms and is_first_demo_sms:
         reply_text = res.get("reply", "")
@@ -1048,12 +1103,24 @@ async def run_endpoint(request: Request):
             "type": "demo-sms",
             "variables": updated_variables,
         })
+    handler_latency_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
+    latency_ms_map: Dict[str, Any] = {}
+    if isinstance(res.get("latency_ms"), dict):
+        latency_ms_map.update(res.get("latency_ms"))
+    if "combined_latency_ms" in latency_ms_map:
+        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
+    latency_ms_map["http_handler_total_ms"] = handler_latency_ms
+    latency_ms_map["combined_latency_ms"] = handler_latency_ms
+    res["latency_ms"] = latency_ms_map
+    res["combined_latency_ms"] = handler_latency_ms
+    res["latency_report_csv"] = _latency_dict_to_csv(latency_ms_map)
     if is_demo_sms:
         return Response(content=_format_sms_xml(res.get("reply", "")), media_type="application/xml")
     return JSONResponse(res)
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
 if "inputs" in globals():
+    request_start = time.perf_counter()
     data = globals().get("inputs", {}) or {}
     q = globals().get("query", {}) or {}
     payload = data.get("input") if isinstance(data.get("input"), dict) else data
@@ -1113,6 +1180,17 @@ if "inputs" in globals():
             "type": "demo-sms",
             "variables": updated_variables,
         })
+    handler_latency_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
+    latency_ms_map: Dict[str, Any] = {}
+    if isinstance(_out.get("latency_ms"), dict):
+        latency_ms_map.update(_out.get("latency_ms"))
+    if "combined_latency_ms" in latency_ms_map:
+        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
+    latency_ms_map["http_handler_total_ms"] = handler_latency_ms
+    latency_ms_map["combined_latency_ms"] = handler_latency_ms
+    _out["latency_ms"] = latency_ms_map
+    _out["combined_latency_ms"] = handler_latency_ms
+    _out["latency_report_csv"] = _latency_dict_to_csv(latency_ms_map)
     try:
         _out["debug_inputs"] = {
             "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
