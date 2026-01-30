@@ -19,12 +19,28 @@ import traceback
 import re
 import builtins
 import threading
+import importlib
 load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
-from main import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
+
+# Runtime import resolver: prefer main (production), fallback to runtiemeditor (local name)
+_runtime_mod = None
+for mod_name in ("main", "runtiemeditor"):
+    try:
+        _runtime_mod = importlib.import_module(mod_name)
+        break
+    except Exception:
+        _runtime_mod = None
+
+if not _runtime_mod or not hasattr(_runtime_mod, "run_agent"):
+    raise ImportError("Failed to import runtime backend (run_agent not found) from main or runtiemeditor.")
+
+run_agent = getattr(_runtime_mod, "run_agent")
+_fetch_conversation_by_conversation_id = getattr(_runtime_mod, "_fetch_conversation_by_conversation_id")
+_upsert_voice_conversation = getattr(_runtime_mod, "_upsert_voice_conversation")
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
