@@ -94,6 +94,11 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         await websocket.send_json({"response_id": None, "content": "Invalid payload", "content_complete": True, "end_call": False})
         return
 
+    interaction_type = retell_msg.get("interaction_type") or ""
+    if interaction_type == "update_only":
+        # No response required
+        return
+
     response_id = retell_msg.get("response_id")
     transcript = retell_msg.get("transcript", [])
     user_message = ""
