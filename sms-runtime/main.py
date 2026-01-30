@@ -25,9 +25,24 @@ from langchain_openai import ChatOpenAI
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 from xml.sax.saxutils import escape
+import time
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
+_PERF_METRICS: Dict[str, List[float]] = {}
+
+def _perf_reset():
+    global _PERF_METRICS
+    _PERF_METRICS = {}
+
+def _perf_record(name: str, duration_ms: float):
+    global _PERF_METRICS
+    if name not in _PERF_METRICS:
+        _PERF_METRICS[name] = []
+    _PERF_METRICS[name].append(float(duration_ms))
+
+def _perf_get() -> Dict[str, List[float]]:
+    return {k: list(v) for k, v in _PERF_METRICS.items()}
 
 class AgentState(MessagesState):
     # This stores the dynamic variables in agent memory and merges updates
@@ -84,8 +99,10 @@ except Exception as e:
 # Redis helpers
 # ---------------------------
 def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
+    start_ns = time.perf_counter_ns()
     if not _redis_client:
         logger.log("fetch.agent.no_redis", "Redis client not available", {"agent_id": agent_id})
+        _perf_record("fetch_agent_details_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return None
     try:
         candidates: List[str] = []
@@ -125,19 +142,24 @@ def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
                             except Exception:
                                 pass
                     logger.log("fetch.agent.redis", "Fetched agent details from Redis", {"agent_key": key})
+                    _perf_record("fetch_agent_details_ms", (time.perf_counter_ns() - start_ns) / 1e6)
                     return rec
             except Exception as e:
                 logger.log("fetch.agent.redis.error", "Error checking agent key in Redis", {"candidate": key, "error": str(e)})
                 continue
         logger.log("fetch.agent.redis.notfound", "Agent not found in Redis", {"agent_id": agent_id, "candidates_tried": list(seen)})
+        _perf_record("fetch_agent_details_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return None
     except Exception as e:
         logger.log("fetch.agent.redis.exception", "Unexpected error fetching agent", {"agent_id": agent_id, "error": str(e)})
+        _perf_record("fetch_agent_details_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return None
 
 def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
+    start_ns = time.perf_counter_ns()
     if not _redis_client:
         logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
+        _perf_record("fetch_agent_tools_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return None
     def _agent_match(row_val: Any, target: Any) -> bool:
         row_str = str(row_val)
@@ -180,9 +202,11 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
                 "when_run": row.get("when_run", "") or "",
             }
         logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
+        _perf_record("fetch_agent_tools_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return tool_map
     except Exception as e:
         logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
+        _perf_record("fetch_agent_tools_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return None
 
 # ---------------------------
@@ -540,15 +564,19 @@ def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template
     """
     Backwards-compatible wrapper that uses the deterministic resolver.
     """
+    start_ns = time.perf_counter_ns()
     if not isinstance(payload, dict):
+        _perf_record("payload_validation_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return False, "Payload must be a JSON object.", {}
     if not isinstance(template_obj, dict):
+        _perf_record("payload_validation_ms", (time.perf_counter_ns() - start_ns) / 1e6)
         return True, None, payload
     # Ensure template keys exist in payload (allow empty so resolver can decide)
     for k in template_obj.keys():
         if k not in payload:
             payload[k] = payload.get(k, "")
     ok, question, final_payload = _resolve_fields_and_produce_question(template_obj, ask_map or {}, payload, conversation or [], agent_prompt or "")
+    _perf_record("payload_validation_ms", (time.perf_counter_ns() - start_ns) / 1e6)
     return ok, question, final_payload
 
 # ---------------------------
@@ -771,7 +799,9 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     return merged
                 try:
                     # Do not inject context variables into tool payloads.
+                    http_start = time.perf_counter_ns()
                     resp = requests.post(_api_url, json=payload2, timeout=20)
+                    _perf_record(f"tool_http_ms_{_tool_id}", (time.perf_counter_ns() - http_start) / 1e6)
                     try:
                         response_data = resp.json()
                     except Exception:
@@ -818,13 +848,18 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
     logger.clear()
+    _perf_reset()
+    total_start = time.perf_counter_ns()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
     agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        total_ms = (time.perf_counter_ns() - total_start) / 1e6
+        perf = _perf_get()
+        perf["total_run_agent_ms"] = [total_ms]
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars), "perf": perf}
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -891,7 +926,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     try:
         # Log before model call
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
+        llm_start = time.perf_counter_ns()
         state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
+        _perf_record("llm_invoke_ms", (time.perf_counter_ns() - llm_start) / 1e6)
         logger.log("agent.invoke.end", "Agent finished invoke")
     except GraphRecursionError as ge:
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
@@ -901,13 +938,19 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
-        except Exception as le:
-            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
-            reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+            except Exception as le:
+                logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
+                reply_text = f"Error: {str(ge)}"
+        total_ms = (time.perf_counter_ns() - total_start) / 1e6
+        perf = _perf_get()
+        perf["total_run_agent_ms"] = [total_ms]
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars), "perf": perf}
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        total_ms = (time.perf_counter_ns() - total_start) / 1e6
+        perf = _perf_get()
+        perf["total_run_agent_ms"] = [total_ms]
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars), "perf": perf}
     # Extract last assistant message
     reply_text = ""
     try:
@@ -944,8 +987,11 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     parsed = _safe_json_loads(content)
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
-                        logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+        logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
+                        total_ms = (time.perf_counter_ns() - total_start) / 1e6
+                        perf = _perf_get()
+                        perf["total_run_agent_ms"] = [total_ms]
+                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict), "perf": perf}
     except Exception:
         pass
     # Compact trace for logs
@@ -973,7 +1019,10 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    total_ms = (time.perf_counter_ns() - total_start) / 1e6
+    perf = _perf_get()
+    perf["total_run_agent_ms"] = [total_ms]
+    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict), "perf": perf}
 
 # ---------------------------
 # FastAPI app
