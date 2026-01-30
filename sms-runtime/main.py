@@ -222,6 +222,37 @@ def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
         logger.log("fetch.convo.exception", "Error fetching conversation by phone", {"phone": phone, "error": str(e)})
         return None
 
+def _fetch_conversation_by_conversation_id(conversation_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client or not conversation_id:
+        return None
+    try:
+        table_name = "all_conversations"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.convo_by_id.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
+                continue
+            if not row:
+                continue
+            cid = row.get("conversation_id")
+            if cid and str(cid) == str(conversation_id):
+                row_data = {"id": row_id}
+                row_data.update(row)
+                for fld in ("conversation_json", "tool_run_logs", "variables"):
+                    if fld in row_data:
+                        row_data[fld] = _parse_json_field(row_data[fld])
+                return row_data
+        return None
+    except Exception as e:
+        logger.log("fetch.convo_by_id.exception", "Error fetching conversation by id", {"conversation_id": conversation_id, "error": str(e)})
+        return None
+
 def _hset_map(client: UpstashRedis, key: str, mapping: Dict[str, Any]) -> None:
     if not mapping:
         return
@@ -266,6 +297,20 @@ def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Opt
     except Exception as e:
         logger.log("save.convo.error", "Failed to upsert conversation", {"error": str(e)})
         return None
+
+def _upsert_voice_conversation(conversation_id: str, agent_id: str, conversation_json: List[Dict[str, Any]], variables: Optional[Dict[str, Any]] = None, tool_run_logs: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    existing = _fetch_conversation_by_conversation_id(conversation_id)
+    row_id = existing.get("id") if isinstance(existing, dict) else None
+    data = {
+        "conversation_id": conversation_id,
+        "agent_id": agent_id,
+        "conversation_json": conversation_json,
+        "type": "voice-retell",
+        "variables": variables or {},
+    }
+    if tool_run_logs is not None:
+        data["tool_run_logs"] = tool_run_logs
+    return _upsert_conversation_row(row_id, data)
 
 # ---------------------------
 # Utility validators and helpers
