@@ -3,13 +3,14 @@ import os
 import json
 import time
 import uuid
+import asyncio
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List, Tuple
 
 # --- Redis Cluster Supporrt ---
 from redis.cluster import RedisCluster
 import redis
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ load_dotenv()
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
+from runtiemeditor import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
@@ -67,6 +69,87 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------------------------------------------------------------
+# Retell WebSocket adapter
+# ----------------------------------------------------------------------
+async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
+    """
+    Minimal Retell adapter: extracts last user transcription, runs the agent, streams back reply.
+    """
+    transcriptions = retell_msg.get("transcriptions", []) if isinstance(retell_msg, dict) else []
+    user_message = ""
+    for t in reversed(transcriptions):
+        if isinstance(t, dict) and t.get("type") == "user" and t.get("content"):
+            user_message = str(t["content"])
+            break
+    if not user_message:
+        await websocket.send_json({"response": {"content": "I didn't catch that."}})
+        return
+
+    conversation_id = str(retell_msg.get("conversation_id") or uuid.uuid4())
+
+    existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
+    conversation_history = []
+    variables = {}
+    prior_tool_logs = []
+    if isinstance(existing_convo, dict):
+        convo_json = existing_convo.get("conversation_json")
+        if isinstance(convo_json, list):
+            conversation_history = convo_json
+        stored_vars = existing_convo.get("variables")
+        if isinstance(stored_vars, dict):
+            variables = stored_vars
+        if isinstance(existing_convo.get("tool_run_logs"), list):
+            prior_tool_logs = existing_convo.get("tool_run_logs")
+
+    try:
+        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+    except Exception as e:
+        await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+        return
+
+    reply_text = result.get("reply", "Sorry, something went wrong.")
+    final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
+
+    new_convo = list(conversation_history)
+    new_convo.append({"role": "user", "content": user_message})
+    new_convo.append({"role": "assistant", "content": reply_text})
+
+    tool_events = []
+    for ev in result.get("logs", []):
+        if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+            ev_copy = dict(ev)
+            ev_copy["assistant_index"] = len(new_convo)
+            tool_events.append(ev_copy)
+    tool_run_logs = prior_tool_logs + tool_events
+
+    _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
+
+    response = {
+        "response": {
+            "content": reply_text,
+            "message_id": str(uuid.uuid4())
+        },
+        "conversation_state": final_vars
+    }
+    await websocket.send_json(response)
+
+
+@app.websocket("/runtime/{agent_id}")
+async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            await _handle_retell_message(websocket, agent_id, data)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        try:
+            await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+        except Exception:
+            pass
 
 # ----------------------------------------------------------------------
 # Request models
