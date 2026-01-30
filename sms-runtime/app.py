@@ -41,6 +41,7 @@ if not _runtime_mod or not hasattr(_runtime_mod, "run_agent"):
 run_agent = getattr(_runtime_mod, "run_agent")
 _fetch_conversation_by_conversation_id = getattr(_runtime_mod, "_fetch_conversation_by_conversation_id")
 _upsert_voice_conversation = getattr(_runtime_mod, "_upsert_voice_conversation")
+_runtime_latency_csv = getattr(_runtime_mod, "_latency_dict_to_csv", None)
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
@@ -106,8 +107,19 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
       "end_call": false
     }
     """
+    handler_start = time.perf_counter()
     if not isinstance(retell_msg, dict):
-        await websocket.send_json({"response_id": None, "content": "Invalid payload", "content_complete": True, "end_call": False})
+        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
+        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
+        await websocket.send_json({
+            "response_id": None,
+            "content": "Invalid payload",
+            "content_complete": True,
+            "end_call": False,
+            "latency_ms": latency_ms,
+            "combined_latency_ms": elapsed_ms,
+            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
+        })
         return
 
     interaction_type = retell_msg.get("interaction_type") or ""
@@ -125,11 +137,16 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 break
 
     if not user_message:
+        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
+        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
         await websocket.send_json({
             "response_id": response_id,
             "content": "I didn't catch that.",
             "content_complete": True,
-            "end_call": False
+            "end_call": False,
+            "latency_ms": latency_ms,
+            "combined_latency_ms": elapsed_ms,
+            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
         })
         return
 
@@ -157,13 +174,28 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
     try:
         result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
     except Exception:
+        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
+        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
         await websocket.send_json({
             "response_id": response_id,
             "content": "Sorry, something went wrong.",
             "content_complete": True,
-            "end_call": False
+            "end_call": False,
+            "latency_ms": latency_ms,
+            "combined_latency_ms": elapsed_ms,
+            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
         })
         return
+    handler_latency_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
+    latency_ms_map: Dict[str, Any] = {}
+    if isinstance(result.get("latency_ms"), dict):
+        latency_ms_map.update(result.get("latency_ms"))
+    if "combined_latency_ms" in latency_ms_map:
+        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
+    latency_ms_map["websocket_handler_total_ms"] = handler_latency_ms
+    combined_latency_ms = handler_latency_ms
+    latency_ms_map["combined_latency_ms"] = combined_latency_ms
+    latency_report_csv = _latency_map_to_csv(latency_ms_map, combined_latency_ms)
 
     reply_text = result.get("reply", "Sorry, something went wrong.")
     final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
@@ -186,7 +218,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         "response_id": response_id,
         "content": reply_text,
         "content_complete": True,
-        "end_call": False
+        "end_call": False,
+        "latency_ms": latency_ms_map,
+        "combined_latency_ms": combined_latency_ms,
+        "latency_report_csv": latency_report_csv
     }
     await websocket.send_json(response)
 
@@ -296,6 +331,22 @@ def hset_map(key: str, mapping: Dict[str, Any]):
     # CHANGE 'mapping' TO 'values' HERE
     r.hset(key, values=clean_map)
 
+def _latency_map_to_csv(lat_map: Dict[str, Any], combined_ms: Optional[int] = None) -> str:
+    """
+    Convert a latency mapping into a CSV string for reporting.
+    """
+    if not isinstance(lat_map, dict):
+        lat_map = {}
+    lines = ["step,ms"]
+    for name, val in lat_map.items():
+        try:
+            ms = int(val)
+        except Exception:
+            ms = val
+        lines.append(f"{name},{ms}")
+    if combined_ms is not None and "combined_latency_ms" not in lat_map:
+        lines.append(f"combined_latency_ms,{int(combined_ms)}")
+    return "\n".join(lines)
 
 
 
