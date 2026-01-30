@@ -75,19 +75,49 @@ app.add_middleware(
 # ----------------------------------------------------------------------
 async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
     """
-    Minimal Retell adapter: extracts last user transcription, runs the agent, streams back reply.
+    Retell adapter (response_required protocol).
+    Expects:
+    {
+      "response_id": 1,
+      "transcript": [{"role": "agent", "content": "Hello"}, {"role": "user", "content": "I need help"}],
+      "interaction_type": "response_required"
+    }
+    Responds with:
+    {
+      "response_id": 1,
+      "content": "...",
+      "content_complete": true,
+      "end_call": false
+    }
     """
-    transcriptions = retell_msg.get("transcriptions", []) if isinstance(retell_msg, dict) else []
-    user_message = ""
-    for t in reversed(transcriptions):
-        if isinstance(t, dict) and t.get("type") == "user" and t.get("content"):
-            user_message = str(t["content"])
-            break
-    if not user_message:
-        await websocket.send_json({"response": {"content": "I didn't catch that."}})
+    if not isinstance(retell_msg, dict):
+        await websocket.send_json({"response_id": None, "content": "Invalid payload", "content_complete": True, "end_call": False})
         return
 
-    conversation_id = str(retell_msg.get("conversation_id") or uuid.uuid4())
+    response_id = retell_msg.get("response_id")
+    transcript = retell_msg.get("transcript", [])
+    user_message = ""
+    if isinstance(transcript, list):
+        for t in reversed(transcript):
+            if isinstance(t, dict) and t.get("role") == "user" and t.get("content"):
+                user_message = str(t["content"])
+                break
+
+    if not user_message:
+        await websocket.send_json({
+            "response_id": response_id,
+            "content": "I didn't catch that.",
+            "content_complete": True,
+            "end_call": False
+        })
+        return
+
+    conversation_id = str(
+        retell_msg.get("conversation_id")
+        or retell_msg.get("call_id")
+        or retell_msg.get("session_id")
+        or f"retell-{response_id}" if response_id is not None else uuid.uuid4()
+    )
 
     existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
     conversation_history = []
@@ -105,8 +135,13 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     try:
         result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
-    except Exception as e:
-        await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+    except Exception:
+        await websocket.send_json({
+            "response_id": response_id,
+            "content": "Sorry, something went wrong.",
+            "content_complete": True,
+            "end_call": False
+        })
         return
 
     reply_text = result.get("reply", "Sorry, something went wrong.")
@@ -127,11 +162,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
     _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
 
     response = {
-        "response": {
-            "content": reply_text,
-            "message_id": str(uuid.uuid4())
-        },
-        "conversation_state": final_vars
+        "response_id": response_id,
+        "content": reply_text,
+        "content_complete": True,
+        "end_call": False
     }
     await websocket.send_json(response)
 
