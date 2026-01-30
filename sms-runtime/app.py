@@ -24,7 +24,7 @@ load_dotenv()
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
-from runtiemeditor import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
+from main import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
