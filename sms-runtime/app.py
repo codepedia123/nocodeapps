@@ -171,7 +171,8 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
 
 @app.websocket("/runtime/{agent_id}")
-async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
+@app.websocket("/runtime/{agent_id}/{conversation_id}")
+async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str, conversation_id: Optional[str] = None):
     await websocket.accept()
     # Send immediate greeting to satisfy Retell timeout expectations
     try:
@@ -186,6 +187,9 @@ async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
     try:
         while True:
             data = await websocket.receive_json()
+            if conversation_id and isinstance(data, dict) and not data.get("conversation_id"):
+                data = dict(data)
+                data["conversation_id"] = conversation_id
             await _handle_retell_message(websocket, agent_id, data)
     except WebSocketDisconnect:
         pass
