@@ -167,19 +167,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     reply_text = result.get("reply", "Sorry, something went wrong.")
     final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
-    perf = result.get("perf", {}) if isinstance(result.get("perf"), dict) else {}
-    latency_csv = ""
-    if perf:
-        rows = ["name,ms"]
-        total_ms = 0.0
-        for name, vals in perf.items():
-            if not isinstance(vals, list):
-                continue
-            for idx, v in enumerate(vals):
-                rows.append(f"{name}{'' if idx == 0 else '_' + str(idx+1)},{v:.2f}")
-                total_ms += float(v)
-        rows.append(f"TOTAL,{total_ms:.2f}")
-        latency_csv = "\n".join(rows)
 
     new_convo = list(conversation_history)
     new_convo.append({"role": "user", "content": user_message})
@@ -199,10 +186,8 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         "response_id": response_id,
         "content": reply_text,
         "content_complete": True,
-        "end_call": False,
+        "end_call": False
     }
-    if latency_csv:
-        response["latency_csv"] = latency_csv
     await websocket.send_json(response)
 
 
