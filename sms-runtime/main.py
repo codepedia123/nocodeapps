@@ -164,31 +164,16 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         if not row_keys:
             logger.log("fetch.tools.redis.empty", "No tool rows found", {"agent_user_id": agent_user_id})
             return {}
-        # Attempt pipelined fetch to avoid per-row RTTs
+        # Upstash pipeline can be tricky; perform sequential hgetall to avoid execute errors.
         fetched_rows: List[Dict[str, Any]] = []
         used_pipeline = False
-        try:
-            pipe_factory = getattr(_redis_client, "pipeline", None)
-            if callable(pipe_factory):
-                pipe = pipe_factory()
-                for rk in row_keys:
-                    pipe.hgetall(rk)
-                results = pipe.execute()
-                used_pipeline = True
-                for rid, res in zip(row_ids_list, results):
-                    fetched_rows.append({"row_id": rid, "row": res or {}})
-            else:
-                raise AttributeError("pipeline not available")
-        except Exception as e:
-            logger.log("fetch.tools.redis.pipeline_fallback", "Pipeline fetch failed or unavailable, falling back to per-key hgetall", {"error": str(e)})
-            fetched_rows = []
-            for rid, rk in zip(row_ids_list, row_keys):
-                try:
-                    row = _redis_client.hgetall(rk) or {}
-                    fetched_rows.append({"row_id": rid, "row": row})
-                except Exception as e2:
-                    logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
-                    continue
+        for rid, rk in zip(row_ids_list, row_keys):
+            try:
+                row = _redis_client.hgetall(rk) or {}
+                fetched_rows.append({"row_id": rid, "row": row})
+            except Exception as e2:
+                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
+                continue
         rows: List[Dict[str, Any]] = []
         for item in fetched_rows:
             row = item.get("row") or {}
@@ -1143,6 +1128,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
 
     async def _run_stream():
         local_state = None
+        last_messages = None
         async for event in agent.astream_events(
             {"messages": msgs, "variables": initial_vars, "is_last_step": False},
             stream_mode="values",
@@ -1166,6 +1152,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             if etype in {"on_chain_end", "on_graph_end", "on_llm_end", "on_chat_model_end"}:
                 local_state = data.get("output") or data.get("state") or data
             if data.get("messages"):
+                last_messages = data.get("messages")
                 local_state = data
             # Capture message text from chat model end if present
             if etype == "on_chat_model_end" and not partial_reply_chunks:
@@ -1174,6 +1161,15 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                 if text_piece:
                     partial_reply_chunks.append(text_piece)
                     _log_step("stream.final_chunk", "Captured final chunk", {"chunk": text_piece})
+        if local_state is None and partial_reply_chunks:
+            # Build a minimal state to avoid empty responses
+            local_state = {
+                "messages": list(last_messages) if last_messages else [],
+                "variables": initial_vars,
+            }
+            # Append assistant message inferred from partials if missing
+            if isinstance(local_state.get("messages"), list):
+                local_state["messages"].append(AIMessage(content="".join(partial_reply_chunks)))
         return local_state
 
     try:
