@@ -1106,7 +1106,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             return "".join(fast_chunks)
 
         try:
-            fast_reply = asyncio.run(_fast_stream())
+            fast_reply = await _fast_stream()
             reply_text = fast_reply or "Hello!"
         except Exception as e:
             logger.log("run.fast_response.error", "Fast response failed, falling back to main agent", {"error": str(e)})
@@ -1148,7 +1148,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     try:
         # Log before model call
         logger.log("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
-        state = asyncio.run(_run_stream())
+        state = await _run_stream()
         logger.log("agent.invoke.end", "Agent finished stream")
     except GraphRecursionError as ge:
         _mark_latency("agent_invoke_ms", invoke_start)
