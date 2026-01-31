@@ -7,6 +7,7 @@ import traceback
 import urllib.parse
 import re
 import time
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Annotated, Callable
 from operator import ior
@@ -179,15 +180,28 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
             else:
                 raise AttributeError("pipeline not available")
         except Exception as e:
-            logger.log("fetch.tools.redis.pipeline_fallback", "Pipeline fetch failed or unavailable, falling back to per-key hgetall", {"error": str(e)})
+            logger.log("fetch.tools.redis.pipeline_fallback", "Pipeline fetch failed or unavailable, falling back to concurrent hgetall", {"error": str(e)})
             fetched_rows = []
-            for rid, rk in zip(row_ids_list, row_keys):
-                try:
-                    row = _redis_client.hgetall(rk) or {}
-                    fetched_rows.append({"row_id": rid, "row": row})
-                except Exception as e2:
-                    logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
-                    continue
+            try:
+                max_workers = min(8, max(1, len(row_keys)))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_key = {executor.submit(_redis_client.hgetall, rk): (rid, rk) for rid, rk in zip(row_ids_list, row_keys)}
+                    for future in concurrent.futures.as_completed(future_to_key):
+                        rid, rk = future_to_key[future]
+                        try:
+                            row = future.result() or {}
+                            fetched_rows.append({"row_id": rid, "row": row})
+                        except Exception as e2:
+                            logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
+            except Exception as e3:
+                logger.log("fetch.tools.redis.concurrent_fallback_error", "Concurrent fallback failed, falling back to sequential", {"error": str(e3)})
+                for rid, rk in zip(row_ids_list, row_keys):
+                    try:
+                        row = _redis_client.hgetall(rk) or {}
+                        fetched_rows.append({"row_id": rid, "row": row})
+                    except Exception as e2:
+                        logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
+                        continue
         rows: List[Dict[str, Any]] = []
         for item in fetched_rows:
             row = item.get("row") or {}
@@ -988,11 +1002,11 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None) -> Dict[str, Any]:
     # Synchronous wrapper for compatibility; executes the async core
-    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback))
+    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback, prefetched_agent_details, prefetched_tools, prefetched_static_header))
 
-async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None) -> Dict[str, Any]:
     logger.clear()
     _log_step("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
@@ -1018,7 +1032,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
     globals()["_CURRENT_STREAM_CALLBACK"] = stream_callback
     t_agent_fetch = time.perf_counter()
-    agent_resp = fetch_agent_details(agent_id)
+    agent_resp = prefetched_agent_details if prefetched_agent_details is not None else fetch_agent_details(agent_id)
     _mark_latency("fetch_agent_details_ms", t_agent_fetch)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
@@ -1036,7 +1050,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
 
     t_tools = time.perf_counter()
-    fetched_tools = fetch_agent_tools(str(agent_id))
+    fetched_tools = prefetched_tools if prefetched_tools is not None else fetch_agent_tools(str(agent_id))
     _mark_latency("fetch_agent_tools_ms", t_tools)
     _log_step("run.fetch_tools", "Fetched tools", {"tool_count": len(fetched_tools) if isinstance(fetched_tools, dict) else 0})
     merged_config = dict(DYNAMIC_CONFIG)
@@ -1048,7 +1062,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     # Deterministic tool ordering for caching
     sorted_config_items = sorted(merged_config.items(), key=lambda kv: str(kv[0]))
     ordered_config: Dict[str, Any] = {k: v for k, v in sorted_config_items}
-    static_header = _build_static_header(ordered_config)
+    static_header = prefetched_static_header if prefetched_static_header else _build_static_header(ordered_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
