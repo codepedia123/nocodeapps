@@ -256,17 +256,8 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
 
-    response = {
-        "response_id": response_id,
-        "content": reply_text,
-        "content_complete": True,
-        "end_call": False,
-        "latency_ms": latency_ms_map,
-        "combined_latency_ms": combined_latency_ms,
-        "latency_report_csv": latency_report_csv,
-        # "logs": result.get("logs", [])
-    }
-    await websocket.send_json(response)
+    # Do not send a final aggregated message; streaming tokens already delivered.
+    return
 
 
 @app.websocket("/runtime/{agent_id}")
