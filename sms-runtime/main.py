@@ -1011,11 +1011,11 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None, final_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
     # Synchronous wrapper for compatibility; executes the async core
-    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback, prefetched_agent_details, prefetched_tools, prefetched_static_header))
+    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback, prefetched_agent_details, prefetched_tools, prefetched_static_header, final_callback))
 
-async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None) -> Dict[str, Any]:
+async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None, final_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
     logger.clear()
     _log_step("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
@@ -1246,7 +1246,13 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         except Exception as le:
             _log_step("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        if callable(final_callback):
+            try:
+                final_callback(result_obj)
+            except Exception:
+                pass
+        return result_obj
     except Exception as e:
         _mark_latency("agent_invoke_ms", invoke_start)
         _log_step("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
@@ -1261,7 +1267,13 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     if state is None:
         reply_text = "".join(partial_reply_chunks) or "Error: No response generated."
         _log_step("run.no_state", "No state after stream; returning partial/fallback reply", {"reply": reply_text})
-        return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        if callable(final_callback):
+            try:
+                final_callback(result_obj)
+            except Exception:
+                pass
+        return result_obj
     # Extract last assistant message
     reply_text = ""
     try:
