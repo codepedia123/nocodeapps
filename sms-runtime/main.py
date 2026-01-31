@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
@@ -924,10 +925,16 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         max_tokens=150,
         top_p=0.9,
         n=1,
-        stream_options=None,
     )
-    # Build agent
-    agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    # Build agent with in-memory checkpointer to enable streaming
+    checkpointer = MemorySaver()
+    agent = create_react_agent(
+        llm,
+        tools,
+        state_modifier=_state_modifier_fn,
+        state_schema=AgentState,
+        checkpointer=checkpointer,
+    )
     _mark_latency("build_agent_ms", t_build_agent)
     msgs = _to_messages(conversation_history, message)
 
@@ -936,12 +943,17 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
     invoke_start = time.perf_counter()
-
+    state = None
     try:
         # Log before model call
-        logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
-        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
-        logger.log("agent.invoke.end", "Agent finished invoke")
+        logger.log("agent.invoke.start", "Invoking agent (stream)", {"message_count": len(msgs)})
+        for chunk in agent.stream(
+            {"messages": msgs, "variables": initial_vars, "is_last_step": False},
+            stream_mode="values",
+            config={"recursion_limit": 50, "configurable": {"thread_id": str(uuid.uuid4())}},
+        ):
+            state = chunk
+        logger.log("agent.invoke.end", "Agent finished stream")
     except GraphRecursionError as ge:
         _mark_latency("agent_invoke_ms", invoke_start)
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
@@ -962,6 +974,8 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
         return _finalize_output({"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     _mark_latency("agent_invoke_ms", invoke_start)
+    if state is None:
+        return _finalize_output({"reply": "Error: No response generated.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     # Extract last assistant message
     reply_text = ""
     try:
