@@ -493,6 +493,18 @@ def _extract_text_from_chunk(chunk: Any) -> str:
     Safely extract text content from a LangChain / OpenAI chunk structure.
     """
     try:
+        if isinstance(chunk, dict):
+            txt_parts: List[str] = []
+            for choice in chunk.get("choices", []):
+                delta = choice.get("delta", {}) or {}
+                if "content" in delta and isinstance(delta["content"], list):
+                    for c in delta["content"]:
+                        if isinstance(c, str):
+                            txt_parts.append(c)
+                        elif isinstance(c, dict) and "text" in c:
+                            txt_parts.append(c.get("text") or "")
+            if txt_parts:
+                return "".join(txt_parts)
         # LangChain OpenAI chat chunk usually exposes .content as list of AIMessageChunk content parts
         content = getattr(chunk, "content", None)
         if isinstance(content, list):
@@ -1139,10 +1151,16 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                             stream_cb(text_piece)
                         except Exception:
                             pass
-            if etype in {"on_chain_end", "on_graph_end", "on_llm_end"}:
+            if etype in {"on_chain_end", "on_graph_end", "on_llm_end", "on_chat_model_end"}:
                 local_state = data.get("output") or data.get("state") or data
             if data.get("messages"):
                 local_state = data
+            # Capture message text from chat model end if present
+            if etype == "on_chat_model_end" and not partial_reply_chunks:
+                resp = data.get("response") or {}
+                text_piece = _extract_text_from_chunk(resp)
+                if text_piece:
+                    partial_reply_chunks.append(text_piece)
         return local_state
 
     try:
