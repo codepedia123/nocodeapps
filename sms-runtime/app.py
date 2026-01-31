@@ -266,7 +266,8 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         "end_call": False,
         "latency_ms": latency_ms_map,
         "combined_latency_ms": combined_latency_ms,
-        "latency_report_csv": latency_report_csv
+        "latency_report_csv": latency_report_csv,
+        "logs": result.get("logs", [])
     }
     await websocket.send_json(response)
 
