@@ -536,6 +536,15 @@ def _extract_text_from_chunk(chunk: Any) -> str:
         pass
     return ""
 
+def _log_step(event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
+    """
+    Helper to keep structured logs consistent.
+    """
+    try:
+        logger.log(event_type, message, data or {})
+    except Exception:
+        pass
+
 def _is_simple_greeting(text: str) -> bool:
     if not isinstance(text, str):
         return False
@@ -986,7 +995,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
 
 async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     logger.clear()
-    logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
+    _log_step("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
     latencies: Dict[str, int] = {}
 
@@ -1030,6 +1039,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     t_tools = time.perf_counter()
     fetched_tools = fetch_agent_tools(str(agent_id))
     _mark_latency("fetch_agent_tools_ms", t_tools)
+    _log_step("run.fetch_tools", "Fetched tools", {"tool_count": len(fetched_tools) if isinstance(fetched_tools, dict) else 0})
     merged_config = dict(DYNAMIC_CONFIG)
     if isinstance(fetched_tools, dict):
         for tid, tcfg in fetched_tools.items():
@@ -1120,6 +1130,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         try:
             fast_reply = await _fast_stream()
             reply_text = fast_reply or "Hello!"
+            _log_step("run.fast_response.success", "Fast response path used", {"reply": reply_text})
         except Exception as e:
             logger.log("run.fast_response.error", "Fast response failed, falling back to main agent", {"error": str(e)})
             reply_text = None
@@ -1151,6 +1162,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                             stream_cb(text_piece)
                         except Exception:
                             pass
+                    _log_step("stream.token", "Emitted token", {"token": text_piece})
             if etype in {"on_chain_end", "on_graph_end", "on_llm_end", "on_chat_model_end"}:
                 local_state = data.get("output") or data.get("state") or data
             if data.get("messages"):
@@ -1161,17 +1173,18 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                 text_piece = _extract_text_from_chunk(resp)
                 if text_piece:
                     partial_reply_chunks.append(text_piece)
+                    _log_step("stream.final_chunk", "Captured final chunk", {"chunk": text_piece})
         return local_state
 
     try:
         # Log before model call
-        logger.log("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
+        _log_step("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
         state = await _run_stream()
-        logger.log("agent.invoke.end", "Agent finished stream")
+        _log_step("agent.invoke.end", "Agent finished stream", {"has_state": state is not None})
     except GraphRecursionError as ge:
         _mark_latency("agent_invoke_ms", invoke_start)
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
-        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
+        _log_step("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         fallback_prompt = static_header
         try:
             fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars).replace("{agent_prompt}", agent_prompt))] + msgs
@@ -1180,12 +1193,12 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             _mark_latency("fallback_llm_ms", fallback_start)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
-            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
+            _log_step("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
         return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     except Exception as e:
         _mark_latency("agent_invoke_ms", invoke_start)
-        logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
+        _log_step("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
         return _finalize_output({"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     _mark_latency("agent_invoke_ms", invoke_start)
     if state is None:
@@ -1196,6 +1209,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             state = None
     if state is None:
         reply_text = "".join(partial_reply_chunks) or "Error: No response generated."
+        _log_step("run.no_state", "No state after stream; returning partial/fallback reply", {"reply": reply_text})
         return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     # Extract last assistant message
     reply_text = ""
@@ -1214,6 +1228,9 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             reply_text = "".join(partial_reply_chunks) or "Done."
     except Exception:
         reply_text = "".join(partial_reply_chunks) or "Done."
+    if not reply_text:
+        reply_text = "".join(partial_reply_chunks) or "Done."
+    _log_step("run.reply.final", "Final reply selected", {"reply": reply_text, "partial_used": bool(partial_reply_chunks)})
     final_variables_dict: Dict[str, Any] = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
