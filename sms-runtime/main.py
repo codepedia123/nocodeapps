@@ -1020,7 +1020,6 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     _log_step("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
     latencies: Dict[str, int] = {}
-    final_emitted = {"sent": False}
 
     def _mark_latency(name: str, start_time: float):
         try:
@@ -1181,31 +1180,6 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     state = None
     partial_reply_chunks: List[str] = []
 
-    def _emit_early_final(text: str):
-        if final_emitted.get("sent"):
-            return
-        try:
-            now_ms = max(int((time.perf_counter() - overall_start) * 1000), 0)
-            latencies["agent_invoke_ms"] = latencies.get("agent_invoke_ms", now_ms)
-            latencies["run_agent_total_ms"] = now_ms
-            latencies["combined_latency_ms"] = now_ms
-            payload = {
-                "reply": text,
-                "latency_ms": dict(latencies),
-                "combined_latency_ms": now_ms,
-                "latency_csv": _latency_dict_to_csv(latencies),
-                "variables": _variables_dict_to_object(initial_vars),
-                "logs": logger.to_list(),
-            }
-            if callable(final_callback):
-                try:
-                    final_callback(payload)
-                    final_emitted["sent"] = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
     async def _run_stream():
         local_state = None
         last_messages = None
@@ -1235,15 +1209,14 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                 if text_piece:
                     partial_reply_chunks.append(text_piece)
                     _log_step("stream.final_chunk", "Captured final chunk", {"chunk": text_piece})
+                if partial_reply_chunks:
+                    _emit_early_final("".join(partial_reply_chunks))
             elif kind == "on_chain_end" and name == "agent":
                 output = data.get("output") or {}
                 if "messages" in output:
                     local_state = output
                     last_messages = output.get("messages")
                     _log_step("stream.chain_end", "Captured agent output", {"msg_count": len(output.get("messages", []))})
-                    # Emit final immediately on chain end with current tokens
-                    if partial_reply_chunks:
-                        _emit_early_final("".join(partial_reply_chunks))
             if data.get("messages"):
                 last_messages = data.get("messages")
         if local_state is None and partial_reply_chunks:
@@ -1276,10 +1249,9 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             _log_step("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
         result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-        if callable(final_callback) and not final_emitted.get("sent"):
+        if callable(final_callback):
             try:
                 final_callback(result_obj)
-                final_emitted["sent"] = True
             except Exception:
                 pass
         return result_obj
@@ -1298,10 +1270,9 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         reply_text = "".join(partial_reply_chunks) or "Error: No response generated."
         _log_step("run.no_state", "No state after stream; returning partial/fallback reply", {"reply": reply_text})
         result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-        if callable(final_callback) and not final_emitted.get("sent"):
+        if callable(final_callback):
             try:
                 final_callback(result_obj)
-                final_emitted["sent"] = True
             except Exception:
                 pass
         return result_obj
