@@ -194,24 +194,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 break
 
     forwarder_task = asyncio.create_task(_stream_forwarder())
-    final_sent = False
-
-    def _final_callback(result_obj: Dict[str, Any]):
-        nonlocal final_sent
-        try:
-            payload = {
-                "response_id": response_id,
-                "content": result_obj.get("reply", ""),
-                "content_complete": True,
-                "end_call": False,
-                "latency_ms": result_obj.get("latency_ms", {}),
-                "combined_latency_ms": result_obj.get("combined_latency_ms"),
-                "latency_report_csv": result_obj.get("latency_csv") or result_obj.get("latency_report_csv"),
-            }
-            loop.call_soon_threadsafe(asyncio.create_task, websocket.send_json(payload))
-            final_sent = True
-        except Exception:
-            pass
 
     def _stream_callback(token: str):
         try:
@@ -221,9 +203,9 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     try:
         if callable(run_agent_async):
-            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, _final_callback)
+            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, None)
         else:
-            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, _final_callback)
+            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, None)
     except Exception:
         elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
         latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
@@ -284,8 +266,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         "latency_report_csv": latency_report_csv,
         # "logs": result.get("logs", [])
     }
-    if not final_sent:
-        await websocket.send_json(response)
+    await websocket.send_json(response)
 
 
 @app.websocket("/runtime/{agent_id}")
