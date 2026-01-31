@@ -40,6 +40,8 @@ if not _runtime_mod or not hasattr(_runtime_mod, "run_agent"):
 
 run_agent = getattr(_runtime_mod, "run_agent")
 run_agent_async = getattr(_runtime_mod, "run_agent_async", None)
+fetch_agent_details = getattr(_runtime_mod, "fetch_agent_details", None)
+fetch_agent_tools = getattr(_runtime_mod, "fetch_agent_tools", None)
 _fetch_conversation_by_conversation_id = getattr(_runtime_mod, "_fetch_conversation_by_conversation_id")
 _upsert_voice_conversation = getattr(_runtime_mod, "_upsert_voice_conversation")
 _runtime_latency_csv = getattr(_runtime_mod, "_latency_dict_to_csv", None)
@@ -91,7 +93,7 @@ app.add_middleware(
 # ----------------------------------------------------------------------
 # Retell WebSocket adapter
 # ----------------------------------------------------------------------
-async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
+async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict, cached_agent: Optional[Dict[str, Any]] = None, cached_tools: Optional[Dict[str, Any]] = None):
     """
     Retell adapter (response_required protocol).
     Expects:
@@ -201,9 +203,9 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     try:
         if callable(run_agent_async):
-            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None)
         else:
-            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
+            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None)
     except Exception:
         elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
         latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
@@ -276,6 +278,8 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 @app.websocket("/runtime/{agent_id}/{conversation_id}")
 async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str, conversation_id: Optional[str] = None):
     await websocket.accept()
+    cached_agent = fetch_agent_details(agent_id) if callable(fetch_agent_details) else None
+    cached_tools = fetch_agent_tools(agent_id) if callable(fetch_agent_tools) else None
     # Send immediate greeting to satisfy Retell timeout expectations
     try:
         await websocket.send_json({
@@ -292,7 +296,7 @@ async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str, convers
             if conversation_id and isinstance(data, dict) and not data.get("conversation_id"):
                 data = dict(data)
                 data["conversation_id"] = conversation_id
-            await _handle_retell_message(websocket, agent_id, data)
+            await _handle_retell_message(websocket, agent_id, data, cached_agent=cached_agent, cached_tools=cached_tools)
     except WebSocketDisconnect:
         pass
     except Exception:
