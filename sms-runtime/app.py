@@ -39,6 +39,7 @@ if not _runtime_mod or not hasattr(_runtime_mod, "run_agent"):
     raise ImportError("Failed to import runtime backend (run_agent not found) from main or runtiemeditor.")
 
 run_agent = getattr(_runtime_mod, "run_agent")
+run_agent_async = getattr(_runtime_mod, "run_agent_async", None)
 _fetch_conversation_by_conversation_id = getattr(_runtime_mod, "_fetch_conversation_by_conversation_id")
 _upsert_voice_conversation = getattr(_runtime_mod, "_upsert_voice_conversation")
 _runtime_latency_csv = getattr(_runtime_mod, "_latency_dict_to_csv", None)
@@ -199,7 +200,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             pass
 
     try:
-        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
+        if callable(run_agent_async):
+            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+        else:
+            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
     except Exception:
         elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
         latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
