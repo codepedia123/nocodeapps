@@ -1,3 +1,4 @@
+
 # main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
 import json
@@ -7,7 +8,7 @@ import urllib.parse
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Annotated
+from typing import Any, Dict, List, Optional, Tuple, Annotated, Callable
 from operator import ior
 import requests
 
@@ -18,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
@@ -27,6 +29,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 from xml.sax.saxutils import escape
+import asyncio
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
@@ -151,22 +154,50 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
         row_ids = _redis_client.smembers(ids_key) or set()
-        rows: List[Dict[str, Any]] = []
+        row_ids_list: List[str] = []
+        row_keys: List[str] = []
         for row_id in row_ids:
             if row_id == "_meta":
                 continue
-            row_key = f"table:{table_name}:row:{row_id}"
-            try:
-                row = _redis_client.hgetall(row_key) or {}
-            except Exception as e:
-                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
-                continue
+            row_ids_list.append(str(row_id))
+            row_keys.append(f"table:{table_name}:row:{row_id}")
+        if not row_keys:
+            logger.log("fetch.tools.redis.empty", "No tool rows found", {"agent_user_id": agent_user_id})
+            return {}
+        # Attempt pipelined fetch to avoid per-row RTTs
+        fetched_rows: List[Dict[str, Any]] = []
+        used_pipeline = False
+        try:
+            pipe_factory = getattr(_redis_client, "pipeline", None)
+            if callable(pipe_factory):
+                pipe = pipe_factory()
+                for rk in row_keys:
+                    pipe.hgetall(rk)
+                results = pipe.execute()
+                used_pipeline = True
+                for rid, res in zip(row_ids_list, results):
+                    fetched_rows.append({"row_id": rid, "row": res or {}})
+            else:
+                raise AttributeError("pipeline not available")
+        except Exception as e:
+            logger.log("fetch.tools.redis.pipeline_fallback", "Pipeline fetch failed or unavailable, falling back to per-key hgetall", {"error": str(e)})
+            fetched_rows = []
+            for rid, rk in zip(row_ids_list, row_keys):
+                try:
+                    row = _redis_client.hgetall(rk) or {}
+                    fetched_rows.append({"row_id": rid, "row": row})
+                except Exception as e2:
+                    logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
+                    continue
+        rows: List[Dict[str, Any]] = []
+        for item in fetched_rows:
+            row = item.get("row") or {}
             if not row:
                 continue
             row_agent_val = row.get("agent_id", "")
             if not _agent_match(row_agent_val, agent_user_id):
                 continue
-            rows.append({"row_id": str(row_id), "row": row})
+            rows.append({"row_id": item.get("row_id"), "row": row})
         status_order = {"ENABLED": 0, "DISABLED": 1}
         rows.sort(key=lambda r: status_order.get(str(r["row"].get("status", "")).upper(), 99))
         tool_map: Dict[str, Any] = {}
@@ -181,7 +212,7 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
                 "instructions": row.get("instructions", "") or "",
                 "when_run": row.get("when_run", "") or "",
             }
-        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
+        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map), "used_pipeline": used_pipeline})
         return tool_map
     except Exception as e:
         logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
@@ -394,6 +425,110 @@ def _latency_dict_to_csv(lat_map: Dict[str, Any]) -> str:
             ms = val
         lines.append(f"{name},{ms}")
     return "\n".join(lines)
+
+# ---------------------------
+# Static/dynamic prompt builders for prefix caching
+# ---------------------------
+def _format_tool_schema_for_prompt(tool_id: str, cfg: Dict[str, Any]) -> str:
+    """
+    Deterministically format tool schema for the static header.
+    Avoids variables to keep prefix cache stable.
+    """
+    api_url = cfg.get("api_url", "") or ""
+    payload = cfg.get("api_payload_json", "") or ""
+    instructions = cfg.get("instructions", "") or ""
+    when_run = cfg.get("when_run", "") or ""
+    tool_json = {
+        "tool_id": str(tool_id),
+        "api_url": api_url,
+        "payload_template": payload,
+        "instructions": instructions,
+        "when_run": when_run,
+    }
+    return json.dumps(tool_json, ensure_ascii=True, sort_keys=True)
+
+def _build_static_header(agent_prompt: str, merged_config: Dict[str, Any]) -> str:
+    """
+    Construct the static, cacheable system header. No variables allowed.
+    Includes agent prompt, rulebook, and deterministically ordered tool schemas.
+    """
+    # Static rulebook (no variables/time)
+    rulebook = (
+        "Runtime rulebook for planning and tool calls.\n"
+        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
+        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
+        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
+        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
+        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
+    )
+    tool_lines: List[str] = []
+    try:
+        for tid in sorted(merged_config.keys(), key=lambda x: str(x)):
+            cfg = merged_config.get(tid) or {}
+            tool_lines.append(_format_tool_schema_for_prompt(str(tid), cfg))
+    except Exception:
+        pass
+    tools_section = "\n".join(tool_lines)
+    static_header = (
+        f"AGENT_PROMPT:\n{agent_prompt}\n\n"
+        f"RUNTIME_RULEBOOK:\n{rulebook}\n\n"
+        f"TOOLS_SCHEMAS (sorted):\n{tools_section}"
+    )
+    return static_header
+
+def _build_dynamic_header(current_vars: Dict[str, Any]) -> str:
+    """
+    Dynamic header that can change per request without polluting the static prefix.
+    """
+    try:
+        vars_str = json.dumps(current_vars or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        vars_str = str(current_vars)
+    return f"CURRENT AGENT VARIABLES:\n{vars_str}"
+
+def _extract_text_from_chunk(chunk: Any) -> str:
+    """
+    Safely extract text content from a LangChain / OpenAI chunk structure.
+    """
+    try:
+        # LangChain OpenAI chat chunk usually exposes .content as list of AIMessageChunk content parts
+        content = getattr(chunk, "content", None)
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, str):
+                    parts.append(c)
+                else:
+                    text_val = getattr(c, "text", None) or getattr(c, "data", None)
+                    if isinstance(text_val, str):
+                        parts.append(text_val)
+            return "".join(parts)
+        if isinstance(content, str):
+            return content
+        # Fallback: try model_dump
+        if hasattr(chunk, "model_dump"):
+            dumped = chunk.model_dump()
+            txt_parts = []
+            for item in dumped.get("choices", []):
+                delta = item.get("delta", {})
+                if "content" in delta and isinstance(delta["content"], list):
+                    for c in delta["content"]:
+                        if isinstance(c, str):
+                            txt_parts.append(c)
+                        elif isinstance(c, dict) and "text" in c:
+                            txt_parts.append(c["text"])
+            return "".join(txt_parts)
+    except Exception:
+        pass
+    return ""
+
+def _is_simple_greeting(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    t = text.strip().lower()
+    return bool(re.match(r"^(hi|hello|hey|heyy|hiya|yo|sup)[\\.!\\s]*$", t))
 
 def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -833,7 +968,7 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
@@ -852,10 +987,12 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         base["latency_ms"] = dict(latencies)
         base["combined_latency_ms"] = total_ms
         base["latency_csv"] = _latency_dict_to_csv(base["latency_ms"])
+        globals()["_CURRENT_STREAM_CALLBACK"] = None
         return base
 
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
+    globals()["_CURRENT_STREAM_CALLBACK"] = stream_callback
     t_agent_fetch = time.perf_counter()
     agent_resp = fetch_agent_details(agent_id)
     _mark_latency("fetch_agent_details_ms", t_agent_fetch)
@@ -873,22 +1010,20 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.error", "OpenAI API key missing", {})
         return _finalize_output({"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
-        "Runtime rulebook for planning and tool calls.\n"
-        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
-        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
-        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
-        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
-        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
-        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
-    )
-    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    t_tools = time.perf_counter()
+    fetched_tools = fetch_agent_tools(str(agent_id))
+    _mark_latency("fetch_agent_tools_ms", t_tools)
+    merged_config = dict(DYNAMIC_CONFIG)
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
+    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+    t_build_agent = time.perf_counter()
+    # Deterministic tool ordering for caching
+    sorted_config_items = sorted(merged_config.items(), key=lambda kv: str(kv[0]))
+    ordered_config: Dict[str, Any] = {k: v for k, v in sorted_config_items}
+    static_header = _build_static_header(agent_prompt, ordered_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -901,30 +1036,27 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
             if isinstance(runtime_vars, dict):
                 current_vars = runtime_vars
-        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        dynamic_header = _build_dynamic_header(current_vars)
+        system_msgs = [
+            SystemMessage(content=static_header),
+            SystemMessage(content=dynamic_header),
+        ]
         messages: List[Any] = []
         if isinstance(state, dict):
             messages = state.get("messages", []) or []
-        # Avoid stacking multiple system messages across steps
-        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        return [system_msg] + filtered
-    t_tools = time.perf_counter()
-    fetched_tools = fetch_agent_tools(str(agent_id))
-    _mark_latency("fetch_agent_tools_ms", t_tools)
-    merged_config = dict(DYNAMIC_CONFIG)
-    if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
-    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
-    t_build_agent = time.perf_counter()
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+        # Remove any prior system messages to avoid duplication
+        filtered = [m for m in messages if not isinstance(m, SystemMessage)]
+        return system_msgs + filtered
+
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(ordered_config)
     llm = ChatOpenAI(
         api_key=api_key_to_use,
         model="gpt-4o-mini",
         temperature=0,
-        max_tokens=150,
+        max_tokens=100,
         top_p=0.9,
         n=1,
+        streaming=True,
     )
     # Build agent with in-memory checkpointer to enable streaming
     checkpointer = MemorySaver()
@@ -942,25 +1074,85 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+
+    # Fast-response short-circuit for simple greetings
+    if _is_simple_greeting(message) and not conversation_history:
+        fast_llm = ChatOpenAI(
+            api_key=api_key_to_use,
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=50,
+            top_p=0.9,
+            n=1,
+            streaming=True,
+        )
+        fast_chunks: List[str] = []
+
+        async def _fast_stream():
+            fast_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars))] + msgs
+            async for chunk in fast_llm.astream(fast_msgs):
+                text_piece = _extract_text_from_chunk(chunk)
+                if text_piece:
+                    fast_chunks.append(text_piece)
+                    if callable(stream_callback):
+                        try:
+                            stream_callback(text_piece)
+                        except Exception:
+                            pass
+            return "".join(fast_chunks)
+
+        try:
+            fast_reply = asyncio.run(_fast_stream())
+            reply_text = fast_reply or "Hello!"
+        except Exception as e:
+            logger.log("run.fast_response.error", "Fast response failed, falling back to main agent", {"error": str(e)})
+            reply_text = None
+        if reply_text:
+            _mark_latency("agent_invoke_ms", t_build_agent)  # approximate for fast path
+            return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     invoke_start = time.perf_counter()
     state = None
-    try:
-        # Log before model call
-        logger.log("agent.invoke.start", "Invoking agent (stream)", {"message_count": len(msgs)})
-        for chunk in agent.stream(
+    partial_reply_chunks: List[str] = []
+
+    async def _run_stream():
+        local_state = None
+        async for event in agent.astream_events(
             {"messages": msgs, "variables": initial_vars, "is_last_step": False},
             stream_mode="values",
+            version="v2",
             config={"recursion_limit": 50, "configurable": {"thread_id": str(uuid.uuid4())}},
         ):
-            state = chunk
+            etype = event.get("type", "")
+            data = event.get("data", {}) or {}
+            if etype == "on_chat_model_stream":
+                chunk = data.get("chunk")
+                text_piece = _extract_text_from_chunk(chunk)
+                if text_piece:
+                    partial_reply_chunks.append(text_piece)
+                    stream_cb = globals().get("_CURRENT_STREAM_CALLBACK")
+                    if callable(stream_cb):
+                        try:
+                            stream_cb(text_piece)
+                        except Exception:
+                            pass
+            if etype in {"on_chain_end", "on_graph_end", "on_llm_end"}:
+                local_state = data.get("output") or data.get("state") or data
+            if data.get("messages"):
+                local_state = data
+        return local_state
+
+    try:
+        # Log before model call
+        logger.log("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
+        state = asyncio.run(_run_stream())
         logger.log("agent.invoke.end", "Agent finished stream")
     except GraphRecursionError as ge:
         _mark_latency("agent_invoke_ms", invoke_start)
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = _render_system_prompt(initial_vars)
+        fallback_prompt = static_header
         try:
-            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars))] + msgs
             fallback_start = time.perf_counter()
             fallback_resp = llm.invoke(fallback_msgs)
             _mark_latency("fallback_llm_ms", fallback_start)
@@ -975,7 +1167,14 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         return _finalize_output({"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     _mark_latency("agent_invoke_ms", invoke_start)
     if state is None:
-        return _finalize_output({"reply": "Error: No response generated.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        # As a fallback, try a single invoke to get state
+        try:
+            state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
+        except Exception:
+            state = None
+    if state is None:
+        reply_text = "".join(partial_reply_chunks) or "Error: No response generated."
+        return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
     # Extract last assistant message
     reply_text = ""
     try:
@@ -990,9 +1189,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         elif last_ai:
             reply_text = str(last_ai.content)
         else:
-            reply_text = "Done."
+            reply_text = "".join(partial_reply_chunks) or "Done."
     except Exception:
-        reply_text = "Done."
+        reply_text = "".join(partial_reply_chunks) or "Done."
     final_variables_dict: Dict[str, Any] = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
@@ -1092,7 +1291,7 @@ async def run_endpoint(request: Request):
             "combined_latency_ms": elapsed_ms,
             "latency_report_csv": _latency_dict_to_csv(latency_ms)
         })
-    res = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    res = await asyncio.to_thread(run_agent, str(agent_id), conversation, str(message), variables_payload, None)
     if is_demo_sms and is_first_demo_sms:
         reply_text = res.get("reply", "")
         if reply_text and not reply_text.startswith("Demo by SaaS: "):
