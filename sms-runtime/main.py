@@ -8,6 +8,7 @@ import urllib.parse
 import re
 import time
 import concurrent.futures
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Annotated, Callable
 from operator import ior
@@ -65,6 +66,7 @@ logger = Logger()
 # Upstash Redis init
 # ---------------------------
 _redis_client: Optional[UpstashRedis] = None
+_AGENT_CACHE: Dict[str, Any] = {}
 try:
     redis_url = "https://climbing-hyena-56303.upstash.io"
     redis_token = "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM"
@@ -490,6 +492,13 @@ def _build_static_header(merged_config: Dict[str, Any]) -> str:
         f"TOOLS_SCHEMAS (sorted):\n{tools_section}"
     )
     return static_header
+
+def _agent_cache_key(agent_id: str, api_key: str, ordered_config: Dict[str, Any]) -> str:
+    try:
+        cfg_str = json.dumps(ordered_config or {}, sort_keys=True)
+    except Exception:
+        cfg_str = str(ordered_config)
+    return f"{agent_id}::{api_key}::{cfg_str}"
 
 def _build_dynamic_header(current_vars: Dict[str, Any]) -> str:
     """
@@ -1087,26 +1096,43 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         filtered = [m for m in messages if not isinstance(m, SystemMessage)]
         return system_msgs + filtered
 
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(ordered_config)
-    llm = ChatOpenAI(
-        api_key=api_key_to_use,
-        model="gpt-4o-mini",
-        temperature=0,
-        max_tokens=100,
-        top_p=0.9,
-        n=1,
-        streaming=True,
-    )
-    # Build agent with in-memory checkpointer to enable streaming
-    checkpointer = MemorySaver()
-    agent = create_react_agent(
-        llm,
-        tools,
-        state_modifier=_state_modifier_fn,
-        state_schema=AgentState,
-        checkpointer=checkpointer,
-    )
-    _mark_latency("build_agent_ms", t_build_agent)
+    cache_key = _agent_cache_key(agent_id, api_key_to_use or "", ordered_config)
+    agent = None
+    llm = None
+    cache_hit = False
+    if cache_key in _AGENT_CACHE:
+        entry = _AGENT_CACHE.get(cache_key) or {}
+        agent = entry.get("agent")
+        llm = entry.get("llm")
+        static_header = entry.get("static_header", static_header)
+        cache_hit = agent is not None and llm is not None
+    if not cache_hit:
+        tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(ordered_config)
+        llm = ChatOpenAI(
+            api_key=api_key_to_use,
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=100,
+            top_p=0.9,
+            n=1,
+            streaming=True,
+        )
+        checkpointer = MemorySaver()
+        agent = create_react_agent(
+            llm,
+            tools,
+            state_modifier=_state_modifier_fn,
+            state_schema=AgentState,
+            checkpointer=checkpointer,
+        )
+        _AGENT_CACHE[cache_key] = {
+            "agent": agent,
+            "llm": llm,
+            "static_header": static_header,
+        }
+        _mark_latency("build_agent_ms", t_build_agent)
+    else:
+        latencies["build_agent_ms"] = 0
     msgs = _to_messages(conversation_history, message)
 
     # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
