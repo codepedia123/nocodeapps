@@ -447,12 +447,12 @@ def _format_tool_schema_for_prompt(tool_id: str, cfg: Dict[str, Any]) -> str:
     }
     return json.dumps(tool_json, ensure_ascii=True, sort_keys=True)
 
-def _build_static_header(agent_prompt: str, merged_config: Dict[str, Any]) -> str:
+def _build_static_header(merged_config: Dict[str, Any]) -> str:
     """
     Construct the static, cacheable system header. No variables allowed.
     Includes agent prompt, rulebook, and deterministically ordered tool schemas.
     """
-    # Static rulebook (no variables/time)
+    # Static rulebook (no variables/time). Keep fully constant for prefix caching.
     rulebook = (
         "Runtime rulebook for planning and tool calls.\n"
         "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
@@ -472,7 +472,7 @@ def _build_static_header(agent_prompt: str, merged_config: Dict[str, Any]) -> st
         pass
     tools_section = "\n".join(tool_lines)
     static_header = (
-        f"AGENT_PROMPT:\n{agent_prompt}\n\n"
+        f"GLOBAL_PROMPT:\nYou are a helpful assistant.\n\n"
         f"RUNTIME_RULEBOOK:\n{rulebook}\n\n"
         f"TOOLS_SCHEMAS (sorted):\n{tools_section}"
     )
@@ -486,7 +486,7 @@ def _build_dynamic_header(current_vars: Dict[str, Any]) -> str:
         vars_str = json.dumps(current_vars or {}, ensure_ascii=False, sort_keys=True)
     except Exception:
         vars_str = str(current_vars)
-    return f"CURRENT AGENT VARIABLES:\n{vars_str}"
+    return f"DYNAMIC_AGENT_PROMPT:\n{{agent_prompt}}\n\nCURRENT AGENT VARIABLES:\n{vars_str}"
 
 def _extract_text_from_chunk(chunk: Any) -> str:
     """
@@ -969,6 +969,10 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # Core run logic
 # ---------------------------
 def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    # Synchronous wrapper for compatibility; executes the async core
+    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback))
+
+async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     overall_start = time.perf_counter()
@@ -1023,7 +1027,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     # Deterministic tool ordering for caching
     sorted_config_items = sorted(merged_config.items(), key=lambda kv: str(kv[0]))
     ordered_config: Dict[str, Any] = {k: v for k, v in sorted_config_items}
-    static_header = _build_static_header(agent_prompt, ordered_config)
+    static_header = _build_static_header(ordered_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -1036,7 +1040,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
             if isinstance(runtime_vars, dict):
                 current_vars = runtime_vars
-        dynamic_header = _build_dynamic_header(current_vars)
+        dynamic_header = _build_dynamic_header(current_vars).replace("{agent_prompt}", agent_prompt)
         system_msgs = [
             SystemMessage(content=static_header),
             SystemMessage(content=dynamic_header),
@@ -1089,7 +1093,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         fast_chunks: List[str] = []
 
         async def _fast_stream():
-            fast_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars))] + msgs
+            fast_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars).replace("{agent_prompt}", agent_prompt))] + msgs
             async for chunk in fast_llm.astream(fast_msgs):
                 text_piece = _extract_text_from_chunk(chunk)
                 if text_piece:
@@ -1152,7 +1156,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         fallback_prompt = static_header
         try:
-            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars))] + msgs
+            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars).replace("{agent_prompt}", agent_prompt))] + msgs
             fallback_start = time.perf_counter()
             fallback_resp = llm.invoke(fallback_msgs)
             _mark_latency("fallback_llm_ms", fallback_start)
@@ -1291,7 +1295,10 @@ async def run_endpoint(request: Request):
             "combined_latency_ms": elapsed_ms,
             "latency_report_csv": _latency_dict_to_csv(latency_ms)
         })
-    res = await asyncio.to_thread(run_agent, str(agent_id), conversation, str(message), variables_payload, None)
+    if callable(run_agent_async):
+        res = await run_agent_async(str(agent_id), conversation, str(message), variables_payload, None)
+    else:
+        res = await asyncio.to_thread(run_agent, str(agent_id), conversation, str(message), variables_payload, None)
     if is_demo_sms and is_first_demo_sms:
         reply_text = res.get("reply", "")
         if reply_text and not reply_text.startswith("Demo by SaaS: "):
