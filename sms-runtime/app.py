@@ -6,6 +6,8 @@ import uuid
 import asyncio
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List, Tuple
+import csv
+import io
 
 # --- Redis Cluster Supporrt ---
 from redis.cluster import RedisCluster
@@ -73,118 +75,189 @@ app.add_middleware(
 # ----------------------------------------------------------------------
 # Retell WebSocket adapter
 # ----------------------------------------------------------------------
+def _csv_from_logs(logs: List[Dict[str, Any]]) -> str:
+    """
+    Convert a list of log dicts to CSV (UTF-8) for easy inspection on the client.
+    """
+    if not logs:
+        return ""
+    # Collect fieldnames deterministically
+    fieldnames = sorted({k for row in logs for k in row.keys()})
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in logs:
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return buf.getvalue()
+
 async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
     """
-    Minimal Retell adapter: extracts last user transcription, runs the agent, streams back reply.
+    Retell adapter (response_required protocol).
+    Expects:
+    {
+      "response_id": 1,
+      "transcript": [{"role": "agent", "content": "Hello"}, {"role": "user", "content": "I need help"}],
+      "interaction_type": "response_required"
+    }
+    Responds with:
+    {
+      "response_id": 1,
+      "content": "...",
+      "content_complete": true,
+      "end_call": false
+    }
     """
-    transcriptions = retell_msg.get("transcriptions", []) if isinstance(retell_msg, dict) else []
-    user_message = ""
-    for t in reversed(transcriptions):
-        if isinstance(t, dict) and t.get("type") == "user" and t.get("content"):
-            user_message = str(t["content"])
-            break
-    if not user_message:
-        await websocket.send_json({"response": {"content": "I didn't catch that."}})
-        return
+    logs: List[Dict[str, Any]] = []
 
-    conversation_id = str(retell_msg.get("conversation_id") or uuid.uuid4())
-
-    existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
-    conversation_history = []
-    variables = {}
-    prior_tool_logs = []
-    if isinstance(existing_convo, dict):
-        convo_json = existing_convo.get("conversation_json")
-        if isinstance(convo_json, list):
-            conversation_history = convo_json
-        stored_vars = existing_convo.get("variables")
-        if isinstance(stored_vars, dict):
-            variables = stored_vars
-        if isinstance(existing_convo.get("tool_run_logs"), list):
-            prior_tool_logs = existing_convo.get("tool_run_logs")
-
-    loop = asyncio.get_running_loop()
-    stream_queue: asyncio.Queue = asyncio.Queue()
-
-    async def _stream_forwarder():
-        while True:
-            token = await stream_queue.get()
-            if token is None:
-                break
-            try:
-                await websocket.send_json({
-                    "response_id": retell_msg.get("response_id"),
-                    "content": token,
-                    "content_complete": False,
-                    "end_call": False,
-                    "stream": True
-                })
-            except Exception:
-                break
-
-    forwarder_task = asyncio.create_task(_stream_forwarder())
-
-    def _stream_callback(token: str):
-        try:
-            loop.call_soon_threadsafe(stream_queue.put_nowait, token)
-        except Exception:
-            pass
+    def log(stage: str, **data: Any):
+        entry = {"stage": stage, "agent_id": agent_id, "ts": time.time()}
+        entry.update({k: v for k, v in data.items()})
+        logs.append(entry)
 
     try:
-        if callable(run_agent_async):
-            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
-        else:
-            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
-    except Exception as e:
+        log("received_payload", payload=retell_msg)
+        if not isinstance(retell_msg, dict):
+            error_msg = "Invalid payload type"
+            log("error", message=error_msg)
+            await websocket.send_json({
+                "response_id": None,
+                "content": "Invalid payload",
+                "content_complete": True,
+                "end_call": False,
+                "error": {"message": error_msg},
+                "logs_csv": _csv_from_logs(logs)
+            })
+            return
+
+        response_id = retell_msg.get("response_id")
+        transcript = retell_msg.get("transcript", [])
+        user_message = ""
+        if isinstance(transcript, list):
+            for t in reversed(transcript):
+                if isinstance(t, dict) and t.get("role") == "user" and t.get("content"):
+                    user_message = str(t["content"])
+                    break
+
+        if not user_message:
+            msg = "I didn't catch that."
+            log("no_user_message", transcript=transcript)
+            await websocket.send_json({
+                "response_id": response_id,
+                "content": msg,
+                "content_complete": True,
+                "end_call": False,
+                "logs_csv": _csv_from_logs(logs)
+            })
+            return
+
+        conversation_id = str(
+            retell_msg.get("conversation_id")
+            or retell_msg.get("call_id")
+            or retell_msg.get("session_id")
+            or f"retell-{response_id}" if response_id is not None else uuid.uuid4()
+        )
+        log("conversation_resolved", conversation_id=conversation_id)
+
+        existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
+        conversation_history = []
+        variables = {}
+        prior_tool_logs = []
+        if isinstance(existing_convo, dict):
+            convo_json = existing_convo.get("conversation_json")
+            if isinstance(convo_json, list):
+                conversation_history = convo_json
+            stored_vars = existing_convo.get("variables")
+            if isinstance(stored_vars, dict):
+                variables = stored_vars
+            if isinstance(existing_convo.get("tool_run_logs"), list):
+                prior_tool_logs = existing_convo.get("tool_run_logs")
+        log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
+
         try:
-            print("run_agent error:", str(e))
-            traceback.print_exc()
-        except Exception:
-            pass
-        await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+            log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
+        except Exception as e:
+            tb = traceback.format_exc()
+            log("agent_error", error=str(e), traceback=tb)
+            await websocket.send_json({
+                "response_id": response_id,
+                "content": f"Error: {e}",
+                "content_complete": True,
+                "end_call": False,
+                "error": {"message": str(e), "traceback": tb},
+                "logs_csv": _csv_from_logs(logs)
+            })
+            return
+
+        reply_text = result.get("reply", "Sorry, something went wrong.")
+        final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
+
+        new_convo = list(conversation_history)
+        new_convo.append({"role": "user", "content": user_message})
+        new_convo.append({"role": "assistant", "content": reply_text})
+
+        tool_events = []
+        for ev in result.get("logs", []):
+            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+                ev_copy = dict(ev)
+                ev_copy["assistant_index"] = len(new_convo)
+                tool_events.append(ev_copy)
+        tool_run_logs = prior_tool_logs + tool_events
+
         try:
-            loop.call_soon_threadsafe(stream_queue.put_nowait, None)
-            await forwarder_task
-        except Exception:
-            pass
-        return
+            _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
+            log("conversation_saved", new_len=len(new_convo), tool_events=len(tool_events))
+        except Exception as e:
+            tb = traceback.format_exc()
+            log("save_error", error=str(e), traceback=tb)
 
-    reply_text = result.get("reply", "Sorry, something went wrong.")
-    final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
-
-    new_convo = list(conversation_history)
-    new_convo.append({"role": "user", "content": user_message})
-    new_convo.append({"role": "assistant", "content": reply_text})
-
-    tool_events = []
-    for ev in result.get("logs", []):
-        if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
-            ev_copy = dict(ev)
-            ev_copy["assistant_index"] = len(new_convo)
-            tool_events.append(ev_copy)
-    tool_run_logs = prior_tool_logs + tool_events
-
-    _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
-
-    try:
-        loop.call_soon_threadsafe(stream_queue.put_nowait, None)
-        await forwarder_task
-    except Exception:
-        pass
+        response = {
+            "response_id": response_id,
+            "content": reply_text,
+            "content_complete": True,
+            "end_call": False,
+            "logs_csv": _csv_from_logs(logs)
+        }
+        await websocket.send_json(response)
+    except Exception as outer_e:
+        tb = traceback.format_exc()
+        logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
+        await websocket.send_json({
+            "response_id": None,
+            "content": f"Fatal error: {outer_e}",
+            "content_complete": True,
+            "end_call": True,
+            "error": {"message": str(outer_e), "traceback": tb},
+            "logs_csv": _csv_from_logs(logs)
+        })
 
 
 @app.websocket("/runtime/{agent_id}")
 async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
+    logs: List[Dict[str, Any]] = []
+    def log(stage: str, **data: Any):
+        entry = {"stage": stage, "agent_id": agent_id, "ts": time.time()}
+        entry.update(data)
+        logs.append(entry)
+
     await websocket.accept()
     try:
+        log("accepted")
         while True:
             data = await websocket.receive_json()
+            log("received", payload=data)
             await _handle_retell_message(websocket, agent_id, data)
     except WebSocketDisconnect:
-        pass
-    except Exception:
+        log("disconnect")
+    except Exception as e:
+        tb = traceback.format_exc()
+        log("ws_error", error=str(e), traceback=tb)
         try:
-            await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+            await websocket.send_json({
+                "response": {"content": f"WebSocket error: {e}"},
+                "error": {"message": str(e), "traceback": tb},
+                "logs_csv": _csv_from_logs(logs)
+            })
         except Exception:
             pass
 
@@ -1439,7 +1512,7 @@ def admin_compact(payload: Optional[Dict[str, Any]] = None):
     return {"status": "ok", "result": result}
 
 # ----------------------------------------------------------------------
-# Runn
+# Run
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
