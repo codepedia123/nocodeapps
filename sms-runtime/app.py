@@ -141,6 +141,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             return
 
         response_id = retell_msg.get("response_id")
+        interaction_type = (retell_msg.get("interaction_type") or "response_required").lower()
         # Accept either response_required transcript format or minimal transcriptions format
         transcript = retell_msg.get("transcript", [])
         transcriptions = retell_msg.get("transcriptions", [])
@@ -214,6 +215,18 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 loop.call_soon_threadsafe(stream_used.set)
             except Exception:
                 pass
+
+        # Handle interaction types
+        if interaction_type == "update_only":
+            log("update_only", info="No response required")
+            await websocket.send_json({
+                "response_id": response_id,
+                "content": "",
+                "content_complete": True,
+                "end_call": False,
+                "logs_csv": _csv_from_logs(logs)
+            })
+            return
 
         try:
             if callable(run_agent_async):
