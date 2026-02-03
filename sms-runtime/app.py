@@ -193,6 +193,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         loop = asyncio.get_running_loop()
         stream_queue: asyncio.Queue = asyncio.Queue()
+        stream_used = asyncio.Event()
 
         async def _stream_forwarder():
             while True:
@@ -215,6 +216,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         def _stream_callback(token: str):
             try:
                 loop.call_soon_threadsafe(stream_queue.put_nowait, token)
+                loop.call_soon_threadsafe(stream_used.set)
             except Exception:
                 pass
 
@@ -277,9 +279,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             await forwarder_task
         except Exception:
             pass
+        final_content = "" if stream_used.is_set() else reply_text
         await websocket.send_json({
             "response_id": response_id,
-            "content": "",
+            "content": final_content,
             "content_complete": True,
             "end_call": False,
             "logs_csv": _csv_from_logs(logs)
