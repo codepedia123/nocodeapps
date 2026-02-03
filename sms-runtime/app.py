@@ -296,6 +296,17 @@ async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
         logs.append(entry)
 
     await websocket.accept()
+    # Send immediate greeting to confirm connection
+    try:
+        await websocket.send_json({
+            "response_id": None,
+            "content": "Hello",
+            "content_complete": True,
+            "end_call": False,
+            "stream": False
+        })
+    except Exception:
+        pass
     try:
         log("accepted")
         while True:
