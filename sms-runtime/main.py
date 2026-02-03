@@ -23,8 +23,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import UpstashVectorStore
-from langchain_community.tools.retriever import create_retriever_tool
-
+from langchain.tools.retriever import create_retriever_tool
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 from xml.sax.saxutils import escape
