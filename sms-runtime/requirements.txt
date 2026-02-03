@@ -1,18 +1,22 @@
+# CORE
 redis==5.0.1
 fastapi==0.115.12
 uvicorn[standard]==0.30.6
-twilio==8.10.0
-python-multipart==0.0.9
-langchain==0.3.21
-langchain-community==0.3.1
-langchain-groq==0.2.0
-langgraph==0.2.35
 python-dotenv==1.0.1
 requests==2.32.3
 pydantic==2.9.2
+
+# REDIS / UPSTASH
 upstash-redis==1.5.0
-langgraph>=0.0.40
+langchain-upstash  # Let pip find the best version (usually 0.1.x or 0.2.x)
+
+# LANGCHAIN & AGENT
+langchain==0.3.21
 langchain-community==0.3.1
-langchain-upstash==0.2.0        # <--- Add this for native Upstash Vector support
-langchain-openai==0.3.3         # <--- Update to latest for better Caching support
-langchain-core==0.3.33          # <--- Update to latest
+langchain-openai==0.3.3
+langchain-groq==0.2.0
+langgraph==0.2.35
+langchain-core>=0.3.0
+
+# KNOWLEDGE BASE LOADERS
+pypdf>=5.0.0
