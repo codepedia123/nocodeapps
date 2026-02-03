@@ -103,10 +103,42 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         if isinstance(existing_convo.get("tool_run_logs"), list):
             prior_tool_logs = existing_convo.get("tool_run_logs")
 
+    loop = asyncio.get_running_loop()
+    stream_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _stream_forwarder():
+        while True:
+            token = await stream_queue.get()
+            if token is None:
+                break
+            try:
+                await websocket.send_json({
+                    "response_id": retell_msg.get("response_id"),
+                    "content": token,
+                    "content_complete": False,
+                    "end_call": False,
+                    "stream": True
+                })
+            except Exception:
+                break
+
+    forwarder_task = asyncio.create_task(_stream_forwarder())
+
+    def _stream_callback(token: str):
+        try:
+            loop.call_soon_threadsafe(stream_queue.put_nowait, token)
+        except Exception:
+            pass
+
     try:
-        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
     except Exception as e:
         await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
+        try:
+            loop.call_soon_threadsafe(stream_queue.put_nowait, None)
+            await forwarder_task
+        except Exception:
+            pass
         return
 
     reply_text = result.get("reply", "Sorry, something went wrong.")
@@ -126,14 +158,11 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
 
-    response = {
-        "response": {
-            "content": reply_text,
-            "message_id": str(uuid.uuid4())
-        },
-        "conversation_state": final_vars
-    }
-    await websocket.send_json(response)
+    try:
+        loop.call_soon_threadsafe(stream_queue.put_nowait, None)
+        await forwarder_task
+    except Exception:
+        pass
 
 
 @app.websocket("/runtime/{agent_id}")
