@@ -218,7 +218,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 pass
 
         try:
-            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+            if callable(run_agent_async):
+                result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+            else:
+                result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
             log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
         except Exception as e:
             tb = traceback.format_exc()
