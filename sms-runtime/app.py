@@ -130,11 +130,18 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             return
 
         response_id = retell_msg.get("response_id")
+        # Accept either response_required transcript format or minimal transcriptions format
         transcript = retell_msg.get("transcript", [])
+        transcriptions = retell_msg.get("transcriptions", [])
         user_message = ""
         if isinstance(transcript, list):
             for t in reversed(transcript):
                 if isinstance(t, dict) and t.get("role") == "user" and t.get("content"):
+                    user_message = str(t["content"])
+                    break
+        if not user_message and isinstance(transcriptions, list):
+            for t in reversed(transcriptions):
+                if isinstance(t, dict) and t.get("type") == "user" and t.get("content"):
                     user_message = str(t["content"])
                     break
 
@@ -211,14 +218,23 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             tb = traceback.format_exc()
             log("save_error", error=str(e), traceback=tb)
 
-        response = {
-            "response_id": response_id,
-            "content": reply_text,
-            "content_complete": True,
-            "end_call": False,
-            "logs_csv": _csv_from_logs(logs)
-        }
-        await websocket.send_json(response)
+        # Stream the reply word by word
+        words = reply_text.split()
+        if not words:
+            words = [reply_text]
+        for idx, word in enumerate(words):
+            is_last = idx == len(words) - 1
+            log("stream_chunk", index=idx, is_last=is_last, chunk=word)
+            response = {
+                "response_id": response_id,
+                "content": word,
+                "content_complete": is_last,
+                "end_call": False,
+                "stream": True
+            }
+            if is_last:
+                response["logs_csv"] = _csv_from_logs(logs)
+            await websocket.send_json(response)
     except Exception as outer_e:
         tb = traceback.format_exc()
         logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
@@ -1512,7 +1528,7 @@ def admin_compact(payload: Optional[Dict[str, Any]] = None):
     return {"status": "ok", "result": result}
 
 # ----------------------------------------------------------------------
-# Runn
+# Run
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
