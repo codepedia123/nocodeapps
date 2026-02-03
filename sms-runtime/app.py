@@ -192,31 +192,24 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
 
         loop = asyncio.get_running_loop()
-        stream_queue: asyncio.Queue = asyncio.Queue()
-        stream_used = asyncio.Event()
 
-        async def _stream_forwarder():
-            while True:
-                token = await stream_queue.get()
-                if token is None:
-                    break
-                try:
-                    await websocket.send_json({
-                        "response_id": response_id,
-                        "content": token,
-                        "content_complete": False,
-                        "end_call": False,
-                        "stream": True
-                    })
-                except Exception:
-                    break
-
-        forwarder_task = asyncio.create_task(_stream_forwarder())
+        async def _send_stream_token(token: str):
+            try:
+                await websocket.send_json({
+                    "response_id": response_id,
+                    "content": token,
+                    "content_complete": False,
+                    "end_call": False,
+                    "stream": True
+                })
+            except Exception:
+                pass
 
         def _stream_callback(token: str):
+            if not token:
+                return
             try:
-                loop.call_soon_threadsafe(stream_queue.put_nowait, token)
-                loop.call_soon_threadsafe(stream_used.set)
+                asyncio.create_task(_send_stream_token(token))
             except Exception:
                 pass
 
@@ -244,11 +237,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "error": {"message": str(e), "traceback": tb},
                 "logs_csv": _csv_from_logs(logs)
             })
-            try:
-                loop.call_soon_threadsafe(stream_queue.put_nowait, None)
-                await forwarder_task
-            except Exception:
-                pass
             return
 
         reply_text = result.get("reply", "Sorry, something went wrong.")
@@ -266,27 +254,23 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 tool_events.append(ev_copy)
         tool_run_logs = prior_tool_logs + tool_events
 
-        try:
-            _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
-            log("conversation_saved", new_len=len(new_convo), tool_events=len(tool_events))
-        except Exception as e:
-            tb = traceback.format_exc()
-            log("save_error", error=str(e), traceback=tb)
+        async def _save_conversation():
+            try:
+                await asyncio.to_thread(_upsert_voice_conversation, conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
+                log("conversation_saved", new_len=len(new_convo), tool_events=len(tool_events))
+            except Exception as e:
+                tb = traceback.format_exc()
+                log("save_error", error=str(e), traceback=tb)
 
-        # End streaming and send final completion marker
-        try:
-            loop.call_soon_threadsafe(stream_queue.put_nowait, None)
-            await forwarder_task
-        except Exception:
-            pass
-        if not stream_used.is_set():
-            await websocket.send_json({
-                "response_id": response_id,
-                "content": reply_text,
-                "content_complete": True,
-                "end_call": False,
-                "logs_csv": _csv_from_logs(logs)
-            })
+        asyncio.create_task(_save_conversation())
+
+        await websocket.send_json({
+            "response_id": response_id,
+            "content": reply_text,
+            "content_complete": True,
+            "end_call": False,
+            "logs_csv": _csv_from_logs(logs)
+        })
     except Exception as outer_e:
         tb = traceback.format_exc()
         logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
