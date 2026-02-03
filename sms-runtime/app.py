@@ -279,14 +279,14 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             await forwarder_task
         except Exception:
             pass
-        final_content = "" if stream_used.is_set() else reply_text
-        await websocket.send_json({
-            "response_id": response_id,
-            "content": final_content,
-            "content_complete": True,
-            "end_call": False,
-            "logs_csv": _csv_from_logs(logs)
-        })
+        if not stream_used.is_set():
+            await websocket.send_json({
+                "response_id": response_id,
+                "content": reply_text,
+                "content_complete": True,
+                "end_call": False,
+                "logs_csv": _csv_from_logs(logs)
+            })
     except Exception as outer_e:
         tb = traceback.format_exc()
         logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
