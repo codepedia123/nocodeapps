@@ -180,8 +180,35 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 prior_tool_logs = existing_convo.get("tool_run_logs")
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
 
+        loop = asyncio.get_running_loop()
+        stream_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _stream_forwarder():
+            while True:
+                token = await stream_queue.get()
+                if token is None:
+                    break
+                try:
+                    await websocket.send_json({
+                        "response_id": response_id,
+                        "content": token,
+                        "content_complete": False,
+                        "end_call": False,
+                        "stream": True
+                    })
+                except Exception:
+                    break
+
+        forwarder_task = asyncio.create_task(_stream_forwarder())
+
+        def _stream_callback(token: str):
+            try:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, token)
+            except Exception:
+                pass
+
         try:
-            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
             log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
         except Exception as e:
             tb = traceback.format_exc()
@@ -194,6 +221,11 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "error": {"message": str(e), "traceback": tb},
                 "logs_csv": _csv_from_logs(logs)
             })
+            try:
+                loop.call_soon_threadsafe(stream_queue.put_nowait, None)
+                await forwarder_task
+            except Exception:
+                pass
             return
 
         reply_text = result.get("reply", "Sorry, something went wrong.")
@@ -218,23 +250,19 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             tb = traceback.format_exc()
             log("save_error", error=str(e), traceback=tb)
 
-        # Stream the reply word by word
-        words = reply_text.split()
-        if not words:
-            words = [reply_text]
-        for idx, word in enumerate(words):
-            is_last = idx == len(words) - 1
-            log("stream_chunk", index=idx, is_last=is_last, chunk=word)
-            response = {
-                "response_id": response_id,
-                "content": word,
-                "content_complete": is_last,
-                "end_call": False,
-                "stream": True
-            }
-            if is_last:
-                response["logs_csv"] = _csv_from_logs(logs)
-            await websocket.send_json(response)
+        # End streaming and send final completion marker
+        try:
+            loop.call_soon_threadsafe(stream_queue.put_nowait, None)
+            await forwarder_task
+        except Exception:
+            pass
+        await websocket.send_json({
+            "response_id": response_id,
+            "content": "",
+            "content_complete": True,
+            "end_call": False,
+            "logs_csv": _csv_from_logs(logs)
+        })
     except Exception as outer_e:
         tb = traceback.format_exc()
         logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
