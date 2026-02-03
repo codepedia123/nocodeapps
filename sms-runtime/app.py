@@ -192,6 +192,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
 
         loop = asyncio.get_running_loop()
+        stream_used = asyncio.Event()
 
         async def _send_stream_token(token: str):
             try:
@@ -210,6 +211,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 return
             try:
                 asyncio.create_task(_send_stream_token(token))
+                loop.call_soon_threadsafe(stream_used.set)
             except Exception:
                 pass
 
@@ -264,9 +266,10 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         asyncio.create_task(_save_conversation())
 
+        final_content = "" if stream_used.is_set() else reply_text
         await websocket.send_json({
             "response_id": response_id,
-            "content": reply_text,
+            "content": final_content,
             "content_complete": True,
             "end_call": False,
             "logs_csv": _csv_from_logs(logs)
