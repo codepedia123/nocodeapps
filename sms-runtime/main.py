@@ -1,4 +1,3 @@
-
 # main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
 import json
@@ -6,11 +5,8 @@ import uuid
 import traceback
 import urllib.parse
 import re
-import time
-import concurrent.futures
-import threading
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Annotated, Callable
+from typing import Any, Dict, List, Optional, Tuple, Annotated
 from operator import ior
 import requests
 
@@ -20,8 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
@@ -31,7 +25,6 @@ from langchain_openai import ChatOpenAI
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 from xml.sax.saxutils import escape
-import asyncio
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
@@ -66,7 +59,6 @@ logger = Logger()
 # Upstash Redis init
 # ---------------------------
 _redis_client: Optional[UpstashRedis] = None
-_AGENT_CACHE: Dict[str, Any] = {}
 try:
     redis_url = "https://climbing-hyena-56303.upstash.io"
     redis_token = "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM"
@@ -157,62 +149,22 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
         row_ids = _redis_client.smembers(ids_key) or set()
-        row_ids_list: List[str] = []
-        row_keys: List[str] = []
+        rows: List[Dict[str, Any]] = []
         for row_id in row_ids:
             if row_id == "_meta":
                 continue
-            row_ids_list.append(str(row_id))
-            row_keys.append(f"table:{table_name}:row:{row_id}")
-        if not row_keys:
-            logger.log("fetch.tools.redis.empty", "No tool rows found", {"agent_user_id": agent_user_id})
-            return {}
-        fetched_rows: List[Dict[str, Any]] = []
-        used_pipeline = False
-        try:
-            pipe_factory = getattr(_redis_client, "pipeline", None)
-            if callable(pipe_factory):
-                pipe = pipe_factory()
-                for rk in row_keys:
-                    pipe.hgetall(rk)
-                results = pipe.execute()
-                used_pipeline = True
-                for rid, res in zip(row_ids_list, results):
-                    fetched_rows.append({"row_id": rid, "row": res or {}})
-            else:
-                raise AttributeError("pipeline not available")
-        except Exception as e:
-            logger.log("fetch.tools.redis.pipeline_fallback", "Pipeline fetch failed or unavailable, falling back to concurrent hgetall", {"error": str(e)})
-            fetched_rows = []
+            row_key = f"table:{table_name}:row:{row_id}"
             try:
-                max_workers = min(8, max(1, len(row_keys)))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_key = {executor.submit(_redis_client.hgetall, rk): (rid, rk) for rid, rk in zip(row_ids_list, row_keys)}
-                    for future in concurrent.futures.as_completed(future_to_key):
-                        rid, rk = future_to_key[future]
-                        try:
-                            row = future.result() or {}
-                            fetched_rows.append({"row_id": rid, "row": row})
-                        except Exception as e2:
-                            logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
-            except Exception as e3:
-                logger.log("fetch.tools.redis.concurrent_fallback_error", "Concurrent fallback failed, falling back to sequential", {"error": str(e3)})
-                for rid, rk in zip(row_ids_list, row_keys):
-                    try:
-                        row = _redis_client.hgetall(rk) or {}
-                        fetched_rows.append({"row_id": rid, "row": row})
-                    except Exception as e2:
-                        logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e2)})
-                        continue
-        rows: List[Dict[str, Any]] = []
-        for item in fetched_rows:
-            row = item.get("row") or {}
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
+                continue
             if not row:
                 continue
             row_agent_val = row.get("agent_id", "")
             if not _agent_match(row_agent_val, agent_user_id):
                 continue
-            rows.append({"row_id": item.get("row_id"), "row": row})
+            rows.append({"row_id": str(row_id), "row": row})
         status_order = {"ENABLED": 0, "DISABLED": 1}
         rows.sort(key=lambda r: status_order.get(str(r["row"].get("status", "")).upper(), 99))
         tool_map: Dict[str, Any] = {}
@@ -227,7 +179,7 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
                 "instructions": row.get("instructions", "") or "",
                 "when_run": row.get("when_run", "") or "",
             }
-        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map), "used_pipeline": used_pipeline})
+        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
         return tool_map
     except Exception as e:
         logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
@@ -425,153 +377,6 @@ def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
     for k, v in variables.items():
         out[str(k)] = "" if v is None else str(v)
     return out
-
-def _latency_dict_to_csv(lat_map: Dict[str, Any]) -> str:
-    """
-    Render a latency dictionary into a small CSV string.
-    """
-    if not isinstance(lat_map, dict):
-        return ""
-    lines = ["step,ms"]
-    for name, val in lat_map.items():
-        try:
-            ms = int(val)
-        except Exception:
-            ms = val
-        lines.append(f"{name},{ms}")
-    return "\n".join(lines)
-
-# ---------------------------
-# Static/dynamic prompt builders for prefix caching
-# ---------------------------
-def _format_tool_schema_for_prompt(tool_id: str, cfg: Dict[str, Any]) -> str:
-    """
-    Deterministically format tool schema for the static header.
-    Avoids variables to keep prefix cache stable.
-    """
-    api_url = cfg.get("api_url", "") or ""
-    payload = cfg.get("api_payload_json", "") or ""
-    instructions = cfg.get("instructions", "") or ""
-    when_run = cfg.get("when_run", "") or ""
-    tool_json = {
-        "tool_id": str(tool_id),
-        "api_url": api_url,
-        "payload_template": payload,
-        "instructions": instructions,
-        "when_run": when_run,
-    }
-    return json.dumps(tool_json, ensure_ascii=True, sort_keys=True)
-
-def _build_static_header(merged_config: Dict[str, Any]) -> str:
-    """
-    Construct the static, cacheable system header. No variables allowed.
-    Includes agent prompt, rulebook, and deterministically ordered tool schemas.
-    """
-    # Static rulebook (no variables/time). Keep fully constant for prefix caching.
-    rulebook = (
-        "Runtime rulebook for planning and tool calls.\n"
-        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
-        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
-        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
-        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
-        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
-        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
-    )
-    tool_lines: List[str] = []
-    try:
-        for tid in sorted(merged_config.keys(), key=lambda x: str(x)):
-            cfg = merged_config.get(tid) or {}
-            tool_lines.append(_format_tool_schema_for_prompt(str(tid), cfg))
-    except Exception:
-        pass
-    tools_section = "\n".join(tool_lines)
-    static_header = (
-        f"GLOBAL_PROMPT:\nYou are a helpful assistant.\n\n"
-        f"RUNTIME_RULEBOOK:\n{rulebook}\n\n"
-        f"TOOLS_SCHEMAS (sorted):\n{tools_section}"
-    )
-    return static_header
-
-def _agent_cache_key(agent_id: str, api_key: str, ordered_config: Dict[str, Any]) -> str:
-    try:
-        cfg_str = json.dumps(ordered_config or {}, sort_keys=True)
-    except Exception:
-        cfg_str = str(ordered_config)
-    return f"{agent_id}::{api_key}::{cfg_str}"
-
-def _build_dynamic_header(current_vars: Dict[str, Any]) -> str:
-    """
-    Dynamic header that can change per request without polluting the static prefix.
-    """
-    try:
-        vars_str = json.dumps(current_vars or {}, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        vars_str = str(current_vars)
-    return f"DYNAMIC_AGENT_PROMPT:\n{{agent_prompt}}\n\nCURRENT AGENT VARIABLES:\n{vars_str}"
-
-def _extract_text_from_chunk(chunk: Any) -> str:
-    """
-    Safely extract text content from a LangChain / OpenAI chunk structure.
-    """
-    try:
-        if isinstance(chunk, dict):
-            txt_parts: List[str] = []
-            for choice in chunk.get("choices", []):
-                delta = choice.get("delta", {}) or {}
-                if "content" in delta and isinstance(delta["content"], list):
-                    for c in delta["content"]:
-                        if isinstance(c, str):
-                            txt_parts.append(c)
-                        elif isinstance(c, dict) and "text" in c:
-                            txt_parts.append(c.get("text") or "")
-            if txt_parts:
-                return "".join(txt_parts)
-        # LangChain OpenAI chat chunk usually exposes .content as list of AIMessageChunk content parts
-        content = getattr(chunk, "content", None)
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, str):
-                    parts.append(c)
-                else:
-                    text_val = getattr(c, "text", None) or getattr(c, "data", None)
-                    if isinstance(text_val, str):
-                        parts.append(text_val)
-            return "".join(parts)
-        if isinstance(content, str):
-            return content
-        # Fallback: try model_dump
-        if hasattr(chunk, "model_dump"):
-            dumped = chunk.model_dump()
-            txt_parts = []
-            for item in dumped.get("choices", []):
-                delta = item.get("delta", {})
-                if "content" in delta and isinstance(delta["content"], list):
-                    for c in delta["content"]:
-                        if isinstance(c, str):
-                            txt_parts.append(c)
-                        elif isinstance(c, dict) and "text" in c:
-                            txt_parts.append(c["text"])
-            return "".join(txt_parts)
-    except Exception:
-        pass
-    return ""
-
-def _log_step(event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
-    """
-    Helper to keep structured logs consistent.
-    """
-    try:
-        logger.log(event_type, message, data or {})
-    except Exception:
-        pass
-
-def _is_simple_greeting(text: str) -> bool:
-    if not isinstance(text, str):
-        return False
-    t = text.strip().lower()
-    return bool(re.match(r"^(hi|hello|hey|heyy|hiya|yo|sup)[\\.!\\s]*$", t))
 
 def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -1011,42 +816,15 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None, final_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
-    # Synchronous wrapper for compatibility; executes the async core
-    return asyncio.run(run_agent_async(agent_id, conversation_history, message, variables, stream_callback, prefetched_agent_details, prefetched_tools, prefetched_static_header, final_callback))
-
-async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, stream_callback: Optional[Callable[[str], None]] = None, prefetched_agent_details: Optional[Dict[str, Any]] = None, prefetched_tools: Optional[Dict[str, Any]] = None, prefetched_static_header: Optional[str] = None, final_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
     logger.clear()
-    _log_step("run.start", "Agent started", {"input_agent_id": agent_id})
-    overall_start = time.perf_counter()
-    latencies: Dict[str, int] = {}
-    final_emitted = {"sent": False}
-
-    def _mark_latency(name: str, start_time: float):
-        try:
-            latencies[name] = max(int((time.perf_counter() - start_time) * 1000), 0)
-        except Exception:
-            latencies[name] = 0
-
-    def _finalize_output(base: Dict[str, Any]) -> Dict[str, Any]:
-        total_ms = max(int((time.perf_counter() - overall_start) * 1000), 0)
-        latencies["run_agent_total_ms"] = total_ms
-        latencies["combined_latency_ms"] = total_ms
-        base["latency_ms"] = dict(latencies)
-        base["combined_latency_ms"] = total_ms
-        base["latency_csv"] = _latency_dict_to_csv(base["latency_ms"])
-        globals()["_CURRENT_STREAM_CALLBACK"] = None
-        return base
-
+    logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
-    globals()["_CURRENT_STREAM_CALLBACK"] = stream_callback
-    t_agent_fetch = time.perf_counter()
-    agent_resp = prefetched_agent_details if prefetched_agent_details is not None else fetch_agent_details(agent_id)
-    _mark_latency("fetch_agent_details_ms", t_agent_fetch)
+    agent_resp = fetch_agent_details(agent_id)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return _finalize_output({"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -1056,23 +834,24 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         api_key_to_use = os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
-        return _finalize_output({"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
+        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-
-    t_tools = time.perf_counter()
-    fetched_tools = prefetched_tools if prefetched_tools is not None else fetch_agent_tools(str(agent_id))
-    _mark_latency("fetch_agent_tools_ms", t_tools)
-    _log_step("run.fetch_tools", "Fetched tools", {"tool_count": len(fetched_tools) if isinstance(fetched_tools, dict) else 0})
-    merged_config = dict(DYNAMIC_CONFIG)
-    if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
-    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
-    t_build_agent = time.perf_counter()
-    # Deterministic tool ordering for caching
-    sorted_config_items = sorted(merged_config.items(), key=lambda kv: str(kv[0]))
-    ordered_config: Dict[str, Any] = {k: v for k, v in sorted_config_items}
-    static_header = prefetched_static_header if prefetched_static_header else _build_static_header(ordered_config)
+    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
+        "Runtime rulebook for planning and tool calls.\n"
+        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
+        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
+        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
+        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
+        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
+    )
+    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
+        try:
+            vars_str = json.dumps(current_vars, ensure_ascii=False)
+        except Exception:
+            vars_str = str(current_vars)
+        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -1085,55 +864,23 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
             runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
             if isinstance(runtime_vars, dict):
                 current_vars = runtime_vars
-        dynamic_header = _build_dynamic_header(current_vars).replace("{agent_prompt}", agent_prompt)
-        system_msgs = [
-            SystemMessage(content=static_header),
-            SystemMessage(content=dynamic_header),
-        ]
+        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
         messages: List[Any] = []
         if isinstance(state, dict):
             messages = state.get("messages", []) or []
-        # Remove any prior system messages to avoid duplication
-        filtered = [m for m in messages if not isinstance(m, SystemMessage)]
-        return system_msgs + filtered
-
-    cache_key = _agent_cache_key(agent_id, api_key_to_use or "", ordered_config)
-    agent = None
-    llm = None
-    cache_hit = False
-    if cache_key in _AGENT_CACHE:
-        entry = _AGENT_CACHE.get(cache_key) or {}
-        agent = entry.get("agent")
-        llm = entry.get("llm")
-        static_header = entry.get("static_header", static_header)
-        cache_hit = agent is not None and llm is not None
-    if not cache_hit:
-        tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(ordered_config)
-        llm = ChatOpenAI(
-            api_key=api_key_to_use,
-            model="gpt-4o-mini",
-            temperature=0,
-            max_tokens=100,
-            top_p=0.9,
-            n=1,
-            streaming=True,
-        )
-        checkpointer = MemorySaver()
-        agent = create_react_agent(
-            llm,
-            tools,
-            state_modifier=_state_modifier_fn,
-            state_schema=AgentState,
-            checkpointer=checkpointer,
-        )
-        _AGENT_CACHE[cache_key] = {
-            "agent": agent,
-            "llm": llm,
-            "static_header": static_header,
-        }
-        _mark_latency("build_agent_ms", t_build_agent)
-    else:
-        latencies["build_agent_ms"] = 0
+        # Avoid stacking multiple system messages across steps
+        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
+        return [system_msg] + filtered
+    fetched_tools = fetch_agent_tools(str(agent_id))
+    merged_config = dict(DYNAMIC_CONFIG)
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
+    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
+    # Build agent
+    agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
     msgs = _to_messages(conversation_history, message)
 
     # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
@@ -1141,170 +888,26 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
 
-    # Fast-response short-circuit for simple greetings
-    if _is_simple_greeting(message) and not conversation_history:
-        fast_llm = ChatOpenAI(
-            api_key=api_key_to_use,
-            model="gpt-4o-mini",
-            temperature=0,
-            max_tokens=50,
-            top_p=0.9,
-            n=1,
-            streaming=True,
-        )
-        fast_chunks: List[str] = []
-
-        async def _fast_stream():
-            fast_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars).replace("{agent_prompt}", agent_prompt))] + msgs
-            async for chunk in fast_llm.astream(fast_msgs):
-                text_piece = _extract_text_from_chunk(chunk)
-                if text_piece:
-                    fast_chunks.append(text_piece)
-                    if callable(stream_callback):
-                        try:
-                            stream_callback(text_piece)
-                        except Exception:
-                            pass
-            return "".join(fast_chunks)
-
-        try:
-            fast_reply = await _fast_stream()
-            reply_text = fast_reply or "Hello!"
-            _log_step("run.fast_response.success", "Fast response path used", {"reply": reply_text})
-        except Exception as e:
-            logger.log("run.fast_response.error", "Fast response failed, falling back to main agent", {"error": str(e)})
-            reply_text = None
-        if reply_text:
-            _mark_latency("agent_invoke_ms", t_build_agent)  # approximate for fast path
-            return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-    invoke_start = time.perf_counter()
-    state = None
-    partial_reply_chunks: List[str] = []
-
-    def _emit_early_final(text: str):
-        if final_emitted.get("sent"):
-            return
-        try:
-            now_ms = max(int((time.perf_counter() - overall_start) * 1000), 0)
-            latencies["agent_invoke_ms"] = latencies.get("agent_invoke_ms", now_ms)
-            latencies["run_agent_total_ms"] = now_ms
-            latencies["combined_latency_ms"] = now_ms
-            payload = {
-                "reply": text,
-                "latency_ms": dict(latencies),
-                "combined_latency_ms": now_ms,
-                "latency_csv": _latency_dict_to_csv(latencies),
-                "variables": _variables_dict_to_object(initial_vars),
-                "logs": logger.to_list(),
-            }
-            if callable(final_callback):
-                try:
-                    final_callback(payload)
-                    final_emitted["sent"] = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    async def _run_stream():
-        local_state = None
-        last_messages = None
-        async for event in agent.astream_events(
-            {"messages": msgs, "variables": initial_vars, "is_last_step": False},
-            version="v2",
-            config={"recursion_limit": 50, "configurable": {"thread_id": str(uuid.uuid4())}},
-        ):
-            kind = event.get("event") or event.get("type", "")
-            data = event.get("data", {}) or {}
-            name = event.get("name", "")
-            if kind == "on_chat_model_stream":
-                chunk = data.get("chunk")
-                text_piece = _extract_text_from_chunk(chunk)
-                if text_piece:
-                    partial_reply_chunks.append(text_piece)
-                    stream_cb = globals().get("_CURRENT_STREAM_CALLBACK")
-                    if callable(stream_cb):
-                        try:
-                            stream_cb(text_piece)
-                        except Exception:
-                            pass
-                    _log_step("stream.token", "Emitted token", {"token": text_piece})
-            elif kind == "on_chat_model_end":
-                resp = data.get("response") or {}
-                text_piece = _extract_text_from_chunk(resp)
-                if text_piece:
-                    partial_reply_chunks.append(text_piece)
-                    _log_step("stream.final_chunk", "Captured final chunk", {"chunk": text_piece})
-            elif kind == "on_chain_end" and name == "agent":
-                output = data.get("output") or {}
-                if "messages" in output:
-                    local_state = output
-                    last_messages = output.get("messages")
-                    _log_step("stream.chain_end", "Captured agent output", {"msg_count": len(output.get("messages", []))})
-                    # Emit final immediately on chain end with current tokens
-                    if partial_reply_chunks:
-                        _emit_early_final("".join(partial_reply_chunks))
-            if data.get("messages"):
-                last_messages = data.get("messages")
-        if local_state is None and partial_reply_chunks:
-            local_state = {
-                "messages": list(last_messages) if last_messages else [],
-                "variables": initial_vars,
-            }
-            if isinstance(local_state.get("messages"), list):
-                local_state["messages"].append(AIMessage(content="".join(partial_reply_chunks)))
-            _log_step("stream.synthetic_state", "Synthesized state from partial chunks", {"partial_len": len(partial_reply_chunks)})
-        return local_state
-
     try:
         # Log before model call
-        _log_step("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
-        state = await _run_stream()
-        _log_step("agent.invoke.end", "Agent finished stream", {"has_state": state is not None})
+        logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
+        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
+        logger.log("agent.invoke.end", "Agent finished invoke")
     except GraphRecursionError as ge:
-        _mark_latency("agent_invoke_ms", invoke_start)
         # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
-        _log_step("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = static_header
+        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
+        fallback_prompt = _render_system_prompt(initial_vars)
         try:
-            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(initial_vars).replace("{agent_prompt}", agent_prompt))] + msgs
-            fallback_start = time.perf_counter()
+            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
-            _mark_latency("fallback_llm_ms", fallback_start)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
-            _log_step("run.error", "Fallback LLM failed", {"error": str(le)})
+            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-        if callable(final_callback) and not final_emitted.get("sent"):
-            try:
-                final_callback(result_obj)
-                final_emitted["sent"] = True
-            except Exception:
-                pass
-        return result_obj
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     except Exception as e:
-        _mark_latency("agent_invoke_ms", invoke_start)
-        _log_step("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return _finalize_output({"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-    _mark_latency("agent_invoke_ms", invoke_start)
-    if state is None:
-        # As a fallback, try a single invoke to get state
-        try:
-            state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
-        except Exception:
-            state = None
-    if state is None:
-        reply_text = "".join(partial_reply_chunks) or "Error: No response generated."
-        _log_step("run.no_state", "No state after stream; returning partial/fallback reply", {"reply": reply_text})
-        result_obj = _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)})
-        if callable(final_callback) and not final_emitted.get("sent"):
-            try:
-                final_callback(result_obj)
-                final_emitted["sent"] = True
-            except Exception:
-                pass
-        return result_obj
+        logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
     # Extract last assistant message
     reply_text = ""
     try:
@@ -1319,12 +922,9 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         elif last_ai:
             reply_text = str(last_ai.content)
         else:
-            reply_text = "".join(partial_reply_chunks) or "Done."
+            reply_text = "Done."
     except Exception:
-        reply_text = "".join(partial_reply_chunks) or "Done."
-    if not reply_text:
-        reply_text = "".join(partial_reply_chunks) or "Done."
-    _log_step("run.reply.final", "Final reply selected", {"reply": reply_text, "partial_used": bool(partial_reply_chunks)})
+        reply_text = "Done."
     final_variables_dict: Dict[str, Any] = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
@@ -1345,7 +945,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return _finalize_output({"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)})
+                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
     except Exception:
         pass
     # Compact trace for logs
@@ -1373,7 +973,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return _finalize_output({"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)})
+    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
 
 # ---------------------------
 # FastAPI app
@@ -1384,7 +984,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.post("/run-agent")
 async def run_endpoint(request: Request):
-    request_start = time.perf_counter()
     try:
         body = await request.json()
     except Exception:
@@ -1415,19 +1014,8 @@ async def run_endpoint(request: Request):
         else:
             is_first_demo_sms = True
     if not agent_id:
-        elapsed_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
-        latency_ms = {"http_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
-        return JSONResponse({
-            "reply": "Error: Missing agent_id in request",
-            "logs": logger.to_list(),
-            "latency_ms": latency_ms,
-            "combined_latency_ms": elapsed_ms,
-            "latency_report_csv": _latency_dict_to_csv(latency_ms)
-        })
-    if callable(run_agent_async):
-        res = await run_agent_async(str(agent_id), conversation, str(message), variables_payload, None)
-    else:
-        res = await asyncio.to_thread(run_agent, str(agent_id), conversation, str(message), variables_payload, None)
+        return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
+    res = run_agent(str(agent_id), conversation, str(message), variables_payload)
     if is_demo_sms and is_first_demo_sms:
         reply_text = res.get("reply", "")
         if reply_text and not reply_text.startswith("Demo by SaaS: "):
@@ -1460,24 +1048,12 @@ async def run_endpoint(request: Request):
             "type": "demo-sms",
             "variables": updated_variables,
         })
-    handler_latency_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
-    latency_ms_map: Dict[str, Any] = {}
-    if isinstance(res.get("latency_ms"), dict):
-        latency_ms_map.update(res.get("latency_ms"))
-    if "combined_latency_ms" in latency_ms_map:
-        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
-    latency_ms_map["http_handler_total_ms"] = handler_latency_ms
-    latency_ms_map["combined_latency_ms"] = handler_latency_ms
-    res["latency_ms"] = latency_ms_map
-    res["combined_latency_ms"] = handler_latency_ms
-    res["latency_report_csv"] = _latency_dict_to_csv(latency_ms_map)
     if is_demo_sms:
         return Response(content=_format_sms_xml(res.get("reply", "")), media_type="application/xml")
     return JSONResponse(res)
 
 # Support inline execution when running inside CI or sandbox that injects 'inputs'
 if "inputs" in globals():
-    request_start = time.perf_counter()
     data = globals().get("inputs", {}) or {}
     q = globals().get("query", {}) or {}
     payload = data.get("input") if isinstance(data.get("input"), dict) else data
@@ -1537,17 +1113,6 @@ if "inputs" in globals():
             "type": "demo-sms",
             "variables": updated_variables,
         })
-    handler_latency_ms = max(int((time.perf_counter() - request_start) * 1000), 0)
-    latency_ms_map: Dict[str, Any] = {}
-    if isinstance(_out.get("latency_ms"), dict):
-        latency_ms_map.update(_out.get("latency_ms"))
-    if "combined_latency_ms" in latency_ms_map:
-        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
-    latency_ms_map["http_handler_total_ms"] = handler_latency_ms
-    latency_ms_map["combined_latency_ms"] = handler_latency_ms
-    _out["latency_ms"] = latency_ms_map
-    _out["combined_latency_ms"] = handler_latency_ms
-    _out["latency_report_csv"] = _latency_dict_to_csv(latency_ms_map)
     try:
         _out["debug_inputs"] = {
             "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
