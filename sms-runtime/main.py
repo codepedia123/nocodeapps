@@ -1,5 +1,6 @@
 # main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
+import asyncio
 import json
 import uuid
 import traceback
@@ -323,6 +324,52 @@ def _safe_json_loads(s: str) -> Optional[Any]:
         return json.loads(s)
     except Exception:
         return None
+
+def _extract_text_from_chunk(chunk: Any) -> str:
+    """
+    Safely extract text content from LangChain / OpenAI streaming chunks.
+    """
+    try:
+        if isinstance(chunk, dict):
+            txt_parts: List[str] = []
+            for choice in chunk.get("choices", []):
+                delta = choice.get("delta", {}) or {}
+                if "content" in delta and isinstance(delta["content"], list):
+                    for c in delta["content"]:
+                        if isinstance(c, str):
+                            txt_parts.append(c)
+                        elif isinstance(c, dict) and "text" in c:
+                            txt_parts.append(c.get("text") or "")
+            if txt_parts:
+                return "".join(txt_parts)
+        content = getattr(chunk, "content", None)
+        if isinstance(content, list):
+            parts: List[str] = []
+            for c in content:
+                if isinstance(c, str):
+                    parts.append(c)
+                else:
+                    text_val = getattr(c, "text", None) or getattr(c, "data", None)
+                    if isinstance(text_val, str):
+                        parts.append(text_val)
+            return "".join(parts)
+        if isinstance(content, str):
+            return content
+        if hasattr(chunk, "model_dump"):
+            dumped = chunk.model_dump()
+            txt_parts = []
+            for item in dumped.get("choices", []):
+                delta = item.get("delta", {})
+                if "content" in delta and isinstance(delta["content"], list):
+                    for c in delta["content"]:
+                        if isinstance(c, str):
+                            txt_parts.append(c)
+                        elif isinstance(c, dict) and "text" in c:
+                            txt_parts.append(c["text"])
+            return "".join(txt_parts)
+    except Exception:
+        pass
+    return ""
 
 def _strip_code_fences(s: str) -> str:
     if not isinstance(s, str):
@@ -981,6 +1028,190 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
+    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+
+async def run_agent_async(
+    agent_id: str,
+    conversation_history: List[Dict[str, Any]],
+    message: str,
+    variables: Optional[Any] = None,
+    stream_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
+    logger.clear()
+    logger.log("run.start", "Agent started (async)", {"input_agent_id": agent_id})
+    initial_vars = _variables_array_to_dict(variables)
+    globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
+    agent_resp = fetch_agent_details(agent_id)
+    if not agent_resp:
+        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    api_key_to_use = None
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        if agent_resp.get(key_name):
+            api_key_to_use = agent_resp.get(key_name)
+            break
+    if not api_key_to_use:
+        api_key_to_use = os.getenv("OPENAI_API_KEY")
+    if not api_key_to_use:
+        logger.log("run.error", "OpenAI API key missing", {})
+        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
+    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
+        "Runtime rulebook for planning and tool calls.\n"
+        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
+        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
+        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
+        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
+        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
+    )
+    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
+        try:
+            vars_str = json.dumps(current_vars, ensure_ascii=False)
+        except Exception:
+            vars_str = str(current_vars)
+        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    def _state_modifier_fn(state: AgentState) -> List[Any]:
+        current_vars: Dict[str, Any] = {}
+        try:
+            if isinstance(state, dict):
+                current_vars = state.get("variables", {}) or {}
+        except Exception:
+            current_vars = {}
+        if not current_vars:
+            runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+            if isinstance(runtime_vars, dict):
+                current_vars = runtime_vars
+        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        messages: List[Any] = []
+        if isinstance(state, dict):
+            messages = state.get("messages", []) or []
+        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
+        return [system_msg] + filtered
+
+    fetched_tools = fetch_agent_tools(str(agent_id))
+    merged_config = dict(DYNAMIC_CONFIG)
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
+    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    llm = ChatOpenAI(
+        api_key=api_key_to_use,
+        model="gpt-4o-mini",
+        temperature=0,
+        max_tokens=200,
+        top_p=0.9,
+        n=1,
+        streaming=True,
+    )
+    agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    msgs = _to_messages(conversation_history, message)
+
+    globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
+    globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+
+    partial_reply_chunks: List[str] = []
+    state = None
+    last_messages = None
+    try:
+        logger.log("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
+        async for event in agent.astream_events(
+            {"messages": msgs, "variables": initial_vars, "is_last_step": False},
+            version="v2",
+            config={"recursion_limit": 50},
+        ):
+            kind = event.get("event") or event.get("type", "")
+            data = event.get("data", {}) or {}
+            name = event.get("name", "")
+            if kind == "on_chat_model_stream":
+                chunk = data.get("chunk")
+                text_piece = _extract_text_from_chunk(chunk)
+                if text_piece:
+                    partial_reply_chunks.append(text_piece)
+                    if callable(stream_callback):
+                        try:
+                            stream_callback(text_piece)
+                        except Exception:
+                            pass
+            elif kind == "on_chat_model_end":
+                resp = data.get("response") or {}
+                text_piece = _extract_text_from_chunk(resp)
+                if text_piece:
+                    partial_reply_chunks.append(text_piece)
+            elif kind == "on_chain_end" and name == "agent":
+                output = data.get("output") or {}
+                if "messages" in output:
+                    state = output
+                    last_messages = output.get("messages")
+            if data.get("messages"):
+                last_messages = data.get("messages")
+        logger.log("agent.invoke.end", "Agent finished stream", {"has_state": state is not None})
+    except GraphRecursionError as ge:
+        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
+        try:
+            fallback_msgs = [SystemMessage(content=_render_system_prompt(initial_vars))] + msgs
+            fallback_resp = llm.invoke(fallback_msgs)
+            reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
+        except Exception as le:
+            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
+            reply_text = f"Error: {str(ge)}"
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    except Exception as e:
+        logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+
+    if state is None and partial_reply_chunks:
+        state = {
+            "messages": list(last_messages) if last_messages else list(msgs),
+            "variables": initial_vars,
+        }
+        if isinstance(state.get("messages"), list):
+            state["messages"].append(AIMessage(content="".join(partial_reply_chunks)))
+
+    reply_text = ""
+    try:
+        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
+        last_ai = None
+        for m in reversed(out_msgs):
+            if isinstance(m, AIMessage):
+                last_ai = m
+                break
+        if last_ai and isinstance(last_ai.content, str):
+            reply_text = last_ai.content.strip()
+        elif last_ai:
+            reply_text = str(last_ai.content)
+        else:
+            reply_text = "".join(partial_reply_chunks) if partial_reply_chunks else "Done."
+    except Exception:
+        reply_text = "".join(partial_reply_chunks) if partial_reply_chunks else "Done."
+
+    final_variables_dict: Dict[str, Any] = dict(initial_vars)
+    try:
+        if isinstance(state, dict) and isinstance(state.get("variables"), dict):
+            final_variables_dict.update(state.get("variables", {}) or {})
+    except Exception:
+        pass
+    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+    if isinstance(runtime_vars, dict):
+        final_variables_dict.update(runtime_vars)
+
+    try:
+        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
+        for m in out_msgs:
+            if isinstance(m, ToolMessage):
+                content = m.content
+                if isinstance(content, str):
+                    parsed = _safe_json_loads(content)
+                    if isinstance(parsed, dict) and parsed.get("needs_input"):
+                        q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
+                        logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
+                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    except Exception:
+        pass
+
     return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
 
 # ---------------------------
