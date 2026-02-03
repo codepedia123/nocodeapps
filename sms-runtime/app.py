@@ -19,32 +19,12 @@ import traceback
 import re
 import builtins
 import threading
-import importlib
 load_dotenv()
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
-
-# Runtime import resolver: prefer main (production), fallback to runtiemeditor (local name)
-_runtime_mod = None
-for mod_name in ("main", "runtiemeditor"):
-    try:
-        _runtime_mod = importlib.import_module(mod_name)
-        break
-    except Exception:
-        _runtime_mod = None
-
-if not _runtime_mod or not hasattr(_runtime_mod, "run_agent"):
-    raise ImportError("Failed to import runtime backend (run_agent not found) from main or runtiemeditor.")
-
-run_agent = getattr(_runtime_mod, "run_agent")
-run_agent_async = getattr(_runtime_mod, "run_agent_async", None)
-fetch_agent_details = getattr(_runtime_mod, "fetch_agent_details", None)
-fetch_agent_tools = getattr(_runtime_mod, "fetch_agent_tools", None)
-_fetch_conversation_by_conversation_id = getattr(_runtime_mod, "_fetch_conversation_by_conversation_id")
-_upsert_voice_conversation = getattr(_runtime_mod, "_upsert_voice_conversation")
-_runtime_latency_csv = getattr(_runtime_mod, "_latency_dict_to_csv", None)
+from main import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
@@ -93,72 +73,21 @@ app.add_middleware(
 # ----------------------------------------------------------------------
 # Retell WebSocket adapter
 # ----------------------------------------------------------------------
-async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict, cached_agent: Optional[Dict[str, Any]] = None, cached_tools: Optional[Dict[str, Any]] = None):
+async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
     """
-    Retell adapter (response_required protocol).
-    Expects:
-    {
-      "response_id": 1,
-      "transcript": [{"role": "agent", "content": "Hello"}, {"role": "user", "content": "I need help"}],
-      "interaction_type": "response_required"
-    }
-    Responds with:
-    {
-      "response_id": 1,
-      "content": "...",
-      "content_complete": true,
-      "end_call": false
-    }
+    Minimal Retell adapter: extracts last user transcription, runs the agent, streams back reply.
     """
-    handler_start = time.perf_counter()
-    if not isinstance(retell_msg, dict):
-        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
-        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
-        await websocket.send_json({
-            "response_id": None,
-            "content": "Invalid payload",
-            "content_complete": True,
-            "end_call": False,
-            "latency_ms": latency_ms,
-            "combined_latency_ms": elapsed_ms,
-            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
-        })
-        return
-
-    interaction_type = retell_msg.get("interaction_type") or ""
-    if interaction_type == "update_only":
-        # No response required
-        return
-
-    response_id = retell_msg.get("response_id")
-    transcript = retell_msg.get("transcript", [])
+    transcriptions = retell_msg.get("transcriptions", []) if isinstance(retell_msg, dict) else []
     user_message = ""
-    if isinstance(transcript, list):
-        for t in reversed(transcript):
-            if isinstance(t, dict) and t.get("role") == "user" and t.get("content"):
-                user_message = str(t["content"])
-                break
-
+    for t in reversed(transcriptions):
+        if isinstance(t, dict) and t.get("type") == "user" and t.get("content"):
+            user_message = str(t["content"])
+            break
     if not user_message:
-        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
-        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
-        await websocket.send_json({
-            "response_id": response_id,
-            "content": "I didn't catch that.",
-            "content_complete": True,
-            "end_call": False,
-            "latency_ms": latency_ms,
-            "combined_latency_ms": elapsed_ms,
-            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
-        })
+        await websocket.send_json({"response": {"content": "I didn't catch that."}})
         return
 
-    conversation_id = str(
-        retell_msg.get("conversation_id")
-        or retell_msg.get("call_id")
-        or retell_msg.get("session_id")
-        or f"retell-{response_id}" if response_id is not None else uuid.uuid4()
-    )
+    conversation_id = str(retell_msg.get("conversation_id") or uuid.uuid4())
 
     existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
     conversation_history = []
@@ -174,70 +103,11 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         if isinstance(existing_convo.get("tool_run_logs"), list):
             prior_tool_logs = existing_convo.get("tool_run_logs")
 
-    loop = asyncio.get_running_loop()
-    stream_queue: asyncio.Queue = asyncio.Queue()
-
-    async def _stream_forwarder():
-        while True:
-            token = await stream_queue.get()
-            if token is None:
-                break
-            try:
-                await websocket.send_json({
-                    "response_id": response_id,
-                    "content": token,
-                    "content_complete": False,
-                    "end_call": False,
-                    "stream": True
-                })
-            except Exception:
-                break
-
-    forwarder_task = asyncio.create_task(_stream_forwarder())
-
-    def _stream_callback(token: str):
-        try:
-            loop.call_soon_threadsafe(stream_queue.put_nowait, token)
-        except Exception:
-            pass
-
     try:
-        if callable(run_agent_async):
-            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, None)
-        else:
-            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback, cached_agent, cached_tools, None, None)
-    except Exception:
-        elapsed_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
-        latency_ms = {"websocket_handler_total_ms": elapsed_ms, "combined_latency_ms": elapsed_ms}
-        await websocket.send_json({
-            "response_id": response_id,
-            "content": "Sorry, something went wrong.",
-            "content_complete": True,
-            "end_call": False,
-            "latency_ms": latency_ms,
-            "combined_latency_ms": elapsed_ms,
-            "latency_report_csv": _latency_map_to_csv(latency_ms, elapsed_ms)
-        })
+        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+    except Exception as e:
+        await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
         return
-    finally:
-        try:
-            loop.call_soon_threadsafe(stream_queue.put_nowait, None)
-        except Exception:
-            pass
-    try:
-        await forwarder_task
-    except Exception:
-        pass
-    handler_latency_ms = max(int((time.perf_counter() - handler_start) * 1000), 0)
-    latency_ms_map: Dict[str, Any] = {}
-    if isinstance(result.get("latency_ms"), dict):
-        latency_ms_map.update(result.get("latency_ms"))
-    if "combined_latency_ms" in latency_ms_map:
-        latency_ms_map["run_agent_combined_latency_ms"] = latency_ms_map.get("combined_latency_ms")
-    latency_ms_map["websocket_handler_total_ms"] = handler_latency_ms
-    combined_latency_ms = handler_latency_ms
-    latency_ms_map["combined_latency_ms"] = combined_latency_ms
-    latency_report_csv = _latency_map_to_csv(latency_ms_map, combined_latency_ms)
 
     reply_text = result.get("reply", "Sorry, something went wrong.")
     final_vars = result.get("variables", {}) if isinstance(result.get("variables"), dict) else {}
@@ -256,33 +126,23 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
     _upsert_voice_conversation(conversation_id, agent_id, new_convo, final_vars, tool_run_logs)
 
-    # Do not send a final aggregated message; streaming tokens already delivered.
-    return
+    response = {
+        "response": {
+            "content": reply_text,
+            "message_id": str(uuid.uuid4())
+        },
+        "conversation_state": final_vars
+    }
+    await websocket.send_json(response)
 
 
 @app.websocket("/runtime/{agent_id}")
-@app.websocket("/runtime/{agent_id}/{conversation_id}")
-async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str, conversation_id: Optional[str] = None):
+async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
     await websocket.accept()
-    cached_agent = fetch_agent_details(agent_id) if callable(fetch_agent_details) else None
-    cached_tools = fetch_agent_tools(agent_id) if callable(fetch_agent_tools) else None
-    # Send immediate greeting to satisfy Retell timeout expectations
-    try:
-        await websocket.send_json({
-            "response_id": 0,
-            "content": "Hello, how can I help you?",
-            "content_complete": True,
-            "end_call": False
-        })
-    except Exception:
-        pass
     try:
         while True:
             data = await websocket.receive_json()
-            if conversation_id and isinstance(data, dict) and not data.get("conversation_id"):
-                data = dict(data)
-                data["conversation_id"] = conversation_id
-            await _handle_retell_message(websocket, agent_id, data, cached_agent=cached_agent, cached_tools=cached_tools)
+            await _handle_retell_message(websocket, agent_id, data)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -367,22 +227,6 @@ def hset_map(key: str, mapping: Dict[str, Any]):
     # CHANGE 'mapping' TO 'values' HERE
     r.hset(key, values=clean_map)
 
-def _latency_map_to_csv(lat_map: Dict[str, Any], combined_ms: Optional[int] = None) -> str:
-    """
-    Convert a latency mapping into a CSV string for reporting.
-    """
-    if not isinstance(lat_map, dict):
-        lat_map = {}
-    lines = ["step,ms"]
-    for name, val in lat_map.items():
-        try:
-            ms = int(val)
-        except Exception:
-            ms = val
-        lines.append(f"{name},{ms}")
-    if combined_ms is not None and "combined_latency_ms" not in lat_map:
-        lines.append(f"combined_latency_ms,{int(combined_ms)}")
-    return "\n".join(lines)
 
 
 
