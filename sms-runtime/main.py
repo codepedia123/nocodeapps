@@ -21,7 +21,9 @@ from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import UpstashVectorStore
+from langchain.tools import create_retriever_tool
 
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
@@ -751,6 +753,84 @@ def _build_activepieces_error_message(tool_display_name: str, api_url: str) -> T
     return message, detail_payload
 
 # ---------------------------
+# Prompt construction helpers (cache-friendly)
+# ---------------------------
+def _format_tool_schema_for_prompt(tool_id: str, cfg: Dict[str, Any]) -> str:
+    """
+    Deterministic representation of a tool schema for the static header.
+    Avoids variables to keep prefix cache stable.
+    """
+    api_url = cfg.get("api_url", "") or ""
+    payload = cfg.get("api_payload_json", "") or ""
+    instructions = cfg.get("instructions", "") or ""
+    when_run = cfg.get("when_run", "") or ""
+    tool_json = {
+        "tool_id": str(tool_id),
+        "api_url": api_url,
+        "payload_template": payload,
+        "instructions": instructions,
+        "when_run": when_run,
+    }
+    return json.dumps(tool_json, ensure_ascii=True, sort_keys=True)
+
+def _build_static_header(merged_config: Dict[str, Any]) -> str:
+    """
+    Construct the static, cacheable system header. No variables allowed.
+    Includes global prompt, rulebook, and deterministically ordered tool schemas.
+    """
+    rulebook = (
+        "Runtime rulebook for planning and tool calls.\n"
+        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
+        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
+        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
+        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
+        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
+    )
+    tool_lines: List[str] = []
+    try:
+        for tid in sorted(merged_config.keys(), key=lambda x: str(x)):
+            cfg = merged_config.get(tid) or {}
+            tool_lines.append(_format_tool_schema_for_prompt(str(tid), cfg))
+    except Exception:
+        pass
+    tools_section = "\n".join(tool_lines)
+    static_header = (
+        f"GLOBAL_PROMPT:\nYou are a helpful assistant.\n\n"
+        f"RUNTIME_RULEBOOK:\n{rulebook}\n\n"
+        f"TOOLS_SCHEMAS (sorted):\n{tools_section}"
+    )
+    return static_header
+
+def _build_dynamic_header(agent_prompt: str, current_vars: Dict[str, Any]) -> str:
+    """
+    Dynamic header separated from static to preserve provider-side caching.
+    """
+    try:
+        vars_str = json.dumps(current_vars or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        vars_str = str(current_vars)
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return f"AGENT_PROMPT:\n{agent_prompt}\n\nCURRENT AGENT VARIABLES:\n{vars_str}\nTime: {now_str}"
+
+def _init_vector_store(api_key: str) -> Optional[UpstashVectorStore]:
+    """
+    Initialize Upstash Vector Store for knowledge base retrieval.
+    """
+    try:
+        url = os.getenv("UPSTASH_VECTOR_REST_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_REDIS_URL")
+        token = os.getenv("UPSTASH_VECTOR_REST_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_REDIS_TOKEN")
+        if not url or not token:
+            return None
+        embedding = OpenAIEmbeddings(api_key=api_key, model="text-embedding-3-small")
+        index_name = os.getenv("UPSTASH_VECTOR_INDEX_NAME", "default")
+        return UpstashVectorStore(embedding=embedding, url=url, token=token, index_name=index_name)
+    except Exception as e:
+        logger.log("vector_store.init_error", "Failed to init Upstash vector store", {"error": str(e)})
+        return None
+
+# ---------------------------
 # Tool factory
 # ---------------------------
 def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
@@ -1041,10 +1121,15 @@ async def run_agent_async(
     logger.log("run.start", "Agent started (async)", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
-    agent_resp = fetch_agent_details(agent_id)
+
+    # Parallel fetch agent + tools
+    agent_task = asyncio.to_thread(fetch_agent_details, agent_id)
+    tools_task = asyncio.to_thread(fetch_agent_tools, str(agent_id))
+    agent_resp, fetched_tools = await asyncio.gather(agent_task, tools_task)
     if not agent_resp:
         logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
         return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+
     api_key_to_use = None
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         if agent_resp.get(key_name):
@@ -1055,23 +1140,22 @@ async def run_agent_async(
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
         return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+
+    # Kick off vector store init in parallel with prompt prep
+    vector_task = asyncio.to_thread(_init_vector_store, api_key_to_use)
+
     agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
-        "Runtime rulebook for planning and tool calls.\n"
-        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
-        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
-        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
-        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
-        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
-        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
-    )
-    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    merged_config = dict(DYNAMIC_CONFIG)
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            merged_config[str(tid)] = {
+                "api_url": tcfg.get("api_url", ""),
+                "api_payload_json": tcfg.get("api_payload_json", ""),
+                "instructions": tcfg.get("instructions", ""),
+                "when_run": tcfg.get("when_run", ""),
+            }
+    static_header = _build_static_header(merged_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -1084,20 +1168,30 @@ async def run_agent_async(
             runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
             if isinstance(runtime_vars, dict):
                 current_vars = runtime_vars
-        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        dynamic_msg = SystemMessage(content=_build_dynamic_header(agent_prompt, current_vars))
         messages: List[Any] = []
         if isinstance(state, dict):
             messages = state.get("messages", []) or []
-        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        return [system_msg] + filtered
+        filtered = [m for m in messages if not isinstance(m, SystemMessage)]
+        return [SystemMessage(content=static_header), dynamic_msg] + filtered
 
-    fetched_tools = fetch_agent_tools(str(agent_id))
-    merged_config = dict(DYNAMIC_CONFIG)
-    if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    tools: List[StructuredTool] = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+
+    vector_store = await vector_task
+    if vector_store:
+        try:
+            retriever = vector_store.as_retriever(search_kwargs={"filter": {"agent_id": agent_id}})
+            kb_tool = create_retriever_tool(
+                retriever,
+                name="search_knowledge_base",
+                description="Use for company-specific policies and manual lookups.",
+            )
+            tools.append(kb_tool)
+            logger.log("kb.tool.added", "Knowledge base tool added", {"filter_agent_id": agent_id})
+        except Exception as e:
+            logger.log("kb.tool.error", "Failed to add knowledge base tool", {"error": str(e)})
+
     llm = ChatOpenAI(
         api_key=api_key_to_use,
         model="gpt-4o-mini",
@@ -1112,6 +1206,7 @@ async def run_agent_async(
 
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+    globals()["_CURRENT_STREAM_CALLBACK"] = stream_callback
 
     partial_reply_chunks: List[str] = []
     state = None
@@ -1141,6 +1236,11 @@ async def run_agent_async(
                 text_piece = _extract_text_from_chunk(resp)
                 if text_piece:
                     partial_reply_chunks.append(text_piece)
+                    if callable(stream_callback):
+                        try:
+                            stream_callback(text_piece)
+                        except Exception:
+                            pass
             elif kind == "on_chain_end" and name == "agent":
                 output = data.get("output") or {}
                 if "messages" in output:
@@ -1152,7 +1252,7 @@ async def run_agent_async(
     except GraphRecursionError as ge:
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         try:
-            fallback_msgs = [SystemMessage(content=_render_system_prompt(initial_vars))] + msgs
+            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(agent_prompt, initial_vars))] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
