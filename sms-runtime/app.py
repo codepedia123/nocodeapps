@@ -302,6 +302,16 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
 @app.websocket("/runtime/{agent_id}")
 async def retell_websocket_endpoint(websocket: WebSocket, agent_id: str):
+    await _retell_ws_entry(websocket, agent_id)
+
+
+@app.websocket("/runtime/{agent_id}/{call_id}")
+async def retell_websocket_endpoint_call(websocket: WebSocket, agent_id: str, call_id: str):
+    # Accepts additional path parameter used by some Retell clients; same handling.
+    await _retell_ws_entry(websocket, agent_id)
+
+
+async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
     logs: List[Dict[str, Any]] = []
     def log(stage: str, **data: Any):
         entry = {"stage": stage, "agent_id": agent_id, "ts": time.time()}
