@@ -1,4 +1,4 @@
-# CORE
+# CORE UTILS
 redis==5.0.1
 fastapi==0.115.12
 uvicorn[standard]==0.30.6
@@ -6,17 +6,14 @@ python-dotenv==1.0.1
 requests==2.32.3
 pydantic==2.9.2
 
-# REDIS / UPSTASH
+# REDIS & VECTOR SDKS (Actual Peer Dependencies)
 upstash-redis==1.5.0
-langchain-upstash  # Let pip find the best version (usually 0.1.x or 0.2.x)
+upstash-vector==0.8.0
 
-# LANGCHAIN & AGENT
+# LANGCHAIN STACK (Latest Stable Versions)
 langchain==0.3.21
 langchain-community==0.3.1
 langchain-openai==0.3.3
 langchain-groq==0.2.0
 langgraph==0.2.35
 langchain-core>=0.3.0
-
-# KNOWLEDGE BASE LOADERS
-pypdf>=5.0.0
