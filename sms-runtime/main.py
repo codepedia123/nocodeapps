@@ -878,7 +878,15 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
-    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
+    llm = ChatOpenAI(
+        api_key=api_key_to_use,
+        model="gpt-4o-mini",
+        temperature=0,
+        max_tokens=200,
+        top_p=0.9,
+        n=1,
+        streaming=True,
+    )
     # Build agent
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
     msgs = _to_messages(conversation_history, message)
