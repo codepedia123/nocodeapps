@@ -131,8 +131,16 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             pass
 
     try:
-        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
+        if callable(run_agent_async):
+            result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+        else:
+            result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
     except Exception as e:
+        try:
+            print("run_agent error:", str(e))
+            traceback.print_exc()
+        except Exception:
+            pass
         await websocket.send_json({"response": {"content": "Sorry, something went wrong."}})
         try:
             loop.call_soon_threadsafe(stream_queue.put_nowait, None)
