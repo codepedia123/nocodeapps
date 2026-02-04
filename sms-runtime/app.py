@@ -219,7 +219,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             log("update_only", info="No response required")
             await websocket.send_json({
                 "response_id": response_id,
-                "content": "",
+                "content": "Hello",
                 "content_complete": True,
                 "end_call": False
             })
@@ -311,11 +311,11 @@ async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
         logs.append(entry)
 
     await websocket.accept()
-    # Send initial ready marker per Retell expectations
+    # Send immediate greeting on connect
     try:
         await websocket.send_json({
             "response_id": 0,
-            "content": "",
+            "content": "hello",
             "content_complete": True,
             "end_call": False
         })
