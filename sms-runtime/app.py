@@ -164,8 +164,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "response_id": response_id,
                 "content": msg,
                 "content_complete": True,
-                "end_call": False,
-                "logs_csv": _csv_from_logs(logs)
+                "end_call": False
             })
             return
 
@@ -201,8 +200,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                     "response_id": response_id,
                     "content": token,
                     "content_complete": False,
-                    "end_call": False,
-                    "stream": True
+                    "end_call": False
                 })
             except Exception:
                 pass
@@ -223,8 +221,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "response_id": response_id,
                 "content": "",
                 "content_complete": True,
-                "end_call": False,
-                "logs_csv": _csv_from_logs(logs)
+                "end_call": False
             })
             return
 
@@ -248,9 +245,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "response_id": response_id,
                 "content": f"Error: {e}",
                 "content_complete": True,
-                "end_call": False,
-                "error": {"message": str(e), "traceback": tb},
-                "logs_csv": _csv_from_logs(logs)
+                "end_call": True
             })
             return
 
@@ -284,8 +279,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             "response_id": response_id,
             "content": final_content,
             "content_complete": True,
-            "end_call": False,
-            "logs_csv": _csv_from_logs(logs)
+            "end_call": False
         })
     except Exception as outer_e:
         tb = traceback.format_exc()
@@ -294,9 +288,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             "response_id": None,
             "content": f"Fatal error: {outer_e}",
             "content_complete": True,
-            "end_call": True,
-            "error": {"message": str(outer_e), "traceback": tb},
-            "logs_csv": _csv_from_logs(logs)
+            "end_call": True
         })
 
 
@@ -319,14 +311,13 @@ async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
         logs.append(entry)
 
     await websocket.accept()
-    # Send immediate greeting to confirm connection
+    # Send initial ready marker per Retell expectations
     try:
         await websocket.send_json({
-            "response_id": None,
-            "content": "Hello",
+            "response_id": 0,
+            "content": "",
             "content_complete": True,
-            "end_call": False,
-            "stream": False
+            "end_call": False
         })
     except Exception:
         pass
@@ -343,9 +334,10 @@ async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
         log("ws_error", error=str(e), traceback=tb)
         try:
             await websocket.send_json({
-                "response": {"content": f"WebSocket error: {e}"},
-                "error": {"message": str(e), "traceback": tb},
-                "logs_csv": _csv_from_logs(logs)
+                "response_id": None,
+                "content": f"WebSocket error: {e}",
+                "content_complete": True,
+                "end_call": True
             })
         except Exception:
             pass
