@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 import traceback
-import inspect
 import re
 import builtins
 import threading
@@ -100,6 +99,27 @@ def _csv_from_logs(logs: List[Dict[str, Any]]) -> str:
     for row in logs:
         writer.writerow({k: row.get(k, "") for k in fieldnames})
     return buf.getvalue()
+
+def fetch_agent_config(agent_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch agent configuration JSON stored at agent:{id}:config.
+    Returns a dict or None on error/missing.
+    """
+    if not r:
+        return None
+    key = f"agent:{agent_id}:config"
+    try:
+        raw = r.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return raw  # Already decoded object
+    except Exception as e:
+        print(f"fetch_agent_config error for {key}: {e}")
+        return None
 
 async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
     """
@@ -191,6 +211,20 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 prior_tool_logs = existing_convo.get("tool_run_logs")
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
 
+        agent_config = fetch_agent_config(str(agent_id))
+        if not agent_config:
+            msg = "Agent configuration missing."
+            log("agent_config_missing", key=f"agent:{agent_id}:config")
+            await websocket.send_json({
+                "response_id": response_id,
+                "content": msg,
+                "content_complete": True,
+                "end_call": True,
+                "error": {"message": msg},
+                "logs_csv": _csv_from_logs(logs)
+            })
+            return
+
         loop = asyncio.get_running_loop()
         stream_used = asyncio.Event()
 
@@ -227,16 +261,23 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         try:
             if callable(run_agent_async):
-                result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
+                result = await run_agent_async(
+                    str(agent_id),
+                    conversation_history,
+                    user_message,
+                    variables,
+                    _stream_callback,
+                    agent_config=agent_config,
+                )
             else:
-                try:
-                    params = inspect.signature(run_agent).parameters
-                    if len(params) >= 5:
-                        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
-                    else:
-                        result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
-                except Exception:
-                    result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
+                result = await asyncio.to_thread(
+                    run_agent,
+                    str(agent_id),
+                    conversation_history,
+                    user_message,
+                    variables,
+                    agent_config,
+                )
             log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
         except Exception as e:
             tb = traceback.format_exc()
