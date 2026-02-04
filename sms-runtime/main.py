@@ -5,6 +5,7 @@ import json
 import uuid
 import traceback
 import urllib.parse
+import time
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Annotated
@@ -989,6 +990,10 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # Core run logic
 # ---------------------------
 def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, agent_config: Optional[Any] = None) -> Dict[str, Any]:
+    t_start = time.perf_counter()
+    latencies: Dict[str, int] = {}
+    def _mark(name: str, start_time: float):
+        latencies[name] = max(int((time.perf_counter() - start_time) * 1000), 0)
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
@@ -1001,7 +1006,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         except Exception:
             logger.log("run.config.validate_error", "Provided agent_config failed validation", {"agent_id": agent_id})
     if config_obj is None:
+        t_cfg = time.perf_counter()
         config_obj = fetch_agent_config(agent_id)
+        _mark("fetch_agent_config_ms", t_cfg)
     if not config_obj:
         logger.log("run.warn.config_default", "Agent config missing, using default", {"agent_id": agent_id})
         config_obj = AgentConfig()  # default prompt, empty tools
@@ -1015,7 +1022,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
 
     config_tool_map: Dict[str, Any] = {}
+    t_tools = time.perf_counter()
     fetched_tools = fetch_agent_tools(str(agent_id))
+    _mark("fetch_agent_tools_ms", t_tools)
     merged_config = dict(DYNAMIC_CONFIG)
     merged_config.update(config_tool_map)
     if isinstance(fetched_tools, dict):
@@ -1043,6 +1052,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
 
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    t_build = time.perf_counter()
     llm = ChatOpenAI(
         api_key=api_key_to_use,
         model="gpt-4o-mini",
@@ -1053,15 +1063,18 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         streaming=True,
     )
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    _mark("build_agent_ms", t_build)
     msgs = _to_messages(conversation_history, message)
 
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
 
+    invoke_start = time.perf_counter()
     try:
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
         state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
         logger.log("agent.invoke.end", "Agent finished invoke")
+        _mark("agent_invoke_ms", invoke_start)
     except GraphRecursionError as ge:
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         try:
@@ -1071,10 +1084,28 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         except Exception as le:
             logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        _mark("agent_invoke_ms", invoke_start)
+        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+        latencies["combined_latency_ms"] = total_ms
+        return {
+            "reply": reply_text,
+            "logs": logger.to_list(),
+            "variables": _variables_dict_to_object(initial_vars),
+            "latency_ms": dict(latencies),
+            "combined_latency_ms": total_ms,
+        }
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        _mark("agent_invoke_ms", invoke_start)
+        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+        latencies["combined_latency_ms"] = total_ms
+        return {
+            "reply": f"Error: {str(e)}",
+            "logs": logger.to_list(),
+            "variables": _variables_dict_to_object(initial_vars),
+            "latency_ms": dict(latencies),
+            "combined_latency_ms": total_ms,
+        }
 
     reply_text = ""
     try:
@@ -1113,7 +1144,15 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+                        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+                        latencies["combined_latency_ms"] = total_ms
+                        return {
+                            "reply": str(q),
+                            "logs": logger.to_list(),
+                            "variables": _variables_dict_to_object(final_variables_dict),
+                            "latency_ms": dict(latencies),
+                            "combined_latency_ms": total_ms,
+                        }
     except Exception:
         pass
 
@@ -1141,7 +1180,16 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
     except Exception:
         pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+    latencies["combined_latency_ms"] = total_ms
+    logger.log("latency", "Run latencies (ms)", {"latency_ms": dict(latencies), "combined": total_ms})
+    return {
+        "reply": reply_text,
+        "logs": logger.to_list(),
+        "variables": _variables_dict_to_object(final_variables_dict),
+        "latency_ms": dict(latencies),
+        "combined_latency_ms": total_ms,
+    }
 
 async def run_agent_async(
     agent_id: str,
@@ -1151,14 +1199,21 @@ async def run_agent_async(
     stream_callback: Optional[Any] = None,
     agent_config: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    t_start = time.perf_counter()
+    latencies: Dict[str, int] = {}
+    def _mark(name: str, start_time: float):
+        latencies[name] = max(int((time.perf_counter() - start_time) * 1000), 0)
     logger.clear()
     logger.log("run.start", "Agent started (async)", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
 
+    t_cfg = time.perf_counter()
     config_task = asyncio.sleep(0, result=agent_config) if agent_config is not None else asyncio.to_thread(fetch_agent_config, agent_id)
     tools_task = asyncio.to_thread(fetch_agent_tools, str(agent_id))
     config_raw, fetched_tools = await asyncio.gather(config_task, tools_task)
+    _mark("fetch_agent_config_ms", t_cfg)
+    _mark("fetch_agent_tools_ms", t_cfg)  # both ran in parallel; use same start for rough measure
 
     config_obj: Optional[AgentConfig] = None
     if config_raw is not None:
@@ -1210,6 +1265,7 @@ async def run_agent_async(
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools: List[StructuredTool] = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
 
+    t_build = time.perf_counter()
     llm = ChatOpenAI(
         api_key=api_key_to_use,
         model="gpt-4o-mini",
@@ -1220,6 +1276,7 @@ async def run_agent_async(
         streaming=True,
     )
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    _mark("build_agent_ms", t_build)
     msgs = _to_messages(conversation_history, message)
 
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
@@ -1229,6 +1286,7 @@ async def run_agent_async(
     partial_reply_chunks: List[str] = []
     state = None
     last_messages = None
+    invoke_start = time.perf_counter()
     try:
         logger.log("agent.invoke.start", "Invoking agent (astream_events)", {"message_count": len(msgs)})
         async for event in agent.astream_events(
@@ -1267,6 +1325,7 @@ async def run_agent_async(
             if data.get("messages"):
                 last_messages = data.get("messages")
         logger.log("agent.invoke.end", "Agent finished stream", {"has_state": state is not None})
+        _mark("agent_invoke_ms", invoke_start)
     except GraphRecursionError as ge:
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
         try:
@@ -1276,10 +1335,28 @@ async def run_agent_async(
         except Exception as le:
             logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        _mark("agent_invoke_ms", invoke_start)
+        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+        latencies["combined_latency_ms"] = total_ms
+        return {
+            "reply": reply_text,
+            "logs": logger.to_list(),
+            "variables": _variables_dict_to_object(initial_vars),
+            "latency_ms": dict(latencies),
+            "combined_latency_ms": total_ms,
+        }
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        _mark("agent_invoke_ms", invoke_start)
+        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+        latencies["combined_latency_ms"] = total_ms
+        return {
+            "reply": f"Error: {str(e)}",
+            "logs": logger.to_list(),
+            "variables": _variables_dict_to_object(initial_vars),
+            "latency_ms": dict(latencies),
+            "combined_latency_ms": total_ms,
+        }
 
     if state is None and partial_reply_chunks:
         state = {
@@ -1326,11 +1403,28 @@ async def run_agent_async(
                     if isinstance(parsed, dict) and parsed.get("needs_input"):
                         q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
                         logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+                        total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+                        latencies["combined_latency_ms"] = total_ms
+                        return {
+                            "reply": str(q),
+                            "logs": logger.to_list(),
+                            "variables": _variables_dict_to_object(final_variables_dict),
+                            "latency_ms": dict(latencies),
+                            "combined_latency_ms": total_ms,
+                        }
     except Exception:
         pass
 
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    total_ms = max(int((time.perf_counter() - t_start) * 1000), 0)
+    latencies["combined_latency_ms"] = total_ms
+    logger.log("latency", "Run latencies (ms)", {"latency_ms": dict(latencies), "combined": total_ms})
+    return {
+        "reply": reply_text,
+        "logs": logger.to_list(),
+        "variables": _variables_dict_to_object(final_variables_dict),
+        "latency_ms": dict(latencies),
+        "combined_latency_ms": total_ms,
+    }
 
 # ---------------------------
 # FastAPI app
