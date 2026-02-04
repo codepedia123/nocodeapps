@@ -27,6 +27,7 @@ load_dotenv()
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
 from main import run_agent, _fetch_conversation_by_conversation_id, _upsert_voice_conversation
+from runtiemeditor import fetch_agent_tools
 # Try to import async variant for streaming; fallback to runtiemeditor if main lacks it.
 try:
     from main import run_agent_async  # type: ignore
