@@ -1003,8 +1003,8 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     if config_obj is None:
         config_obj = fetch_agent_config(agent_id)
     if not config_obj:
-        logger.log("run.error", "Agent config fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent config.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        logger.log("run.warn.config_default", "Agent config missing, using default", {"agent_id": agent_id})
+        config_obj = AgentConfig()  # default prompt, empty tools
 
     config_dict = config_obj.model_dump()
     api_key_to_use = _extract_api_key_from_config(config_dict) or os.getenv("OPENAI_API_KEY")
@@ -1170,8 +1170,8 @@ async def run_agent_async(
         # Fallback to Redis fetch if provided config failed validation
         config_obj = fetch_agent_config(agent_id)
     if config_obj is None:
-        logger.log("run.error", "Agent config fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent config.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        logger.log("run.warn.config_default", "Agent config missing, using default", {"agent_id": agent_id})
+        config_obj = AgentConfig()  # default prompt, empty tools
 
     config_dict = config_obj.model_dump()
     api_key_to_use = _extract_api_key_from_config(config_dict) or os.getenv("OPENAI_API_KEY")
