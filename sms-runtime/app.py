@@ -110,13 +110,25 @@ def fetch_agent_config(agent_id: str) -> Optional[Dict[str, Any]]:
     key = f"agent:{agent_id}:config"
     try:
         raw = r.get(key)
-        if raw is None:
-            return None
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8", errors="ignore")
-        if isinstance(raw, str):
-            return json.loads(raw)
-        return raw  # Already decoded object
+        if raw is not None:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="ignore")
+            if isinstance(raw, str):
+                return json.loads(raw)
+            return raw  # Already decoded object
+
+        # Legacy fallback: agent{N} hash with prompt/api_key
+        legacy_key_candidates = [f"agent{agent_id}", str(agent_id)]
+        for lk in legacy_key_candidates:
+            try:
+                if r.exists(lk):
+                    rec = r.hgetall(lk) or {}
+                    prompt = rec.get("prompt") or "You are a helpful assistant."
+                    api_key = rec.get("api_key") or rec.get("openai_api_key") or rec.get("openai_key") or rec.get("key")
+                    return {"prompt": prompt, "api_key": api_key, "tools": []}
+            except Exception:
+                continue
+        return None
     except Exception as e:
         print(f"fetch_agent_config error for {key}: {e}")
         return None
