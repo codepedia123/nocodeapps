@@ -320,11 +320,16 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         final_content = "" if stream_used.is_set() else reply_text
         log("latency_ms", elapsed_ms=int((time.perf_counter() - start_time) * 1000))
+        if isinstance(result, dict) and isinstance(result.get("latency_ms"), dict):
+            log("latency_detail", latency_ms=result.get("latency_ms"), combined_latency_ms=result.get("combined_latency_ms"))
         await websocket.send_json({
             "response_id": response_id,
             "content": final_content,
             "content_complete": True,
-            "end_call": False
+            "end_call": False,
+            "logs_csv": _csv_from_logs(logs),
+            "latency_ms": result.get("latency_ms") if isinstance(result, dict) else None,
+            "combined_latency_ms": result.get("combined_latency_ms") if isinstance(result, dict) else None,
         })
     except Exception as outer_e:
         tb = traceback.format_exc()
