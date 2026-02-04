@@ -21,21 +21,27 @@ from langgraph.graph import MessagesState
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import UpstashVectorStore
-from langchain.tools.retriever import create_retriever_tool
+from langchain_openai import ChatOpenAI
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
 from xml.sax.saxutils import escape
 
 # Minimal dynamic config
 DYNAMIC_CONFIG: Dict[str, Any] = {}
+_STATIC_HEADER_CACHE: Dict[str, str] = {}
 
 class AgentState(MessagesState):
     # This stores the dynamic variables in agent memory and merges updates
     variables: Annotated[Dict[str, str], ior]
     # Flag used by LangGraph prebuilt agents; keep default False
     is_last_step: bool = False
+
+
+class AgentConfig(BaseModel):
+    prompt: str = "You are a helpful assistant."
+    tools: List[Dict[str, Any]] = []
+    api_key: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
 
 # Simple logger
 class Logger:
@@ -85,56 +91,32 @@ except Exception as e:
 # ---------------------------
 # Redis helpers
 # ---------------------------
-def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
+def fetch_agent_config(agent_id: str) -> Optional[AgentConfig]:
+    """
+    Fetch the canonical agent config JSON stored at agent:{id}:config.
+    """
     if not _redis_client:
-        logger.log("fetch.agent.no_redis", "Redis client not available", {"agent_id": agent_id})
+        logger.log("fetch.config.no_redis", "Redis client not available", {"agent_id": agent_id})
         return None
+    key = f"agent:{agent_id}:config"
     try:
-        candidates: List[str] = []
-        if isinstance(agent_id, str):
-            candidates.append(agent_id)
-            if agent_id.startswith("agent"):
-                try:
-                    suffix = int(agent_id[len("agent"):])
-                    candidates.append(str(suffix))
-                    candidates.append(f"agent{suffix}")
-                except Exception:
-                    pass
-            else:
-                candidates.append(f"agent{agent_id}")
+        raw = _redis_client.get(key)
+        if raw is None:
+            logger.log("fetch.config.notfound", "Agent config missing", {"key": key})
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, str):
+            parsed = json.loads(raw)
         else:
-            candidates.append(f"agent{agent_id}")
-            candidates.append(str(agent_id))
-
-        seen = set()
-        for cand in candidates:
-            if not cand or cand in seen:
-                continue
-            seen.add(cand)
-            key = cand if cand.startswith("agent") else (f"agent{cand}" if cand.isdigit() else cand)
-            try:
-                if _redis_client.exists(key):
-                    rec = _redis_client.hgetall(key) or {}
-                    if "tools" in rec and rec.get("tools"):
-                        try:
-                            rec["tools"] = json.loads(rec["tools"])
-                        except Exception:
-                            pass
-                    for fld in ("created_at", "updated_at"):
-                        if fld in rec:
-                            try:
-                                rec[fld] = int(rec[fld])
-                            except Exception:
-                                pass
-                    logger.log("fetch.agent.redis", "Fetched agent details from Redis", {"agent_key": key})
-                    return rec
-            except Exception as e:
-                logger.log("fetch.agent.redis.error", "Error checking agent key in Redis", {"candidate": key, "error": str(e)})
-                continue
-        logger.log("fetch.agent.redis.notfound", "Agent not found in Redis", {"agent_id": agent_id, "candidates_tried": list(seen)})
-        return None
+            parsed = raw
+        try:
+            return AgentConfig.model_validate(parsed)
+        except Exception:
+            logger.log("fetch.config.validate_error", "Failed to validate agent config", {"key": key})
+            return None
     except Exception as e:
-        logger.log("fetch.agent.redis.exception", "Unexpected error fetching agent", {"agent_id": agent_id, "error": str(e)})
+        logger.log("fetch.config.error", "Failed to fetch agent config", {"key": key, "error": str(e)})
         return None
 
 def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
@@ -151,26 +133,30 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         table_name = "all-agents-tools"
         ids_key = f"table:{table_name}:ids"
         row_ids = _redis_client.smembers(ids_key) or set()
-        rows: List[Dict[str, Any]] = []
-        for row_id in row_ids:
-            if row_id == "_meta":
-                continue
-            row_key = f"table:{table_name}:row:{row_id}"
+        row_ids_list = [rid for rid in row_ids if rid != "_meta"]
+        row_keys = [f"table:{table_name}:row:{rid}" for rid in row_ids_list]
+
+        fetched_rows: List[Dict[str, Any]] = []
+        for rid, rk in zip(row_ids_list, row_keys):
             try:
-                row = _redis_client.hgetall(row_key) or {}
+                row = _redis_client.hgetall(rk) or {}
+                if row:
+                    fetched_rows.append({"row_id": str(rid), "row": row})
             except Exception as e:
-                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
+                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": rk, "error": str(e)})
                 continue
-            if not row:
-                continue
-            row_agent_val = row.get("agent_id", "")
-            if not _agent_match(row_agent_val, agent_user_id):
-                continue
-            rows.append({"row_id": str(row_id), "row": row})
+
+        filtered_rows: List[Dict[str, Any]] = []
+        for item in fetched_rows:
+            row_agent_val = item["row"].get("agent_id", "")
+            if _agent_match(row_agent_val, agent_user_id):
+                filtered_rows.append(item)
+
         status_order = {"ENABLED": 0, "DISABLED": 1}
-        rows.sort(key=lambda r: status_order.get(str(r["row"].get("status", "")).upper(), 99))
+        filtered_rows.sort(key=lambda r: status_order.get(str(r["row"].get("status", "")).upper(), 99))
+
         tool_map: Dict[str, Any] = {}
-        for item in rows:
+        for item in filtered_rows:
             row = item["row"]
             status = str(row.get("status", "") or "").upper()
             if status == "DISABLED":
@@ -813,21 +799,41 @@ def _build_dynamic_header(agent_prompt: str, current_vars: Dict[str, Any]) -> st
     now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return f"AGENT_PROMPT:\n{agent_prompt}\n\nCURRENT AGENT VARIABLES:\n{vars_str}\nTime: {now_str}"
 
-def _init_vector_store(api_key: str) -> Optional[UpstashVectorStore]:
-    """
-    Initialize Upstash Vector Store for knowledge base retrieval.
-    """
+def _get_static_header_cached(merged_config: Dict[str, Any]) -> str:
+    cache_key = None
     try:
-        url = os.getenv("UPSTASH_VECTOR_REST_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_REDIS_URL")
-        token = os.getenv("UPSTASH_VECTOR_REST_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_REDIS_TOKEN")
-        if not url or not token:
-            return None
-        embedding = OpenAIEmbeddings(api_key=api_key, model="text-embedding-3-small")
-        index_name = os.getenv("UPSTASH_VECTOR_INDEX_NAME", "default")
-        return UpstashVectorStore(embedding=embedding, url=url, token=token, index_name=index_name)
-    except Exception as e:
-        logger.log("vector_store.init_error", "Failed to init Upstash vector store", {"error": str(e)})
-        return None
+        cache_key = json.dumps(merged_config, ensure_ascii=True, sort_keys=True)
+    except Exception:
+        cache_key = None
+    if cache_key and cache_key in _STATIC_HEADER_CACHE:
+        return _STATIC_HEADER_CACHE[cache_key]
+    header = _build_static_header(merged_config)
+    if cache_key:
+        _STATIC_HEADER_CACHE[cache_key] = header
+    return header
+
+def _config_tools_to_map(config_tools: Any) -> Dict[str, Any]:
+    tool_map: Dict[str, Any] = {}
+    if not isinstance(config_tools, list):
+        return tool_map
+    for idx, tool in enumerate(config_tools):
+        if not isinstance(tool, dict):
+            continue
+        tool_id = str(tool.get("id") or tool.get("tool_id") or tool.get("name") or tool.get("slug") or idx)
+        tool_map[tool_id] = {
+            "api_url": tool.get("api_url", "") or "",
+            "api_payload_json": tool.get("api_payload_json", "") or tool.get("payload_template", "") or "",
+            "instructions": tool.get("instructions", "") or "",
+            "when_run": tool.get("when_run", "") or tool.get("trigger", "") or "",
+        }
+    return tool_map
+
+def _extract_api_key_from_config(config: Dict[str, Any]) -> Optional[str]:
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        val = config.get(key_name)
+        if val:
+            return val
+    return None
 
 # ---------------------------
 # Tool factory
@@ -942,42 +948,40 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, agent_config: Optional[Any] = None) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
-    agent_resp = fetch_agent_details(agent_id)
-    if not agent_resp:
-        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    api_key_to_use = None
-    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
-        if agent_resp.get(key_name):
-            api_key_to_use = agent_resp.get(key_name)
-            break
-    if not api_key_to_use:
-        api_key_to_use = os.getenv("OPENAI_API_KEY")
+
+    config_obj: Optional[AgentConfig] = None
+    if agent_config is not None:
+        try:
+            config_obj = agent_config if isinstance(agent_config, AgentConfig) else AgentConfig.model_validate(agent_config)
+        except Exception:
+            logger.log("run.config.validate_error", "Provided agent_config failed validation", {"agent_id": agent_id})
+    if config_obj is None:
+        config_obj = fetch_agent_config(agent_id)
+    if not config_obj:
+        logger.log("run.error", "Agent config fetch returned None", {"agent_id": agent_id})
+        return {"reply": "Error: Failed to fetch agent config.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+
+    config_dict = config_obj.model_dump()
+    api_key_to_use = _extract_api_key_from_config(config_dict) or os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
         return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
-        "Runtime rulebook for planning and tool calls.\n"
-        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
-        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
-        "If a tool INSTRUCTIONS field for a property is exactly 'EMPTY', then set that property to an empty value with the correct type based on the payload template (e.g., \"\", [], {}, 0, false, etc. based on the value type, set an empty for it.) and do not ask the user for it.\n"
-        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
-        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
-        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
-    )
-    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
+
+    config_tool_map = _config_tools_to_map(config_obj.tools)
+    fetched_tools = fetch_agent_tools(str(agent_id))
+    merged_config = dict(DYNAMIC_CONFIG)
+    merged_config.update(config_tool_map)
+    if isinstance(fetched_tools, dict):
+        merged_config.update({str(k): v for k, v in fetched_tools.items()})
+
+    static_header = _get_static_header_cached(merged_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -990,18 +994,13 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
             if isinstance(runtime_vars, dict):
                 current_vars = runtime_vars
-        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        dynamic_msg = SystemMessage(content=_build_dynamic_header(agent_prompt, current_vars))
         messages: List[Any] = []
         if isinstance(state, dict):
             messages = state.get("messages", []) or []
-        # Avoid stacking multiple system messages across steps
-        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        return [system_msg] + filtered
-    fetched_tools = fetch_agent_tools(str(agent_id))
-    merged_config = dict(DYNAMIC_CONFIG)
-    if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
+        filtered = [m for m in messages if not isinstance(m, SystemMessage)]
+        return [SystemMessage(content=static_header), dynamic_msg] + filtered
+
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
     llm = ChatOpenAI(
@@ -1013,26 +1012,20 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
         n=1,
         streaming=True,
     )
-    # Build agent
     agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
     msgs = _to_messages(conversation_history, message)
 
-    # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
-    # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
     globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
     globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
 
     try:
-        # Log before model call
         logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
         state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
         logger.log("agent.invoke.end", "Agent finished invoke")
     except GraphRecursionError as ge:
-        # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
         logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = _render_system_prompt(initial_vars)
         try:
-            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_msgs = [SystemMessage(content=static_header), SystemMessage(content=_build_dynamic_header(agent_prompt, initial_vars))] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
@@ -1042,7 +1035,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     except Exception as e:
         logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
         return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    # Extract last assistant message
+
     reply_text = ""
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
@@ -1059,6 +1052,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
             reply_text = "Done."
     except Exception:
         reply_text = "Done."
+
     final_variables_dict: Dict[str, Any] = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
@@ -1068,7 +1062,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
     if isinstance(runtime_vars, dict):
         final_variables_dict.update(runtime_vars)
-    # Detect if any tool result asked for more input and surface question
+
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
         for m in out_msgs:
@@ -1082,7 +1076,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
                         return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
     except Exception:
         pass
-    # Compact trace for logs
+
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
         compact_trace: List[Dict[str, Any]] = []
@@ -1115,46 +1109,45 @@ async def run_agent_async(
     message: str,
     variables: Optional[Any] = None,
     stream_callback: Optional[Any] = None,
+    agent_config: Optional[Any] = None,
 ) -> Dict[str, Any]:
     logger.clear()
     logger.log("run.start", "Agent started (async)", {"input_agent_id": agent_id})
     initial_vars = _variables_array_to_dict(variables)
     globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
 
-    # Parallel fetch agent + tools
-    agent_task = asyncio.to_thread(fetch_agent_details, agent_id)
+    config_task = asyncio.sleep(0, result=agent_config) if agent_config is not None else asyncio.to_thread(fetch_agent_config, agent_id)
     tools_task = asyncio.to_thread(fetch_agent_tools, str(agent_id))
-    agent_resp, fetched_tools = await asyncio.gather(agent_task, tools_task)
-    if not agent_resp:
-        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    config_raw, fetched_tools = await asyncio.gather(config_task, tools_task)
 
-    api_key_to_use = None
-    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
-        if agent_resp.get(key_name):
-            api_key_to_use = agent_resp.get(key_name)
-            break
-    if not api_key_to_use:
-        api_key_to_use = os.getenv("OPENAI_API_KEY")
+    config_obj: Optional[AgentConfig] = None
+    if config_raw is not None:
+        try:
+            config_obj = config_raw if isinstance(config_raw, AgentConfig) else AgentConfig.model_validate(config_raw)
+        except Exception:
+            logger.log("run.config.validate_error", "Provided agent_config failed validation", {"agent_id": agent_id})
+    if config_obj is None and agent_config is not None:
+        # Fallback to Redis fetch if provided config failed validation
+        config_obj = fetch_agent_config(agent_id)
+    if config_obj is None:
+        logger.log("run.error", "Agent config fetch returned None", {"agent_id": agent_id})
+        return {"reply": "Error: Failed to fetch agent config.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+
+    config_dict = config_obj.model_dump()
+    api_key_to_use = _extract_api_key_from_config(config_dict) or os.getenv("OPENAI_API_KEY")
     if not api_key_to_use:
         logger.log("run.error", "OpenAI API key missing", {})
         return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
 
-    # Kick off vector store init in parallel with prompt prep
-    vector_task = asyncio.to_thread(_init_vector_store, api_key_to_use)
+    agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
 
-    agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-
+    config_tool_map = _config_tools_to_map(config_obj.tools)
     merged_config = dict(DYNAMIC_CONFIG)
+    merged_config.update(config_tool_map)
     if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {
-                "api_url": tcfg.get("api_url", ""),
-                "api_payload_json": tcfg.get("api_payload_json", ""),
-                "instructions": tcfg.get("instructions", ""),
-                "when_run": tcfg.get("when_run", ""),
-            }
-    static_header = _build_static_header(merged_config)
+        merged_config.update({str(k): v for k, v in fetched_tools.items()})
+
+    static_header = _get_static_header_cached(merged_config)
 
     def _state_modifier_fn(state: AgentState) -> List[Any]:
         current_vars: Dict[str, Any] = {}
@@ -1176,20 +1169,6 @@ async def run_agent_async(
 
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools: List[StructuredTool] = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
-
-    vector_store = await vector_task
-    if vector_store:
-        try:
-            retriever = vector_store.as_retriever(search_kwargs={"filter": {"agent_id": agent_id}})
-            kb_tool = create_retriever_tool(
-                retriever,
-                name="search_knowledge_base",
-                description="Use for company-specific policies and manual lookups.",
-            )
-            tools.append(kb_tool)
-            logger.log("kb.tool.added", "Knowledge base tool added", {"filter_agent_id": agent_id})
-        except Exception as e:
-            logger.log("kb.tool.error", "Failed to add knowledge base tool", {"error": str(e)})
 
     llm = ChatOpenAI(
         api_key=api_key_to_use,
