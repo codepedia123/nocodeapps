@@ -213,17 +213,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         agent_config = fetch_agent_config(str(agent_id))
         if not agent_config:
-            msg = "Agent configuration missing."
             log("agent_config_missing", key=f"agent:{agent_id}:config")
-            await websocket.send_json({
-                "response_id": response_id,
-                "content": msg,
-                "content_complete": True,
-                "end_call": True,
-                "error": {"message": msg},
-                "logs_csv": _csv_from_logs(logs)
-            })
-            return
 
         loop = asyncio.get_running_loop()
         stream_used = asyncio.Event()
