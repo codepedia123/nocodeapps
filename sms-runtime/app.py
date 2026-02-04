@@ -119,28 +119,14 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
     }
     """
     logs: List[Dict[str, Any]] = []
-    req_start = time.perf_counter()
 
     def log(stage: str, **data: Any):
         entry = {"stage": stage, "agent_id": agent_id, "ts": time.time()}
         entry.update({k: v for k, v in data.items()})
         logs.append(entry)
 
-    async def send_log(event: str, detail: str = ""):
-        elapsed_ms = int((time.perf_counter() - req_start) * 1000)
-        try:
-            await websocket.send_json({
-                "response_id": retell_msg.get("response_id"),
-                "content": f"[log {elapsed_ms}ms] {event} {detail}".strip(),
-                "content_complete": False,
-                "end_call": False
-            })
-        except Exception:
-            pass
-
     try:
         log("received_payload", payload=retell_msg)
-        await send_log("received_payload")
         if not isinstance(retell_msg, dict):
             error_msg = "Invalid payload type"
             log("error", message=error_msg)
@@ -148,7 +134,9 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 "response_id": None,
                 "content": "Invalid payload",
                 "content_complete": True,
-                "end_call": True
+                "end_call": False,
+                "error": {"message": error_msg},
+                "logs_csv": _csv_from_logs(logs)
             })
             return
 
@@ -187,7 +175,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             or f"retell-{response_id}" if response_id is not None else uuid.uuid4()
         )
         log("conversation_resolved", conversation_id=conversation_id)
-        await send_log("conversation_resolved", conversation_id)
 
         existing_convo = _fetch_conversation_by_conversation_id(conversation_id)
         conversation_history = []
@@ -203,7 +190,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             if isinstance(existing_convo.get("tool_run_logs"), list):
                 prior_tool_logs = existing_convo.get("tool_run_logs")
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
-        await send_log("conversation_loaded", f"history={len(conversation_history)} vars={len(variables)}")
 
         loop = asyncio.get_running_loop()
         stream_used = asyncio.Event()
@@ -231,7 +217,6 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         # Handle interaction types
         if interaction_type == "update_only":
             log("update_only", info="No response required")
-            await send_log("update_only")
             await websocket.send_json({
                 "response_id": response_id,
                 "content": "Hello",
@@ -242,26 +227,20 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
 
         try:
             if callable(run_agent_async):
-                await send_log("agent_start_async")
                 result = await run_agent_async(str(agent_id), conversation_history, user_message, variables, _stream_callback)
             else:
                 try:
                     params = inspect.signature(run_agent).parameters
                     if len(params) >= 5:
-                        await send_log("agent_start_thread")
                         result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables, _stream_callback)
                     else:
-                        await send_log("agent_start_thread")
                         result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
                 except Exception:
-                    await send_log("agent_start_thread")
                     result = await asyncio.to_thread(run_agent, str(agent_id), conversation_history, user_message, variables)
             log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
-            await send_log("agent_ran")
         except Exception as e:
             tb = traceback.format_exc()
             log("agent_error", error=str(e), traceback=tb)
-            await send_log("agent_error", str(e))
             await websocket.send_json({
                 "response_id": response_id,
                 "content": f"Error: {e}",
@@ -302,14 +281,9 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
             "content_complete": True,
             "end_call": False
         })
-        await send_log("completed")
     except Exception as outer_e:
         tb = traceback.format_exc()
         logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
-        try:
-            await send_log("fatal", str(outer_e))
-        except Exception:
-            pass
         await websocket.send_json({
             "response_id": None,
             "content": f"Fatal error: {outer_e}",
