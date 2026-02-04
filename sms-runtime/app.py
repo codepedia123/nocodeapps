@@ -151,6 +151,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
     }
     """
     logs: List[Dict[str, Any]] = []
+    start_time = time.perf_counter()
 
     def log(stage: str, **data: Any):
         entry = {"stage": stage, "agent_id": agent_id, "ts": time.time()}
@@ -318,6 +319,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         asyncio.create_task(_save_conversation())
 
         final_content = "" if stream_used.is_set() else reply_text
+        log("latency_ms", elapsed_ms=int((time.perf_counter() - start_time) * 1000))
         await websocket.send_json({
             "response_id": response_id,
             "content": final_content,
@@ -326,7 +328,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
         })
     except Exception as outer_e:
         tb = traceback.format_exc()
-        logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e)})
+        logs.append({"stage": "fatal", "agent_id": agent_id, "ts": time.time(), "error": str(outer_e), "latency_ms": int((time.perf_counter() - start_time) * 1000)})
         await websocket.send_json({
             "response_id": None,
             "content": f"Fatal error: {outer_e}",
