@@ -91,6 +91,51 @@ except Exception as e:
 # ---------------------------
 # Redis helpers
 # ---------------------------
+def _fetch_legacy_agent_record(agent_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client:
+        return None
+    try:
+        candidates: List[str] = []
+        if isinstance(agent_id, str):
+            candidates.append(agent_id)
+            if agent_id.startswith("agent"):
+                try:
+                    suffix = int(agent_id[len("agent"):])
+                    candidates.append(str(suffix))
+                    candidates.append(f"agent{suffix}")
+                except Exception:
+                    pass
+            else:
+                candidates.append(f"agent{agent_id}")
+        else:
+            candidates.append(f"agent{agent_id}")
+            candidates.append(str(agent_id))
+
+        seen = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            key = cand if cand.startswith("agent") else (f"agent{cand}" if cand.isdigit() else cand)
+            try:
+                if _redis_client.exists(key):
+                    rec = _redis_client.hgetall(key) or {}
+                    for fld in ("created_at", "updated_at"):
+                        if fld in rec:
+                            try:
+                                rec[fld] = int(rec[fld])
+                            except Exception:
+                                pass
+                    logger.log("fetch.agent.legacy", "Fetched legacy agent record", {"agent_key": key})
+                    return rec
+            except Exception as e:
+                logger.log("fetch.agent.legacy.error", "Error checking legacy agent key", {"candidate": key, "error": str(e)})
+                continue
+        return None
+    except Exception as e:
+        logger.log("fetch.agent.legacy.exception", "Unexpected error fetching legacy agent", {"agent_id": agent_id, "error": str(e)})
+        return None
+
 def fetch_agent_config(agent_id: str) -> Optional[AgentConfig]:
     """
     Fetch the canonical agent config JSON stored at agent:{id}:config.
@@ -103,6 +148,17 @@ def fetch_agent_config(agent_id: str) -> Optional[AgentConfig]:
         raw = _redis_client.get(key)
         if raw is None:
             logger.log("fetch.config.notfound", "Agent config missing", {"key": key})
+            legacy = _fetch_legacy_agent_record(agent_id)
+            if isinstance(legacy, dict):
+                fallback = {
+                    "prompt": legacy.get("prompt") or "You are a helpful assistant.",
+                    "api_key": legacy.get("api_key") or legacy.get("openai_api_key") or legacy.get("openai_key") or legacy.get("key"),
+                    "tools": [],
+                }
+                try:
+                    return AgentConfig.model_validate(fallback)
+                except Exception:
+                    return None
             return None
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", errors="ignore")
@@ -812,22 +868,6 @@ def _get_static_header_cached(merged_config: Dict[str, Any]) -> str:
         _STATIC_HEADER_CACHE[cache_key] = header
     return header
 
-def _config_tools_to_map(config_tools: Any) -> Dict[str, Any]:
-    tool_map: Dict[str, Any] = {}
-    if not isinstance(config_tools, list):
-        return tool_map
-    for idx, tool in enumerate(config_tools):
-        if not isinstance(tool, dict):
-            continue
-        tool_id = str(tool.get("id") or tool.get("tool_id") or tool.get("name") or tool.get("slug") or idx)
-        tool_map[tool_id] = {
-            "api_url": tool.get("api_url", "") or "",
-            "api_payload_json": tool.get("api_payload_json", "") or tool.get("payload_template", "") or "",
-            "instructions": tool.get("instructions", "") or "",
-            "when_run": tool.get("when_run", "") or tool.get("trigger", "") or "",
-        }
-    return tool_map
-
 def _extract_api_key_from_config(config: Dict[str, Any]) -> Optional[str]:
     for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
         val = config.get(key_name)
@@ -974,7 +1014,7 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
 
     agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
 
-    config_tool_map = _config_tools_to_map(config_obj.tools)
+    config_tool_map: Dict[str, Any] = {}
     fetched_tools = fetch_agent_tools(str(agent_id))
     merged_config = dict(DYNAMIC_CONFIG)
     merged_config.update(config_tool_map)
@@ -1141,7 +1181,7 @@ async def run_agent_async(
 
     agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
 
-    config_tool_map = _config_tools_to_map(config_obj.tools)
+    config_tool_map: Dict[str, Any] = {}
     merged_config = dict(DYNAMIC_CONFIG)
     merged_config.update(config_tool_map)
     if isinstance(fetched_tools, dict):
