@@ -989,7 +989,7 @@ def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) 
 # ---------------------------
 # Core run logic
 # ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, agent_config: Optional[Any] = None) -> Dict[str, Any]:
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None, agent_config: Optional[Any] = None, tools_map: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     t_start = time.perf_counter()
     latencies: Dict[str, int] = {}
     def _mark(name: str, start_time: float):
@@ -1022,9 +1022,12 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     agent_prompt = str(config_obj.prompt or "You are a helpful assistant.").strip()
 
     config_tool_map: Dict[str, Any] = {}
-    t_tools = time.perf_counter()
-    fetched_tools = fetch_agent_tools(str(agent_id))
-    _mark("fetch_agent_tools_ms", t_tools)
+    if tools_map is None:
+        t_tools = time.perf_counter()
+        fetched_tools = fetch_agent_tools(str(agent_id))
+        _mark("fetch_agent_tools_ms", t_tools)
+    else:
+        fetched_tools = tools_map
     merged_config = dict(DYNAMIC_CONFIG)
     merged_config.update(config_tool_map)
     if isinstance(fetched_tools, dict):
@@ -1198,6 +1201,7 @@ async def run_agent_async(
     variables: Optional[Any] = None,
     stream_callback: Optional[Any] = None,
     agent_config: Optional[Any] = None,
+    tools_map: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     t_start = time.perf_counter()
     latencies: Dict[str, int] = {}
@@ -1210,10 +1214,15 @@ async def run_agent_async(
 
     t_cfg = time.perf_counter()
     config_task = asyncio.sleep(0, result=agent_config) if agent_config is not None else asyncio.to_thread(fetch_agent_config, agent_id)
-    tools_task = asyncio.to_thread(fetch_agent_tools, str(agent_id))
-    config_raw, fetched_tools = await asyncio.gather(config_task, tools_task)
-    _mark("fetch_agent_config_ms", t_cfg)
-    _mark("fetch_agent_tools_ms", t_cfg)  # both ran in parallel; use same start for rough measure
+    if tools_map is None:
+        tools_task = asyncio.to_thread(fetch_agent_tools, str(agent_id))
+        config_raw, fetched_tools = await asyncio.gather(config_task, tools_task)
+        _mark("fetch_agent_config_ms", t_cfg)
+        _mark("fetch_agent_tools_ms", t_cfg)  # both ran in parallel; use same start for rough measure
+    else:
+        config_raw = await config_task
+        fetched_tools = tools_map
+        _mark("fetch_agent_config_ms", t_cfg)
 
     config_obj: Optional[AgentConfig] = None
     if config_raw is not None:
