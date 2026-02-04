@@ -133,7 +133,7 @@ def fetch_agent_config(agent_id: str) -> Optional[Dict[str, Any]]:
         print(f"fetch_agent_config error for {key}: {e}")
         return None
 
-async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict):
+async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg: dict, agent_config: Optional[Dict[str, Any]] = None, tools_map: Optional[Dict[str, Any]] = None):
     """
     Retell adapter (response_required protocol).
     Expects:
@@ -224,9 +224,12 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                 prior_tool_logs = existing_convo.get("tool_run_logs")
         log("conversation_loaded", history_len=len(conversation_history), vars_count=len(variables))
 
-        agent_config = fetch_agent_config(str(agent_id))
+        if agent_config is None:
+            agent_config = fetch_agent_config(str(agent_id))
         if not agent_config:
             log("agent_config_missing", key=f"agent:{agent_id}:config")
+        if tools_map is None:
+            tools_map = fetch_agent_tools(str(agent_id))
 
         loop = asyncio.get_running_loop()
         stream_used = asyncio.Event()
@@ -271,6 +274,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                     variables,
                     _stream_callback,
                     agent_config=agent_config,
+                    tools_map=tools_map,
                 )
             else:
                 result = await asyncio.to_thread(
@@ -280,6 +284,7 @@ async def _handle_retell_message(websocket: WebSocket, agent_id: str, retell_msg
                     user_message,
                     variables,
                     agent_config,
+                    tools_map,
                 )
             log("agent_ran", result_keys=list(result.keys()) if isinstance(result, dict) else "non-dict")
         except Exception as e:
@@ -361,6 +366,8 @@ async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
         logs.append(entry)
 
     await websocket.accept()
+    agent_config = fetch_agent_config(str(agent_id))
+    tools_map = fetch_agent_tools(str(agent_id))
     # Send immediate greeting on connect
     try:
         await websocket.send_json({
@@ -376,7 +383,7 @@ async def _retell_ws_entry(websocket: WebSocket, agent_id: str):
         while True:
             data = await websocket.receive_json()
             log("received", payload=data)
-            await _handle_retell_message(websocket, agent_id, data)
+            await _handle_retell_message(websocket, agent_id, data, agent_config, tools_map)
     except WebSocketDisconnect:
         log("disconnect")
     except Exception as e:
