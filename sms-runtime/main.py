@@ -1,4 +1,4 @@
-# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs.
+# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
 import json
 import uuid
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 from langgraph.graph import MessagesState
 from redis.asyncio import Redis as AsyncRedis
