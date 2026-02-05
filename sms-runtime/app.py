@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 # --- Redis Cluster Supporrt ---
 from redis.cluster import RedisCluster
 import redis
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -23,6 +23,7 @@ load_dotenv()
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
+from main import run_agent_ws
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
@@ -67,6 +68,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------------------------------------------------------------
+# WebSocket streaming endpoint (stateful, <500ms TTFT target)
+# ----------------------------------------------------------------------
+@app.websocket("/ws/chat/{agent_id}/{phone}")
+async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
+    await websocket.accept()
+    thread_id = f"{agent_id}:{phone}"
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            user_input = data.get("message", "")
+            initial_vars = data.get("variables", {}) or {}
+
+            async for text_chunk in run_agent_ws(agent_id, user_input, thread_id, initial_vars):
+                if isinstance(text_chunk, str) and text_chunk.startswith("||VARS||"):
+                    vars_json = text_chunk.replace("||VARS||", "", 1)
+                    try:
+                        await websocket.send_json({"type": "variables", "data": json.loads(vars_json or "{}")})
+                    except Exception:
+                        await websocket.send_json({"type": "variables", "data": {}})
+                else:
+                    await websocket.send_text(text_chunk)
+
+            await websocket.send_text("[DONE]")
+
+    except WebSocketDisconnect:
+        # Keep thread state in Redis; client may reconnect with same thread_id
+        pass
+    except Exception:
+        try:
+            await websocket.send_text("Sorry, something went wrong.")
+        except Exception:
+            pass
 
 # ----------------------------------------------------------------------
 # Request models
