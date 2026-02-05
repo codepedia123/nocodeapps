@@ -1,4 +1,4 @@
-# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logss
+# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
 import json
 import uuid
@@ -1004,9 +1004,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
 # Async streaming entrypoint (WebSocket friendly)
 # ---------------------------
 async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
-    if not _ensure_async_checkpointer():
-        yield "||ERROR||Async Redis checkpointer not initialized; set REDIS_TCP_URL and ensure langgraph redis checkpointer is installed"
-        return
+
 
     agent = _get_cached_agent(agent_id)
     config = {"configurable": {"thread_id": thread_id}}
