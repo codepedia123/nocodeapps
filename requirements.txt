@@ -1,16 +1,19 @@
-redis==5.0.1
+# Web & Runtime
 fastapi==0.115.12
 uvicorn[standard]==0.30.6
-twilio==8.10.0
-python-multipart==0.0.9
-langchain==0.3.21
-langchain-community==0.3.1
-langchain-openai==0.2.2
-langchain-groq==0.2.0
-langgraph==0.2.35
 python-dotenv==1.0.1
-requests==2.32.3
-pydantic==2.9.2
+python-multipart==0.0.9
+
+# AI Stack
+langchain==0.3.21
+langchain-core>=0.3.0
+langchain-openai==0.3.3
+langchain-community==0.3.1
+langgraph==0.2.35
+
+# Storage & Tools
 upstash-redis==1.5.0
-langchain-core>=0.2
-langgraph>=0.0.40
+upstash-vector>=0.6.0
+redis==5.0.1
+langgraph-checkpoint-redis
+httpx
