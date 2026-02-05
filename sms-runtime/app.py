@@ -82,6 +82,11 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     await websocket.accept()
     # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
     thread_id = f"{agent_id}:{phone}"
+    # Send immediate greeting on connect
+    try:
+        await websocket.send_text("hello")
+    except Exception:
+        pass
 
     try:
         while True:
