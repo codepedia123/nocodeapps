@@ -83,6 +83,7 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
     thread_id = f"{agent_id}:{phone}"
     logs_enabled = str(websocket.query_params.get("logs", "")).lower() == "true"
+    transcript_history: List[Dict[str, Any]] = []
     # Send immediate greeting on connect in Retell format
     try:
         await websocket.send_text(json.dumps({
@@ -91,6 +92,7 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
             "content_complete": False,
             "end_call": False,
         }))
+        transcript_history.append({"role": "agent", "content": "hello"})
     except Exception:
         pass
 
@@ -103,6 +105,11 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
             interaction_type = data.get("interaction_type", "response_required")
 
             transcript = data.get("transcript") or []
+            if transcript and not transcript_history:
+                # Seed history with provided transcript
+                for turn in transcript:
+                    if isinstance(turn, dict) and "role" in turn and "content" in turn:
+                        transcript_history.append({"role": turn["role"], "content": str(turn.get("content", ""))})
             user_input = ""
             if transcript:
                 for turn in reversed(transcript):
@@ -113,16 +120,22 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
                 user_input = data.get("message", "")  # fallback legacy input
             initial_vars = data.get("variables", {}) or {}
 
+            if user_input:
+                transcript_history.append({"role": "user", "content": user_input})
+
             # If logs requested, run once (non-streaming) and return final reply with runtime logs
             if logs_enabled:
                 try:
-                    result = await run_agent_async(agent_id, [], user_input, initial_vars)
+                    result = await run_agent_async(agent_id, transcript_history, user_input, initial_vars)
+                    reply_text = result.get("reply", "")
+                    transcript_history.append({"role": "agent", "content": reply_text})
                     await websocket.send_text(json.dumps({
                         "response_id": response_id,
-                        "content": result.get("reply", ""),
+                        "content": reply_text,
                         "content_complete": True,
                         "end_call": False,
                         "logs": result.get("logs", []),
+                        "transcript": transcript_history,
                     }))
                 except Exception as e:
                     await websocket.send_text(json.dumps({
@@ -144,6 +157,7 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
                 continue
 
             # Stream assistant response
+            agent_chunks: List[str] = []
             async for text_chunk in run_agent_ws(agent_id, user_input, thread_id, initial_vars):
                 if isinstance(text_chunk, str) and text_chunk.startswith("||VARS||"):
                     # Skip variable payloads for Retell
@@ -168,13 +182,17 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
                     "content_complete": False,
                     "end_call": False,
                 }))
+                agent_chunks.append(str(text_chunk))
 
             # Final completion message
+            if agent_chunks:
+                transcript_history.append({"role": "agent", "content": "".join(agent_chunks)})
             await websocket.send_text(json.dumps({
                 "response_id": response_id,
                 "content": "",
                 "content_complete": True,
                 "end_call": False,
+                "transcript": transcript_history,
             }))
 
     except WebSocketDisconnect:
