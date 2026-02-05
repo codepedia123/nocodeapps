@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.checkpoint.redis.asyncio import AsyncRedisSaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.graph import MessagesState
 from redis.asyncio import Redis as AsyncRedis
 
