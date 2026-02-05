@@ -180,6 +180,12 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     except WebSocketDisconnect:
         # Keep thread state in Redis; client may reconnect with same thread_id
         pass
+
+
+# Variant endpoint without phone param; defaults phone to "unknown"
+@app.websocket("/ws/chat/{agent_id}")
+async def websocket_chat_no_phone(websocket: WebSocket, agent_id: str):
+    await websocket_chat(websocket, agent_id, phone="unknown")
     except Exception:
         err_text = traceback.format_exc()
         print("WebSocket error:\n" + err_text)
