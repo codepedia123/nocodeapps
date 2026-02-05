@@ -75,6 +75,7 @@ app.add_middleware(
 @app.websocket("/ws/chat/{agent_id}/{phone}")
 async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     await websocket.accept()
+    # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
     thread_id = f"{agent_id}:{phone}"
 
     try:
@@ -90,9 +91,6 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
                         await websocket.send_json({"type": "variables", "data": json.loads(vars_json or "{}")})
                     except Exception:
                         await websocket.send_json({"type": "variables", "data": {}})
-                elif isinstance(text_chunk, str) and text_chunk.startswith("||LOGS||"):
-                    logs_str = text_chunk.replace("||LOGS||", "", 1)
-                    await websocket.send_json({"type": "logs", "data": logs_str})
                 elif isinstance(text_chunk, str) and text_chunk.startswith("||ERROR||"):
                     err_msg = text_chunk.replace("||ERROR||", "", 1)
                     await websocket.send_json({"type": "error", "data": err_msg})
