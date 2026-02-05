@@ -39,6 +39,8 @@ class AgentState(MessagesState):
     variables: Annotated[Dict[str, str], ior]
     # Flag used by LangGraph prebuilt agents; keep default False
     is_last_step: bool = False
+    # Required by create_react_agent state schema
+    remaining_steps: int = 0
 
 # Simple logger
 class Logger:
