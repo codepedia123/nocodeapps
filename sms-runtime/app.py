@@ -186,13 +186,6 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
 @app.websocket("/ws/chat/{agent_id}")
 async def websocket_chat_no_phone(websocket: WebSocket, agent_id: str):
     await websocket_chat(websocket, agent_id, phone="unknown")
-    except Exception:
-        err_text = traceback.format_exc()
-        print("WebSocket error:\n" + err_text)
-        try:
-            await websocket.send_json({"type": "error", "data": err_text})
-        except Exception:
-            pass
 
 # ----------------------------------------------------------------------
 # Request models
