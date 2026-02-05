@@ -282,7 +282,7 @@ def _get_cached_agent(agent_id: str):
     agent = create_react_agent(
         llm,
         tools=tools,
-        state_modifier=system_prompt,
+        prompt=system_prompt,
         checkpointer=checkpointer,
         state_schema=AgentState,
     )
