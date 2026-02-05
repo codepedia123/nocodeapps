@@ -992,37 +992,20 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
 # Async streaming entrypoint (WebSocket friendly)
 # ---------------------------
 async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
-    logs: List[str] = []
-    def add_log(label: str, data: Any = None):
-        try:
-            snippet = json.dumps(data, ensure_ascii=False) if data is not None else ""
-        except Exception:
-            snippet = str(data)
-        logs.append(f"{label}: {snippet}")
-
-    add_log("start", {"agent_id": agent_id, "thread_id": thread_id})
-
     if not _async_checkpointer:
-        err = "Async Redis checkpointer not initialized; set REDIS_TCP_URL and ensure langgraph redis checkpointer is installed"
-        add_log("error", err)
-        yield "||ERROR||" + err
-        yield "||LOGS||" + "\n".join(logs)
+        yield "||ERROR||Async Redis checkpointer not initialized; set REDIS_TCP_URL and ensure langgraph redis checkpointer is installed"
         return
 
     agent = _get_cached_agent(agent_id)
-    add_log("agent_built", {"tools": len(agent.tools) if hasattr(agent, 'tools') else "n/a"})
-
     config = {"configurable": {"thread_id": thread_id}}
     input_data: Dict[str, Any] = {"messages": [("user", message)]}
     if variables:
         input_data["variables"] = variables
-    add_log("input", input_data)
 
     try:
         async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
             text = _chunk_to_text(chunk)
             if text:
-                add_log("chunk", text)
                 yield text
 
         final_vars: Dict[str, Any] = {}
@@ -1032,15 +1015,11 @@ async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: O
                 vals = getattr(state, "values", {}) or {}
                 if isinstance(vals, dict):
                     final_vars = vals.get("variables", {}) or {}
-            add_log("final_vars", final_vars)
-        except Exception as e:
-            add_log("state_error", str(e))
+        except Exception:
+            pass
         yield "||VARS||" + json.dumps(final_vars or {})
     except Exception as e:
-        add_log("error", str(e))
         yield "||ERROR||" + str(e)
-    finally:
-        yield "||LOGS||" + "\n".join(logs)
 
 # ---------------------------
 # FastAPI app
