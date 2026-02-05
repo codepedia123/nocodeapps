@@ -82,9 +82,14 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     await websocket.accept()
     # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
     thread_id = f"{agent_id}:{phone}"
-    # Send immediate greeting on connect
+    # Send immediate greeting on connect in Retell format
     try:
-        await websocket.send_text("hello")
+        await websocket.send_text(json.dumps({
+            "response_id": 0,
+            "content": "hello",
+            "content_complete": False,
+            "end_call": False,
+        }))
     except Exception:
         pass
 
@@ -92,67 +97,53 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
         while True:
             data = await websocket.receive_json()
 
-            # Detect Retell JSON shape
-            is_retell = "response_id" in data and "transcript" in data
-            response_id = data.get("response_id")
+            # Treat all clients as Retell output; accept either input shape
+            response_id = data.get("response_id", 0)
 
-            if is_retell:
-                # Pull latest user utterance
-                transcript = data.get("transcript") or []
-                user_input = ""
+            transcript = data.get("transcript") or []
+            user_input = ""
+            if transcript:
                 for turn in reversed(transcript):
                     if isinstance(turn, dict) and turn.get("role") == "user":
                         user_input = str(turn.get("content", ""))
                         break
-                initial_vars = data.get("variables", {}) or {}
-            else:
-                user_input = data.get("message", "")
-                initial_vars = data.get("variables", {}) or {}
+            if not user_input:
+                user_input = data.get("message", "")  # fallback legacy input
+            initial_vars = data.get("variables", {}) or {}
 
             # Stream assistant response
             async for text_chunk in run_agent_ws(agent_id, user_input, thread_id, initial_vars):
                 if isinstance(text_chunk, str) and text_chunk.startswith("||VARS||"):
-                    vars_json = text_chunk.replace("||VARS||", "", 1)
-                    try:
-                        await websocket.send_json({"type": "variables", "data": json.loads(vars_json or "{}")})
-                    except Exception:
-                        await websocket.send_json({"type": "variables", "data": {}})
+                    # Skip variable payloads for Retell
                     continue
 
                 if isinstance(text_chunk, str) and text_chunk.startswith("||ERROR||"):
                     err_msg = text_chunk.replace("||ERROR||", "", 1)
-                    if is_retell:
-                        await websocket.send_text(json.dumps({
-                            "response_id": response_id,
-                            "content": err_msg,
-                            "content_complete": True,
-                            "end_call": True,
-                        }))
-                    else:
-                        await websocket.send_json({"type": "error", "data": err_msg})
+                    await websocket.send_text(json.dumps({
+                        "response_id": response_id,
+                        "content": err_msg,
+                        "content_complete": True,
+                        "end_call": True,
+                    }))
                     return
 
                 if not text_chunk:
                     continue
 
-                if is_retell:
-                    await websocket.send_text(json.dumps({
-                        "response_id": response_id,
-                        "content": str(text_chunk),
-                        "content_complete": False,
-                        "end_call": False,
-                    }))
-                else:
-                    await websocket.send_text(text_chunk)
-
-            # Final completion message for Retell clients
-            if is_retell:
                 await websocket.send_text(json.dumps({
                     "response_id": response_id,
-                    "content": "",
-                    "content_complete": True,
+                    "content": str(text_chunk),
+                    "content_complete": False,
                     "end_call": False,
                 }))
+
+            # Final completion message
+            await websocket.send_text(json.dumps({
+                "response_id": response_id,
+                "content": "",
+                "content_complete": True,
+                "end_call": False,
+            }))
 
     except WebSocketDisconnect:
         # Keep thread state in Redis; client may reconnect with same thread_id
