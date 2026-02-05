@@ -911,8 +911,9 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
     tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
     llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
-    # Build agent
-    agent = create_react_agent(llm, tools, state_modifier=_state_modifier_fn, state_schema=AgentState)
+    # Build agent (new API expects prompt, not state_modifier)
+    initial_prompt = _render_system_prompt(initial_vars)
+    agent = create_react_agent(llm, tools, prompt=initial_prompt, state_schema=AgentState)
     msgs = _to_messages(conversation_history, message)
 
     # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
