@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Annotated
 from operator import ior
 import requests
+import asyncio
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -16,7 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
+from langgraph.checkpoint.redis.asyncio import AsyncRedisSaver
 from langgraph.graph import MessagesState
+from redis.asyncio import Redis as AsyncRedis
 
 from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
@@ -54,6 +57,26 @@ class Logger:
         self._events = []
 
 logger = Logger()
+
+# ---------------------------
+# Async Redis checkpointer (TCP, stateful)
+# ---------------------------
+_async_redis_client: Optional[AsyncRedis] = None
+_async_checkpointer: Optional[AsyncRedisSaver] = None
+_AGENT_GRAPH_CACHE: Dict[str, Any] = {}
+
+try:
+    redis_tcp_url = os.getenv("REDIS_TCP_URL")
+    if redis_tcp_url:
+        _async_redis_client = AsyncRedis.from_url(redis_tcp_url, decode_responses=False)
+        _async_checkpointer = AsyncRedisSaver(_async_redis_client)
+        logger.log("redis.tcp", "Initialized AsyncRedisSaver", {"url": redis_tcp_url})
+    else:
+        logger.log("redis.tcp.missing", "REDIS_TCP_URL not set; async checkpointer disabled")
+except Exception as e:
+    logger.log("redis.tcp.error", "Failed to init AsyncRedisSaver", {"error": str(e)})
+    _async_redis_client = None
+    _async_checkpointer = None
 
 # ---------------------------
 # Upstash Redis init
@@ -177,6 +200,83 @@ def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ---------------------------
+# Agent + tool caching for async streaming
+# ---------------------------
+def _resolve_api_key(agent_resp: Dict[str, Any]) -> Optional[str]:
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        if agent_resp.get(key_name):
+            return agent_resp.get(key_name)
+    return os.getenv("OPENAI_API_KEY")
+
+def _build_system_prompt(agent_prompt: str, rulebook: str = "") -> str:
+    base_prompt = agent_prompt or "You are a helpful assistant."
+    rules = (
+        "Tool rules:\n"
+        "If a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\n"
+        "Do not claim an external action succeeded unless a tool result clearly confirms it.\n"
+        "Do not invent missing user details.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts when available.\n"
+    )
+    if rulebook:
+        return f"{base_prompt}\n\nRULEBOOK:\n{rulebook}\n\n{rules}"
+    return f"{base_prompt}\n\n{rules}"
+
+def _merge_tool_config(agent_id: str) -> Dict[str, Any]:
+    merged_config = dict(DYNAMIC_CONFIG)
+    fetched_tools = fetch_agent_tools(str(agent_id)) or {}
+    for tid, tcfg in fetched_tools.items():
+        merged_config[str(tid)] = {
+            "api_url": tcfg.get("api_url", ""),
+            "api_payload_json": tcfg.get("api_payload_json", ""),
+            "instructions": tcfg.get("instructions", ""),
+            "when_run": tcfg.get("when_run", ""),
+        }
+    return merged_config
+
+def _chunk_to_text(chunk: Any) -> str:
+    if not chunk:
+        return ""
+    content = getattr(chunk, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
+
+def _get_cached_agent(agent_id: str):
+    cache_key = str(agent_id)
+    if cache_key in _AGENT_GRAPH_CACHE:
+        return _AGENT_GRAPH_CACHE[cache_key]
+
+    agent_resp = fetch_agent_details(agent_id) or {}
+    api_key = _resolve_api_key(agent_resp)
+    if not api_key:
+        raise RuntimeError("OpenAI API key missing for streaming agent")
+
+    merged_config = _merge_tool_config(agent_id)
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    system_prompt = _build_system_prompt(agent_resp.get("prompt", ""), agent_resp.get("rulebook", ""))
+    llm = ChatOpenAI(api_key=api_key, model="gpt-4o", streaming=True, temperature=0)
+
+    checkpointer = _async_checkpointer or MemorySaver()
+
+    agent = create_react_agent(
+        llm,
+        tools=tools,
+        state_modifier=system_prompt,
+        checkpointer=checkpointer,
+        state_schema=AgentState,
+    )
+    _AGENT_GRAPH_CACHE[cache_key] = agent
+    return agent
+
+# ---------------------------
 # Conversation persistence helpers (all_conversations table)
 # ---------------------------
 def _parse_json_field(val: Any) -> Any:
@@ -186,6 +286,37 @@ def _parse_json_field(val: Any) -> Any:
 
 def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     if not _redis_client or not phone:
+        return None
+
+def _fetch_conversation_by_conversation_id(conversation_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client or not conversation_id:
+        return None
+    try:
+        table_name = "all_conversations"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.convo_by_id.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
+                continue
+            if not row:
+                continue
+            cid = row.get("conversation_id")
+            if cid and str(cid) == str(conversation_id):
+                row_data = {"id": row_id}
+                row_data.update(row)
+                for fld in ("conversation_json", "tool_run_logs", "variables"):
+                    if fld in row_data:
+                        row_data[fld] = _parse_json_field(row_data[fld])
+                return row_data
+        return None
+    except Exception as e:
+        logger.log("fetch.convo_by_id.exception", "Error fetching conversation by id", {"conversation_id": conversation_id, "error": str(e)})
         return None
     try:
         table_name = "all_conversations"
@@ -257,6 +388,20 @@ def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Opt
     except Exception as e:
         logger.log("save.convo.error", "Failed to upsert conversation", {"error": str(e)})
         return None
+
+def _upsert_voice_conversation(conversation_id: str, agent_id: str, conversation_json: List[Dict[str, Any]], variables: Optional[Dict[str, Any]] = None, tool_run_logs: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    existing = _fetch_conversation_by_conversation_id(conversation_id)
+    row_id = existing.get("id") if isinstance(existing, dict) else None
+    data = {
+        "conversation_id": conversation_id,
+        "agent_id": agent_id,
+        "conversation_json": conversation_json,
+        "type": "voice-retell",
+        "variables": variables or {},
+    }
+    if tool_run_logs is not None:
+        data["tool_run_logs"] = tool_run_logs
+    return _upsert_conversation_row(row_id, data)
 
 # ---------------------------
 # Utility validators and helpers
@@ -836,6 +981,41 @@ def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message
     except Exception:
         pass
     return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+
+async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    Lightweight async wrapper that offloads the sync run_agent to a thread.
+    """
+    return await asyncio.to_thread(run_agent, agent_id, conversation_history, message, variables)
+
+# ---------------------------
+# Async streaming entrypoint (WebSocket friendly)
+# ---------------------------
+async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
+    if not _async_checkpointer:
+        raise RuntimeError("Async Redis checkpointer not initialized; set REDIS_TCP_URL")
+
+    agent = _get_cached_agent(agent_id)
+    config = {"configurable": {"thread_id": thread_id}}
+    input_data: Dict[str, Any] = {"messages": [("user", message)]}
+    if variables:
+        input_data["variables"] = variables
+
+    async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
+        text = _chunk_to_text(chunk)
+        if text:
+            yield text
+
+    final_vars: Dict[str, Any] = {}
+    try:
+        state = await agent.aget_state(config)
+        if state and hasattr(state, "values"):
+            vals = getattr(state, "values", {}) or {}
+            if isinstance(vals, dict):
+                final_vars = vals.get("variables", {}) or {}
+    except Exception as e:
+        logger.log("run.async.state_error", "Failed to load final state", {"error": str(e)})
+    yield "||VARS||" + json.dumps(final_vars or {})
 
 # ---------------------------
 # FastAPI app
