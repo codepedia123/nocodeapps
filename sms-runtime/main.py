@@ -17,7 +17,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+try:
+    from langgraph.checkpoint.redis.asyncio import AsyncRedisSaver  # type: ignore
+except Exception:
+    try:
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver  # type: ignore
+    except Exception:
+        try:
+            from langgraph.checkpoint.redis import AsyncRedisSaver  # type: ignore
+        except Exception:
+            try:
+                from langgraph_checkpoint_redis import AsyncRedisSaver  # type: ignore
+            except Exception:
+                AsyncRedisSaver = None  # type: ignore
 
 from langgraph.graph import MessagesState
 from redis.asyncio import Redis as AsyncRedis
@@ -70,9 +82,10 @@ def _ensure_async_checkpointer() -> bool:
     global _async_redis_client, _async_checkpointer
     if _async_checkpointer:
         return True
-    redis_tcp_url =
+    redis_tcp_url = os.getenv(
+        "REDIS_TCP_URL",
         "rediss://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379",
-    
+    )
     if not redis_tcp_url or AsyncRedisSaver is None:
         return False
     try:
