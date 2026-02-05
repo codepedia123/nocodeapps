@@ -108,8 +108,10 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
         # Keep thread state in Redis; client may reconnect with same thread_id
         pass
     except Exception:
+        err_text = traceback.format_exc()
+        print("WebSocket error:\n" + err_text)
         try:
-            await websocket.send_text("Sorry, something went wrong.")
+            await websocket.send_json({"type": "error", "data": err_text})
         except Exception:
             pass
 
