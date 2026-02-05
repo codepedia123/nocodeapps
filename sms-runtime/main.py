@@ -70,10 +70,9 @@ def _ensure_async_checkpointer() -> bool:
     global _async_redis_client, _async_checkpointer
     if _async_checkpointer:
         return True
-    redis_tcp_url = os.getenv(
-        "REDIS_TCP_URL",
+    redis_tcp_url =
         "rediss://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379",
-    )
+    
     if not redis_tcp_url or AsyncRedisSaver is None:
         return False
     try:
