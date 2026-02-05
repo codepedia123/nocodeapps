@@ -992,30 +992,55 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
 # Async streaming entrypoint (WebSocket friendly)
 # ---------------------------
 async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
+    logs: List[str] = []
+    def add_log(label: str, data: Any = None):
+        try:
+            snippet = json.dumps(data, ensure_ascii=False) if data is not None else ""
+        except Exception:
+            snippet = str(data)
+        logs.append(f"{label}: {snippet}")
+
+    add_log("start", {"agent_id": agent_id, "thread_id": thread_id})
+
     if not _async_checkpointer:
-        raise RuntimeError("Async Redis checkpointer not initialized; set REDIS_TCP_URL")
+        err = "Async Redis checkpointer not initialized; set REDIS_TCP_URL and ensure langgraph redis checkpointer is installed"
+        add_log("error", err)
+        yield "||ERROR||" + err
+        yield "||LOGS||" + "\n".join(logs)
+        return
 
     agent = _get_cached_agent(agent_id)
+    add_log("agent_built", {"tools": len(agent.tools) if hasattr(agent, 'tools') else "n/a"})
+
     config = {"configurable": {"thread_id": thread_id}}
     input_data: Dict[str, Any] = {"messages": [("user", message)]}
     if variables:
         input_data["variables"] = variables
+    add_log("input", input_data)
 
-    async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
-        text = _chunk_to_text(chunk)
-        if text:
-            yield text
-
-    final_vars: Dict[str, Any] = {}
     try:
-        state = await agent.aget_state(config)
-        if state and hasattr(state, "values"):
-            vals = getattr(state, "values", {}) or {}
-            if isinstance(vals, dict):
-                final_vars = vals.get("variables", {}) or {}
+        async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
+            text = _chunk_to_text(chunk)
+            if text:
+                add_log("chunk", text)
+                yield text
+
+        final_vars: Dict[str, Any] = {}
+        try:
+            state = await agent.aget_state(config)
+            if state and hasattr(state, "values"):
+                vals = getattr(state, "values", {}) or {}
+                if isinstance(vals, dict):
+                    final_vars = vals.get("variables", {}) or {}
+            add_log("final_vars", final_vars)
+        except Exception as e:
+            add_log("state_error", str(e))
+        yield "||VARS||" + json.dumps(final_vars or {})
     except Exception as e:
-        logger.log("run.async.state_error", "Failed to load final state", {"error": str(e)})
-    yield "||VARS||" + json.dumps(final_vars or {})
+        add_log("error", str(e))
+        yield "||ERROR||" + str(e)
+    finally:
+        yield "||LOGS||" + "\n".join(logs)
 
 # ---------------------------
 # FastAPI app
