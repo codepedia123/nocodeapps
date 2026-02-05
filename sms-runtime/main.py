@@ -17,7 +17,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from upstash_redis import Redis as UpstashRedis
 from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+try:
+    from langgraph.checkpoint.redis.asyncio import AsyncRedisSaver  # type: ignore
+except Exception:
+    try:
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver  # type: ignore
+    except Exception:
+        try:
+            from langgraph.checkpoint.redis import AsyncRedisSaver  # type: ignore
+        except Exception:
+            try:
+                from langgraph_checkpoint_redis import AsyncRedisSaver  # type: ignore
+            except Exception:
+                AsyncRedisSaver = None  # type: ignore
 from langgraph.graph import MessagesState
 from redis.asyncio import Redis as AsyncRedis
 
@@ -62,21 +74,30 @@ logger = Logger()
 # Async Redis checkpointer (TCP, stateful)
 # ---------------------------
 _async_redis_client: Optional[AsyncRedis] = None
-_async_checkpointer: Optional[AsyncRedisSaver] = None
+_async_checkpointer: Optional[Any] = None
 _AGENT_GRAPH_CACHE: Dict[str, Any] = {}
 
-try:
-    redis_tcp_url = os.getenv("REDIS_TCP_URL")
-    if redis_tcp_url:
+def _ensure_async_checkpointer() -> bool:
+    global _async_redis_client, _async_checkpointer
+    if _async_checkpointer:
+        return True
+    redis_tcp_url = os.getenv(
+        "REDIS_TCP_URL",
+        "rediss://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379",
+    )
+    if not redis_tcp_url or AsyncRedisSaver is None:
+        return False
+    try:
         _async_redis_client = AsyncRedis.from_url(redis_tcp_url, decode_responses=False)
         _async_checkpointer = AsyncRedisSaver(_async_redis_client)
+        _AGENT_GRAPH_CACHE.clear()
         logger.log("redis.tcp", "Initialized AsyncRedisSaver", {"url": redis_tcp_url})
-    else:
-        logger.log("redis.tcp.missing", "REDIS_TCP_URL not set; async checkpointer disabled")
-except Exception as e:
-    logger.log("redis.tcp.error", "Failed to init AsyncRedisSaver", {"error": str(e)})
-    _async_redis_client = None
-    _async_checkpointer = None
+        return True
+    except Exception as e:
+        logger.log("redis.tcp.error", "Failed to init AsyncRedisSaver", {"error": str(e)})
+        _async_redis_client = None
+        _async_checkpointer = None
+        return False
 
 # ---------------------------
 # Upstash Redis init
@@ -992,7 +1013,7 @@ async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, An
 # Async streaming entrypoint (WebSocket friendly)
 # ---------------------------
 async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
-    if not _async_checkpointer:
+    if not _ensure_async_checkpointer():
         yield "||ERROR||Async Redis checkpointer not initialized; set REDIS_TCP_URL and ensure langgraph redis checkpointer is installed"
         return
 
