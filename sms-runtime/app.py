@@ -99,6 +99,7 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
 
             # Treat all clients as Retell output; accept either input shape
             response_id = data.get("response_id", 0)
+            interaction_type = data.get("interaction_type", "response_required")
 
             transcript = data.get("transcript") or []
             user_input = ""
@@ -110,6 +111,16 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
             if not user_input:
                 user_input = data.get("message", "")  # fallback legacy input
             initial_vars = data.get("variables", {}) or {}
+
+            # If this is just an update/reminder, acknowledge and continue loop without generating reply
+            if interaction_type in ("update_only", "reminder_required") or not user_input:
+                await websocket.send_text(json.dumps({
+                    "response_id": response_id,
+                    "content": "",
+                    "content_complete": True,
+                    "end_call": False,
+                }))
+                continue
 
             # Stream assistant response
             async for text_chunk in run_agent_ws(agent_id, user_input, thread_id, initial_vars):
