@@ -4,18 +4,14 @@ uvicorn[standard]==0.30.6
 python-dotenv==1.0.1
 python-multipart==0.0.9
 
-# AI Stack
-langchain==0.3.21
-langchain-core>=0.3.0
-langchain-openai==0.3.3
-langchain-community==0.3.1
-langgraph==0.2.35
+# AI Stack (Let pip resolve the best matches)
+langchain>=0.3.0
+langchain-openai>=0.3.0
+langgraph>=0.2.60
+langgraph-checkpoint-redis>=0.3.0
 
 # Storage & Tools
-langgraph==0.2.35
 upstash-redis==1.5.0
 upstash-vector>=0.6.0
-redis==5.0.1
-langgraph-checkpoint>=2.0.0
-langgraph-checkpoint-redis==0.3.4
+redis>=5.0.1
 httpx
