@@ -1,4 +1,4 @@
-# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
+# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs.
 import os
 import json
 import uuid
