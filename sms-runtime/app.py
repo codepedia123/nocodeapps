@@ -28,7 +28,7 @@ os.environ.setdefault(
 # Config
 # ----------------------------------------------------------------------
 from upstash_redis import Redis as UpstashRedis
-from main import run_agent_ws
+from main import run_agent_ws, run_agent_async
 
 def _init_redis() -> Optional[UpstashRedis]:
     try:
@@ -82,6 +82,7 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
     await websocket.accept()
     # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
     thread_id = f"{agent_id}:{phone}"
+    logs_enabled = str(websocket.query_params.get("logs", "")).lower() == "true"
     # Send immediate greeting on connect in Retell format
     try:
         await websocket.send_text(json.dumps({
@@ -111,6 +112,26 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
             if not user_input:
                 user_input = data.get("message", "")  # fallback legacy input
             initial_vars = data.get("variables", {}) or {}
+
+            # If logs requested, run once (non-streaming) and return final reply with runtime logs
+            if logs_enabled:
+                try:
+                    result = await run_agent_async(agent_id, [], user_input, initial_vars)
+                    await websocket.send_text(json.dumps({
+                        "response_id": response_id,
+                        "content": result.get("reply", ""),
+                        "content_complete": True,
+                        "end_call": False,
+                        "logs": result.get("logs", []),
+                    }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({
+                        "response_id": response_id,
+                        "content": f"Error: {e}",
+                        "content_complete": True,
+                        "end_call": True,
+                    }))
+                continue
 
             # If this is just an update/reminder, acknowledge and continue loop without generating reply
             if interaction_type in ("update_only", "reminder_required") or not user_input:
