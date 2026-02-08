@@ -742,6 +742,92 @@ def _is_valid_api_url(u: str) -> bool:
     except Exception:
         return False
 
+
+def _extract_flow_id_from_url(api_url: str) -> Optional[str]:
+    """Extract the Activepieces flow id from a webhook URL."""
+    try:
+        parsed = urllib.parse.urlparse(api_url)
+        segments = [seg for seg in (parsed.path or "").split("/") if seg]
+        if "webhooks" in segments:
+            idx = segments.index("webhooks")
+            if idx + 1 < len(segments):
+                return segments[idx + 1]
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_activepieces_api_key() -> Optional[str]:
+    """Fetch the Activepieces APP_KEY from the remote config service."""
+    url = "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json() if resp.ok else None
+        if isinstance(data, dict):
+            for _, rec in data.items():
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("name", "")).lower() == "active_pieces":
+                    val = rec.get("value")
+                    if val:
+                        return str(val)
+    except Exception as e:
+        logger.log("tool.diag.app_key_error", "Failed to fetch active_pieces app key", {"error": str(e)})
+    return None
+
+
+def _fetch_failed_run_details(flow_id: str, app_key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Fetch the latest failed run details and return (error_message, trigger_raw_body, display_name)."""
+    try:
+        headers = {"Authorization": app_key}
+        list_url = (
+            "https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs"
+            f"?flowId={flow_id}&projectId=m6IFepCya4gsolsay8PoM&limit=1&status=FAILED"
+        )
+        resp1 = requests.get(list_url, headers=headers, timeout=15)
+        data = resp1.json() if resp1.ok else None
+        run_id = None
+        if isinstance(data, dict):
+            arr = data.get("data")
+            if isinstance(arr, list) and arr:
+                first = arr[0]
+                if isinstance(first, dict):
+                    run_id = first.get("id")
+        if not run_id:
+            return (None, None, None)
+        detail_url = f"https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs/{run_id}"
+        resp2 = requests.get(detail_url, headers=headers, timeout=15)
+        detail = resp2.json() if resp2.ok else None
+        if not isinstance(detail, dict):
+            return (None, None, None)
+        steps = detail.get("steps") or {}
+        flow_version = detail.get("flowVersion") or {}
+        display_name = None
+        if isinstance(flow_version, dict):
+            display_name = flow_version.get("displayName")
+        if not isinstance(steps, dict):
+            return (None, None, display_name)
+        trigger_raw = None
+        run_error = None
+        trigger = steps.get("trigger") or {}
+        if isinstance(trigger, dict):
+            output = trigger.get("output") or {}
+            if isinstance(output, dict):
+                trigger_raw = output.get("rawBody") or output.get("raw_body")
+        step_1 = steps.get("step_1") or {}
+        if isinstance(step_1, dict):
+            run_error = step_1.get("errorMessage") or step_1.get("error_message")
+        if not run_error:
+            for s in steps.values():
+                if isinstance(s, dict) and str(s.get("status", "")).upper() == "FAILED":
+                    run_error = s.get("errorMessage") or s.get("error_message") or run_error
+                    if run_error:
+                        break
+        return (run_error, trigger_raw, display_name)
+    except Exception as e:
+        logger.log("tool.diag.run_fetch_error", "Failed to fetch flow run details", {"flow_id": flow_id, "error": str(e)})
+        return (None, None, None)
+
 # ---------------------------
 # Tool factory
 # ---------------------------
@@ -813,12 +899,27 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                     except Exception:
                         response_data = resp.text
                     tool_result = {"ok": bool(resp.ok), "status_code": resp.status_code, "response": response_data, "event_id": event_id}
-                    logger.log("tool.response", f"api_tool_{_tool_id} result", tool_result)
-                    return json.dumps(tool_result, ensure_ascii=False)
                 except Exception as e:
-                    error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
-                    logger.log("tool.error", f"api_tool_{_tool_id} failed", error_data)
-                    return json.dumps(error_data, ensure_ascii=False)
+                    tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
+
+                # Failure enrichment for 500/ok=False
+                try:
+                    should_enrich = (tool_result.get("status_code") == 500) or (tool_result.get("ok") is False)
+                    if should_enrich:
+                        app_key = _fetch_activepieces_api_key()
+                        flow_id = _extract_flow_id_from_url(_api_url)
+                        err_msg, trigger_raw, display_name = (None, None, None)
+                        if app_key and flow_id:
+                            err_msg, trigger_raw, display_name = _fetch_failed_run_details(flow_id, app_key)
+                        issue_message = f"{(display_name or f'api_tool_{_tool_id}')} HAD AN ISSUE, DETAILS: {err_msg or 'Unknown error'} ; {trigger_raw or 'No trigger raw body'}"
+                        tool_result["response"] = issue_message
+                        tool_result["error"] = True
+                except Exception as enrich_err:
+                    logger.log("tool.diag.enrich_error", "Failed to enrich tool failure", {"event_id": event_id, "error": str(enrich_err)})
+
+                log_type = "tool.response" if tool_result.get("ok") else "tool.error"
+                logger.log(log_type, f"api_tool_{_tool_id} result", tool_result)
+                return json.dumps(tool_result, ensure_ascii=False)
             return make_api_call
         make_api_call = _make_api_call_factory(str(tool_id), api_url, tpl_obj, ask_map)
         description = (f"WHEN_RUN: {when_run}\nINSTRUCTIONS: {instructions}\nPAYLOAD_TEMPLATE: {raw_payload_template}\nDo not invent missing details. Ask if unsure.")
