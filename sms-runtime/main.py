@@ -911,7 +911,7 @@ def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
                         err_msg, trigger_raw, display_name = (None, None, None)
                         if app_key and flow_id:
                             err_msg, trigger_raw, display_name = _fetch_failed_run_details(flow_id, app_key)
-                        issue_message = f"{(display_name or f'api_tool_{_tool_id}')} HAD AN ISSUE, DETAILS: {err_msg or 'Unknown error'} ; {trigger_raw or 'No trigger raw body'}"
+                        issue_message = f"{(display_name or f'api_tool_{_tool_id}')} HAD AN ISSUE, DETAILS: {err_msg or 'Unknown error'} ; raw payload body {trigger_raw or 'No trigger raw body'}"
                         tool_result["response"] = issue_message
                         tool_result["error"] = True
                 except Exception as enrich_err:
