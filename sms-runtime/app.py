@@ -187,13 +187,15 @@ async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
             # Final completion message
             if agent_chunks:
                 transcript_history.append({"role": "agent", "content": "".join(agent_chunks)})
-            await websocket.send_text(json.dumps({
+            completion_payload = {
                 "response_id": response_id,
                 "content": "",
                 "content_complete": True,
                 "end_call": False,
-                "transcript": transcript_history,
-            }))
+            }
+            if logs_enabled:
+                completion_payload["transcript"] = transcript_history
+            await websocket.send_text(json.dumps(completion_payload))
 
     except WebSocketDisconnect:
         # Keep thread state in Redis; client may reconnect with same thread_id
