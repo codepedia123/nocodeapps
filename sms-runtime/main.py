@@ -1,275 +1,368 @@
-# sms-runtime/app.py
+# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
 import os
 import json
-import time
 import uuid
-from dotenv import load_dotenv
-from typing import Dict, Any, Optional, List, Tuple
-
-# --- Redis Cluster Supporrt ---
-from redis.cluster import RedisCluster
-import redis
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from pathlib import Path
 import traceback
+import urllib.parse
 import re
-import builtins
-import threading
-load_dotenv()
-# Fallback TCP Redis URL for AsyncRedisSaver (override with env in production)
-os.environ.setdefault(
-    "REDIS_TCP_URL",
-    "rediss://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379",
-)
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
-from upstash_redis import Redis as UpstashRedis
-from main import run_agent_ws, run_agent_async
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Annotated
+from operator import ior
+import requests
+import asyncio
 
-def _init_redis() -> Optional[UpstashRedis]:
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+
+from upstash_redis import Redis as UpstashRedis
+from langgraph.prebuilt import create_react_agent, InjectedState
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+from langgraph.checkpoint.memory import MemorySaver
+
+from langgraph.graph import MessagesState
+from redis.asyncio import Redis as AsyncRedis
+
+from langchain_core.tools import StructuredTool
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from pydantic import create_model, Field, BaseModel, ConfigDict
+from langgraph.errors import GraphRecursionError
+from xml.sax.saxutils import escape
+
+# Minimal dynamic config
+DYNAMIC_CONFIG: Dict[str, Any] = {}
+
+class AgentState(MessagesState):
+    # This stores the dynamic variables in agent memory and merges updates
+    variables: Annotated[Dict[str, str], ior]
+    # Flag used by LangGraph prebuilt agents; keep default False
+    is_last_step: bool = False
+    # Required by create_react_agent state schema
+    remaining_steps: int = 0
+
+# Simple logger
+class Logger:
+    def __init__(self):
+        self._events: List[Dict[str, Any]] = []
+
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def log(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
+        entry = {"ts": self._now(), "id": str(uuid.uuid4()), "type": event_type, "message": message, "data": data or {}}
+        self._events.append(entry)
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        return self._events.copy()
+
+    def clear(self):
+        self._events = []
+
+logger = Logger()
+
+# ---------------------------
+# Async Redis checkpointer (TCP, stateful)
+# ---------------------------
+_async_redis_client: Optional[AsyncRedis] = None
+_async_checkpointer: Optional[Any] = None
+_AGENT_GRAPH_CACHE: Dict[str, Any] = {}
+
+def _ensure_async_checkpointer() -> bool:
+    global _async_redis_client, _async_checkpointer
+    if _async_checkpointer:
+        return True
+    # Prefer env-provided TCP URL; keep empty string if unset.
+    redis_tcp_url = (
+        os.getenv("REDIS_TCP_URL")
+        or os.getenv("UPSTASH_REDIS_TCP_URL")
+        or ""
+    )
+    if not redis_tcp_url or AsyncRedisSaver is None:
+        return False
     try:
-        # Pull these from Railway Environment Variables for security
-        url = os.getenv("UPSTASH_REDIS_REST_URL", "https://climbing-hyena-56303.upstash.io")
-        token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM")
-        if not url or not token:
-            raise RuntimeError("Upstash credentials missing")
-        
-        # Initialize the HTTP-based client
-        client = UpstashRedis(url=url, token=token)
-        
-        # Test connection
-        client.set("connection_test", "ok")
-        print("✅ Connected to Upstash via HTTP SDK")
-        return client
-        
+        _async_redis_client = AsyncRedis.from_url(redis_tcp_url, decode_responses=False)
+        _async_checkpointer = AsyncRedisSaver(_async_redis_client)
+        _AGENT_GRAPH_CACHE.clear()
+        logger.log("redis.tcp", "Initialized AsyncRedisSaver", {"url": redis_tcp_url})
+        return True
     except Exception as e:
-        print(f"❌ Upstash SDK connection failed: {e}")
+        logger.log("redis.tcp.error", "Failed to init AsyncRedisSaver", {"error": str(e)})
+        _async_redis_client = None
+        _async_checkpointer = None
+        return False
+
+# ---------------------------
+# Upstash Redis init
+# ---------------------------
+_redis_client: Optional[UpstashRedis] = None
+try:
+    redis_url = "https://climbing-hyena-56303.upstash.io"
+    redis_token = "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM"
+
+    # If you have local dev defaults, set them here, but never keep production secrets hardcoded
+    if not redis_url or not redis_token:
+        raise RuntimeError("Upstash credentials missing in environment")
+
+    _redis_client = UpstashRedis(url=redis_url, token=redis_token)
+    try:
+        _redis_client.set("connection_test", "ok")
+        logger.log("redis", "Connected to Upstash via HTTP SDK", {"url": redis_url})
+        print("Connected to Upstash via HTTP SDK")
+    except Exception as e:
+        logger.log("redis.ping_error", "Upstash test operation failed", {"error": str(e)})
+        _redis_client = None
+except Exception as e:
+    logger.log("redis.init_error", "Failed to initialize Upstash client", {"error": str(e)})
+    print(f"Upstash SDK connection failed: {e}")
+    _redis_client = None
+
+# ---------------------------
+# Redis helpers
+# ---------------------------
+def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client:
+        logger.log("fetch.agent.no_redis", "Redis client not available", {"agent_id": agent_id})
+        return None
+    try:
+        candidates: List[str] = []
+        if isinstance(agent_id, str):
+            candidates.append(agent_id)
+            if agent_id.startswith("agent"):
+                try:
+                    suffix = int(agent_id[len("agent"):])
+                    candidates.append(str(suffix))
+                    candidates.append(f"agent{suffix}")
+                except Exception:
+                    pass
+            else:
+                candidates.append(f"agent{agent_id}")
+        else:
+            candidates.append(f"agent{agent_id}")
+            candidates.append(str(agent_id))
+
+        seen = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            key = cand if cand.startswith("agent") else (f"agent{cand}" if cand.isdigit() else cand)
+            try:
+                if _redis_client.exists(key):
+                    rec = _redis_client.hgetall(key) or {}
+                    if "tools" in rec and rec.get("tools"):
+                        try:
+                            rec["tools"] = json.loads(rec["tools"])
+                        except Exception:
+                            pass
+                    for fld in ("created_at", "updated_at"):
+                        if fld in rec:
+                            try:
+                                rec[fld] = int(rec[fld])
+                            except Exception:
+                                pass
+                    logger.log("fetch.agent.redis", "Fetched agent details from Redis", {"agent_key": key})
+                    return rec
+            except Exception as e:
+                logger.log("fetch.agent.redis.error", "Error checking agent key in Redis", {"candidate": key, "error": str(e)})
+                continue
+        logger.log("fetch.agent.redis.notfound", "Agent not found in Redis", {"agent_id": agent_id, "candidates_tried": list(seen)})
+        return None
+    except Exception as e:
+        logger.log("fetch.agent.redis.exception", "Unexpected error fetching agent", {"agent_id": agent_id, "error": str(e)})
         return None
 
-# Initialize global client
-r = _init_redis()
-
-
-
-MAX_FETCH_KEYS = int(os.getenv("MAX_FETCH_KEYS", "5000"))
-safe_builtins = {
-    "abs": abs, "all": all, "any": any, "bool": bool,
-    "dict": dict, "float": float, "int": int, "len": len,
-    "list": list, "max": max, "min": min, "range": range,
-    "str": str, "sum": sum, "print": print,
-    "Exception": Exception
-}
-
-app = FastAPI(title="SMS Runtime Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ----------------------------------------------------------------------
-# WebSocket streaming endpoint (stateful, <500ms TTFT target)
-# ----------------------------------------------------------------------
-@app.websocket("/ws/chat/{agent_id}/{phone}")
-async def websocket_chat(websocket: WebSocket, agent_id: str, phone: str):
-    await websocket.accept()
-    # Conversation management placeholder (do not delete): thread_id could be mapped to stored conversation history.
-    thread_id = f"{agent_id}:{phone}"
-    logs_enabled = str(websocket.query_params.get("logs", "")).lower() == "true"
-    transcript_history: List[Dict[str, Any]] = []
-    # Send immediate greeting on connect in Retell format
+def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client:
+        logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
+        return None
+    def _agent_match(row_val: Any, target: Any) -> bool:
+        row_str = str(row_val)
+        tgt_str = str(target)
+        row_core = row_str[5:] if row_str.startswith("agent") else row_str
+        tgt_core = tgt_str[5:] if tgt_str.startswith("agent") else tgt_str
+        return row_str == tgt_str or row_core == tgt_core
     try:
-        await websocket.send_text(json.dumps({
-            "response_id": 0,
-            "content": "hello",
-            "content_complete": False,
-            "end_call": False,
-        }))
-        transcript_history.append({"role": "agent", "content": "hello"})
-    except Exception:
-        pass
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-
-            # Treat all clients as Retell output; accept either input shape
-            response_id = data.get("response_id", 0)
-            interaction_type = data.get("interaction_type", "response_required")
-
-            transcript = data.get("transcript") or []
-            if transcript and not transcript_history:
-                # Seed history with provided transcript
-                for turn in transcript:
-                    if isinstance(turn, dict) and "role" in turn and "content" in turn:
-                        transcript_history.append({"role": turn["role"], "content": str(turn.get("content", ""))})
-            user_input = ""
-            if transcript:
-                for turn in reversed(transcript):
-                    if isinstance(turn, dict) and turn.get("role") == "user":
-                        user_input = str(turn.get("content", ""))
-                        break
-            if not user_input:
-                user_input = data.get("message", "")  # fallback legacy input
-            initial_vars = data.get("variables", {}) or {}
-
-            if user_input:
-                transcript_history.append({"role": "user", "content": user_input})
-
-            # If logs requested, run once (non-streaming) and return final reply with runtime logs
-            if logs_enabled:
-                try:
-                    result = await run_agent_async(agent_id, transcript_history, user_input, initial_vars)
-                    reply_text = result.get("reply", "")
-                    transcript_history.append({"role": "agent", "content": reply_text})
-                    await websocket.send_text(json.dumps({
-                        "response_id": response_id,
-                        "content": reply_text,
-                        "content_complete": True,
-                        "end_call": False,
-                        "logs": result.get("logs", []),
-                        "transcript": transcript_history,
-                    }))
-                except Exception as e:
-                    await websocket.send_text(json.dumps({
-                        "response_id": response_id,
-                        "content": f"Error: {e}",
-                        "content_complete": True,
-                        "end_call": True,
-                    }))
+        table_name = "all-agents-tools"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        tool_map: Dict[str, Any] = {}
+        for row_id in row_ids:
+            if row_id == "_meta":
                 continue
-
-            # If this is just an update/reminder, acknowledge and continue loop without generating reply
-            if interaction_type in ("update_only", "reminder_required") or not user_input:
-                await websocket.send_text(json.dumps({
-                    "response_id": response_id,
-                    "content": "",
-                    "content_complete": True,
-                    "end_call": False,
-                }))
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
                 continue
-
-            # Stream assistant response
-            agent_chunks: List[str] = []
-            async for text_chunk in run_agent_ws(agent_id, user_input, thread_id, initial_vars):
-                if isinstance(text_chunk, str) and text_chunk.startswith("||VARS||"):
-                    # Skip variable payloads for Retell
-                    continue
-
-                if isinstance(text_chunk, str) and text_chunk.startswith("||ERROR||"):
-                    err_msg = text_chunk.replace("||ERROR||", "", 1)
-                    await websocket.send_text(json.dumps({
-                        "response_id": response_id,
-                        "content": err_msg,
-                        "content_complete": True,
-                        "end_call": True,
-                    }))
-                    return
-
-                if not text_chunk:
-                    continue
-
-                await websocket.send_text(json.dumps({
-                    "response_id": response_id,
-                    "content": str(text_chunk),
-                    "content_complete": False,
-                    "end_call": False,
-                }))
-                agent_chunks.append(str(text_chunk))
-
-            # Final completion message
-            if agent_chunks:
-                transcript_history.append({"role": "agent", "content": "".join(agent_chunks)})
-            completion_payload = {
-                "response_id": response_id,
-                "content": "",
-                "content_complete": True,
-                "end_call": False,
+            if not row:
+                continue
+            row_agent_val = row.get("agent_id", "")
+            if not _agent_match(row_agent_val, agent_user_id):
+                continue
+            tool_map[str(row_id)] = {
+                "api_url": row.get("api_url", "") or "",
+                "api_payload_json": row.get("api_payload_json", "") or "",
+                "instructions": row.get("instructions", "") or "",
+                "when_run": row.get("when_run", "") or "",
             }
-            if logs_enabled:
-                completion_payload["transcript"] = transcript_history
-            await websocket.send_text(json.dumps(completion_payload))
+        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
+        return tool_map
+    except Exception as e:
+        logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
+        return None
 
-    except WebSocketDisconnect:
-        # Keep thread state in Redis; client may reconnect with same thread_id
-        pass
+# ---------------------------
+# Agent + tool caching for async streaming
+# ---------------------------
+def _resolve_api_key(agent_resp: Dict[str, Any]) -> Optional[str]:
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        if agent_resp.get(key_name):
+            return agent_resp.get(key_name)
+    return os.getenv("OPENAI_API_KEY")
 
+def _build_system_prompt(agent_prompt: str, rulebook: str = "") -> str:
+    base_prompt = agent_prompt or "You are a helpful assistant."
+    rules = (
+        "Tool rules:\n"
+        "If a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\n"
+        "Do not claim an external action succeeded unless a tool result clearly confirms it.\n"
+        "Do not invent missing user details.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts when available.\n"
+    )
+    if rulebook:
+        return f"{base_prompt}\n\nRULEBOOK:\n{rulebook}\n\n{rules}"
+    return f"{base_prompt}\n\n{rules}"
 
-# Variant endpoint without phone param; defaults phone to "unknown"
-@app.websocket("/ws/chat/{agent_id}")
-async def websocket_chat_no_phone(websocket: WebSocket, agent_id: str):
-    await websocket_chat(websocket, agent_id, phone="unknown")
+def _merge_tool_config(agent_id: str) -> Dict[str, Any]:
+    merged_config = dict(DYNAMIC_CONFIG)
+    fetched_tools = fetch_agent_tools(str(agent_id)) or {}
+    for tid, tcfg in fetched_tools.items():
+        merged_config[str(tid)] = {
+            "api_url": tcfg.get("api_url", ""),
+            "api_payload_json": tcfg.get("api_payload_json", ""),
+            "instructions": tcfg.get("instructions", ""),
+            "when_run": tcfg.get("when_run", ""),
+        }
+    return merged_config
 
-# ----------------------------------------------------------------------
-# Request models
-# ----------------------------------------------------------------------
-class AddRequest(BaseModel):
-    table: str
-    data: Dict[str, Any]
-    
-class TableRequest(BaseModel):
-    name: str
+def _chunk_to_text(chunk: Any) -> str:
+    if not chunk:
+        return ""
+    content = getattr(chunk, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
 
-class UpdateRequest(BaseModel):
-    table: str
-    id: str
-    updates: Dict[str, Any]
+def _get_cached_agent(agent_id: str):
+    cache_key = str(agent_id)
+    if cache_key in _AGENT_GRAPH_CACHE:
+        return _AGENT_GRAPH_CACHE[cache_key]
 
-class BulkDeleteRequest(BaseModel):
-    ids: List[str]
+    agent_resp = fetch_agent_details(agent_id) or {}
+    api_key = _resolve_api_key(agent_resp)
+    if not api_key:
+        raise RuntimeError("OpenAI API key missing for streaming agent")
 
+    merged_config = _merge_tool_config(agent_id)
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    system_prompt = _build_system_prompt(agent_resp.get("prompt", ""), agent_resp.get("rulebook", ""))
+    llm = ChatOpenAI(api_key=api_key, model="gpt-4o", streaming=True, temperature=0)
 
-# ----------------------------------------------------------------------
-# Key utilities and helpers
-# ----------------------------------------------------------------------
-def _require_redis():
-    if not r:
-        raise HTTPException(status_code=503, detail="Redis not available")
+    checkpointer = _async_checkpointer or MemorySaver()
 
-def _get_next_user_id() -> int:
-    return int(r.get("next_user_id") or 0)
+    agent = create_react_agent(
+        llm,
+        tools=tools,
+        prompt=system_prompt,
+        checkpointer=checkpointer,
+        state_schema=AgentState,
+    )
+    _AGENT_GRAPH_CACHE[cache_key] = agent
+    return agent
 
-def _get_next_agent_id() -> int:
-    return int(r.get("next_agent_id") or 0)
+# ---------------------------
+# Conversation persistence helpers (all_conversations table)
+# ---------------------------
+def _parse_json_field(val: Any) -> Any:
+    if isinstance(val, str):
+        return _safe_json_loads(val)
+    return val
 
-def _user_key(uid: int) -> str:
-    return f"user:{uid}"
+def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client or not phone:
+        return None
 
-def _agent_name(aid_num: int) -> str:
-    return f"agent{aid_num}"
+def _fetch_conversation_by_conversation_id(conversation_id: str) -> Optional[Dict[str, Any]]:
+    if not _redis_client or not conversation_id:
+        return None
+    try:
+        table_name = "all_conversations"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.convo_by_id.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
+                continue
+            if not row:
+                continue
+            cid = row.get("conversation_id")
+            if cid and str(cid) == str(conversation_id):
+                row_data = {"id": row_id}
+                row_data.update(row)
+                for fld in ("conversation_json", "tool_run_logs", "variables"):
+                    if fld in row_data:
+                        row_data[fld] = _parse_json_field(row_data[fld])
+                return row_data
+        return None
+    except Exception as e:
+        logger.log("fetch.convo_by_id.exception", "Error fetching conversation by id", {"conversation_id": conversation_id, "error": str(e)})
+        return None
+    try:
+        table_name = "all_conversations"
+        ids_key = f"table:{table_name}:ids"
+        row_ids = _redis_client.smembers(ids_key) or set()
+        for row_id in row_ids:
+            if row_id == "_meta":
+                continue
+            row_key = f"table:{table_name}:row:{row_id}"
+            try:
+                row = _redis_client.hgetall(row_key) or {}
+            except Exception as e:
+                logger.log("fetch.convo.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
+                continue
+            recv = row.get("reciever_phone") or row.get("receiver_phone")
+            if recv and str(recv) == str(phone):
+                row_data = {"id": row_id}
+                row_data.update(row)
+                for fld in ("conversation_json", "tool_run_logs", "variables"):
+                    if fld in row_data:
+                        row_data[fld] = _parse_json_field(row_data[fld])
+                return row_data
+        return None
+    except Exception as e:
+        logger.log("fetch.convo.exception", "Error fetching conversation by phone", {"phone": phone, "error": str(e)})
+        return None
 
-def _convo_msg_key(agent_name: str, phone: str) -> str:
-    return f"convo:{agent_name}:{phone}"
-
-def _convo_meta_key(agent_name: str, phone: str) -> str:
-    return f"convo_meta:{agent_name}:{phone}"
-
-# --- NEW: Table helpers for correct Redis key management ---
-def _table_meta_key(name: str) -> str:
-    return f"table:{name}:meta"
-
-def _table_ids_key(name: str) -> str:
-    return f"table:{name}:ids"
-
-def _table_row_key(name: str, rowid: str) -> str:
-    return f"table:{name}:row:{rowid}"
-
-def hset_map(key: str, mapping: Dict[str, Any]):
-    """
-    Correct, Upstash-safe HSET helper.
-    """
+def _hset_map(client: UpstashRedis, key: str, mapping: Dict[str, Any]) -> None:
     if not mapping:
         return
-
-    clean_map = {}
-
+    clean_map: Dict[str, str] = {}
     for fld, val in mapping.items():
         if isinstance(val, (dict, list)):
             clean_map[fld] = json.dumps(val)
@@ -279,1187 +372,909 @@ def hset_map(key: str, mapping: Dict[str, Any]):
             clean_map[fld] = "1" if val else "0"
         else:
             clean_map[fld] = str(val)
+    client.hset(key, values=clean_map)
 
-    # CHANGE 'mapping' TO 'values' HERE
-    r.hset(key, values=clean_map)
-
-
-
-
-def _list_all_tables_with_counts() -> List[Dict[str, Any]]:
-    """
-    Returns all tables with record counts.
-    Covers system tables and dynamic tables.
-    """
-    tables = []
-
-    # ---- System tables ----
+def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Optional[str]:
+    if not _redis_client:
+        logger.log("save.convo.no_redis", "Redis client not available", {})
+        return None
     try:
-        users_count = r.scard("users")
-        tables.append({
-            "name": "users",
-            "records": int(users_count or 0)
-        })
-    except Exception:
-        pass
-
-    try:
-        agents_count = r.scard("agents")
-        tables.append({
-            "name": "agents",
-            "records": int(agents_count or 0)
-        })
-    except Exception:
-        pass
-
-    try:
-        conversations_count = r.scard("conversations")
-        tables.append({
-            "name": "conversations",
-            "records": int(conversations_count or 0)
-        })
-    except Exception:
-        pass
-
-    # ---- Dynamic tables ----
-    try:
-        dynamic_tables = r.smembers("tables") or []
-        for name in sorted(dynamic_tables):
-            ids_key = _table_ids_key(name)
-            count = r.scard(ids_key) or 0
-
-            # subtract sentinel "_meta"
-            if r.sismember(ids_key, "_meta"):
-                count -= 1
-
-            tables.append({
-                "name": name,
-                "records": max(count, 0)
-            })
-    except Exception:
-        pass
-
-    return tables
-@app.get("/tables")
-def list_tables():
-    _require_redis()
-    return {
-        "tables": _list_all_tables_with_counts()
-    }
-def _table_exists(name: str) -> bool:
-    return r.sismember("tables", name)
-
-def _create_table(name: str):
-    if _table_exists(name):
-        raise HTTPException(status_code=400, detail="Table already exists")
-    r.sadd("tables", name)
-    # use helper to be Upstash-safe
-    hset_map(_table_meta_key(name), {"created_at": int(time.time())})
-    # use a dedicated set for ids and add a sentinel value to ensure set type
-    r.sadd(_table_ids_key(name), "_meta")
-    r.set(f"nextid:{name}", 0)
-    return True
-
-def _delete_table(name: str):
-    if not _table_exists(name):
-        raise HTTPException(status_code=404, detail="Table not found")
-    # Delete all rows for this table
-    ids_key = _table_ids_key(name)
-    row_ids = r.smembers(ids_key)
-    for row_id in row_ids:
-        if row_id != "_meta":
-            r.delete(_table_row_key(name, row_id))
-    r.delete(_table_meta_key(name))
-    r.delete(ids_key)
-    r.srem("tables", name)
-    r.delete(f"nextid:{name}")
-    return True
-
-# get numeric suffix ids for keys like user:N or agent:N
-def _all_numeric_suffix_ids(prefix: str) -> List[int]:
-    ids = []
-    pattern = f"{prefix}:*"
-    for key in r.scan_iter(match=pattern):
-        parts = key.split(":")
-        if len(parts) >= 2:
-            suffix = parts[1]
-            if suffix.isdigit():
-                ids.append(int(suffix))
-    return sorted(set(ids))
-
-# ----------------------------------------------------------------------
-# Compaction helpers (unchanged behavior but included)
-# ----------------------------------------------------------------------
-def compact_users() -> Dict[str, Any]:
-    ids = _all_numeric_suffix_ids("user")
-    if not ids:
-        r.set("next_user_id", 0)
-        r.delete("users")
-        return {"status": "ok", "users_before": 0, "users_after": 0}
-    mapping: Dict[int, int] = {}
-    for new_idx, old_id in enumerate(ids, start=1):
-        mapping[old_id] = new_idx
-    temp_map: Dict[str, Tuple[int, int]] = {}
-    uid_uuid = uuid.uuid4().hex
-    for old_id, new_id in mapping.items():
-        if old_id == new_id:
-            continue
-        old_key = _user_key(old_id)
-        if not r.exists(old_key):
-            continue
-        temp_key = f"tmp:rekey:user:{uid_uuid}:{old_id}"
-        if r.exists(temp_key):
-            r.delete(temp_key)
-        r.rename(old_key, temp_key)
-        temp_map[temp_key] = (old_id, new_id)
-    final_ids: List[int] = []
-    for old_id, new_id in mapping.items():
-        if old_id == new_id:
-            key = _user_key(old_id)
-            if r.exists(key):
-                final_ids.append(new_id)
-    for temp_key, (old_id, new_id) in temp_map.items():
-        final_key = _user_key(new_id)
-        if r.exists(final_key):
-            r.delete(final_key)
-        r.rename(temp_key, final_key)
-        final_ids.append(new_id)
-    final_ids = sorted(set(final_ids))
-    r.delete("users")
-    for uid in final_ids:
-        r.sadd("users", str(uid))
-    old_to_new = {old: new for old, new in mapping.items() if old != new}
-    for aid in list(r.smembers("agents")):
-        try:
-            user_id = r.hget(aid, "user_id")
-            if not user_id:
+        table_name = "all_conversations"
+        if not row_id:
+            row_id = str(uuid.uuid4())
+        ids_key = f"table:{table_name}:ids"
+        row_key = f"table:{table_name}:row:{row_id}"
+        to_store: Dict[str, str] = {}
+        for k, v in (data or {}).items():
+            if v is None:
                 continue
-            if user_id.isdigit():
-                old_uid = int(user_id)
-                if old_uid in old_to_new:
-                    r.hset(aid, "user_id", str(old_to_new[old_uid]))
-        except Exception:
-            continue
-    r.set("next_user_id", len(final_ids))
-    return {"status": "ok", "users_before": len(ids), "users_after": len(final_ids)}
+            if isinstance(v, (dict, list)):
+                try:
+                    to_store[k] = json.dumps(v, ensure_ascii=False)
+                    continue
+                except Exception:
+                    pass
+            to_store[k] = str(v)
+        _redis_client.sadd(ids_key, row_id)
+        if to_store:
+            _hset_map(_redis_client, row_key, to_store)
+        logger.log("save.convo", "Conversation upserted", {"row_id": row_id})
+        return row_id
+    except Exception as e:
+        logger.log("save.convo.error", "Failed to upsert conversation", {"error": str(e)})
+        return None
 
-def _collect_conversations_for_agent(agent_name: str) -> List[str]:
-    out = []
-    for ck in r.smembers("conversations"):
-        if not ck:
+def _upsert_voice_conversation(conversation_id: str, agent_id: str, conversation_json: List[Dict[str, Any]], variables: Optional[Dict[str, Any]] = None, tool_run_logs: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    existing = _fetch_conversation_by_conversation_id(conversation_id)
+    row_id = existing.get("id") if isinstance(existing, dict) else None
+    data = {
+        "conversation_id": conversation_id,
+        "agent_id": agent_id,
+        "conversation_json": conversation_json,
+        "type": "voice-retell",
+        "variables": variables or {},
+    }
+    if tool_run_logs is not None:
+        data["tool_run_logs"] = tool_run_logs
+    return _upsert_conversation_row(row_id, data)
+
+# ---------------------------
+# Utility validators and helpers
+# ---------------------------
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_OPTIONAL_KEYS = {"description", "notes", "memo", "comments", "comment"}
+
+def _safe_json_loads(s: str) -> Optional[Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def _strip_code_fences(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    t = s.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t.replace("json\n", "", 1).replace("json\r\n", "", 1)
+    return t.strip()
+
+def _format_sms_xml(message: str) -> str:
+    safe_message = escape(message or "")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Message>' + safe_message + "</Message>\n</Response>"
+
+def _is_empty(val: Any) -> bool:
+    return val is None or (isinstance(val, str) and val.strip() == "") or (isinstance(val, (list, dict)) and len(val) == 0)
+
+def _looks_like_email_field(name: str) -> bool:
+    n = name.lower()
+    return "email" in n or n in {"attendees", "emails", "invitees"}
+
+def _normalize_email_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str) and _EMAIL_RE.match(v)]
+    if isinstance(value, str) and _EMAIL_RE.match(value):
+        return [value]
+    return []
+
+def _variables_array_to_dict(variables: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if isinstance(variables, dict):
+        for k, v in variables.items():
+            if k is None:
+                continue
+            out[str(k)] = "" if v is None else str(v)
+        return out
+    if not isinstance(variables, list):
+        return out
+    for item in variables:
+        if not isinstance(item, dict):
             continue
-        if ck.startswith(agent_name + ":"):
-            out.append(ck)
+        name = item.get("name") or item.get("key")
+        if name is None:
+            continue
+        out[str(name)] = "" if item.get("value") is None else str(item.get("value"))
     return out
 
-def compact_agents() -> Dict[str, Any]:
-    ids = _all_numeric_suffix_ids("agent")
-    if not ids:
-        r.set("next_agent_id", 0)
-        r.delete("agents")
-        return {"status": "ok", "agents_before": 0, "agents_after": 0}
-    mapping: Dict[int, int] = {}
-    for new_idx, old_id in enumerate(ids, start=1):
-        mapping[old_id] = new_idx
-    agent_uuid = uuid.uuid4().hex
-    for old_id, new_id in mapping.items():
-        if old_id == new_id:
-            continue
-        old_name = _agent_name(old_id)
-        new_name = _agent_name(new_id)
-        temp_agent = f"tmp:rekey:agent:{agent_uuid}:{old_id}"
-        if r.exists(old_name):
-            if r.exists(temp_agent):
-                r.delete(temp_agent)
-            r.rename(old_name, temp_agent)
-        if r.sismember("agents", old_name):
-            r.srem("agents", old_name)
-            r.sadd("agents", temp_agent)
-        convs = _collect_conversations_for_agent(old_name)
-        for ck in convs:
-            try:
-                _, phone = ck.split(":", 1)
-            except ValueError:
-                continue
-            old_msg = _convo_msg_key(old_name, phone)
-            temp_msg = _convo_msg_key(temp_agent, phone)
-            if r.exists(old_msg):
-                if r.exists(temp_msg):
-                    r.delete(temp_msg)
-                r.rename(old_msg, temp_msg)
-            old_meta = _convo_meta_key(old_name, phone)
-            temp_meta = _convo_meta_key(temp_agent, phone)
-            if r.exists(old_meta):
-                if r.exists(temp_meta):
-                    r.delete(temp_meta)
-                r.rename(old_meta, temp_meta)
-                try:
-                    r.hset(temp_meta, "agent_id", temp_agent)
-                except Exception:
-                    pass
-            r.srem("conversations", ck)
-            r.sadd("conversations", f"{temp_agent}:{phone}")
-        if r.exists(temp_agent):
-            if r.exists(new_name):
-                r.delete(new_name)
-            r.rename(temp_agent, new_name)
-        if r.sismember("agents", temp_agent):
-            r.srem("agents", temp_agent)
-            r.sadd("agents", new_name)
-        convs_temp = _collect_conversations_for_agent(temp_agent)
-        for tck in convs_temp:
-            try:
-                _, phone = tck.split(":", 1)
-            except ValueError:
-                continue
-            temp_msg = _convo_msg_key(temp_agent, phone)
-            final_msg = _convo_msg_key(new_name, phone)
-            if r.exists(temp_msg):
-                if r.exists(final_msg):
-                    r.delete(final_msg)
-                r.rename(temp_msg, final_msg)
-            temp_meta = _convo_meta_key(temp_agent, phone)
-            final_meta = _convo_meta_key(new_name, phone)
-            if r.exists(temp_meta):
-                if r.exists(final_meta):
-                    r.delete(final_meta)
-                r.rename(temp_meta, final_meta)
-                try:
-                    r.hset(final_meta, "agent_id", new_name)
-                except Exception:
-                    pass
-            if r.sismember("conversations", tck):
-                r.srem("conversations", tck)
-                r.sadd("conversations", f"{new_name}:{phone}")
-    r.delete("agents")
-    final_agent_ids = []
-    for new_idx in sorted(mapping.values()):
-        name = _agent_name(new_idx)
-        if r.exists(name):
-            r.sadd("agents", name)
-            final_agent_ids.append(new_idx)
-    r.set("next_agent_id", len(final_agent_ids))
-    return {"status": "ok", "agents_before": len(ids), "agents_after": len(final_agent_ids)}
+def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
+    if not isinstance(variables, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in variables.items():
+        out[str(k)] = "" if v is None else str(v)
+    return out
 
-# ----------------------------------------------------------------------
-# Health
-# ----------------------------------------------------------------------
-
-@app.get("/")
-def health():
-    redis_status = "Failed"
-    redis_error = ""
-    if r:
-        try:
-            r.ping()
-            redis_status = "Connected"
-        except Exception as e:
-            redis_status = "Failed"
-            redis_error = str(e)
-    else:
-        redis_error = "Redis client not initialized"
-    return {
-        "message": "SMS Runtime Backend Live!",
-        "redis": redis_status,
-        "redis_error": redis_error,
-        "endpoints": ["/add", "/fetch", "/update", "/delete", "/admin/compact"]
-    }
-
-# ----------------------------------------------------------------------
-# TABLE CREATE/DELETE ENDPOINTS
-# ----------------------------------------------------------------------
-@app.post("/createtable")
-def createtable(req: TableRequest):
-    _require_redis()
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-    _create_table(name)
-    return {"status": "success", "table": name}
-
-@app.delete("/deletetable")
-def deletetable(name: str):
-    _require_redis()
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-    _delete_table(name)
-    return {"status": "deleted", "table": name}
-
-# ----------------------------------------------------------------------
-# Function management module (plug-and-play)
-# ----------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-
-LOCAL_FUNC_DIR = Path("./local_functions")
-LOCAL_FUNC_DIR.mkdir(parents=True, exist_ok=True)
-
-# simple unsafe token blacklist (adjust as needed)
-def _sanitize_code(code: str) -> str:
-    # Pass through without restriction
-    return code
-
-
-def _run_code(code: str, inputs: dict) -> dict:
-    """
-    Unrestricted runner.
-    This executes user-provided code with normal Python semantics.
-    Inputs are injected into the execution environment under their keys.
-    The executed code may perform imports, filesystem operations, networking, and other system calls.
-    Use only in trusted environments.
-    """
-    env = {
-        "__name__": "__main__",
-        "__file__": "<dynamic_function>",
-        **inputs
-    }
-
+def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     try:
-        # Compile to get clearer tracebacks
-        compiled = compile(code, "<dynamic_function>", "exec")
-        exec(compiled, env)
-    except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
-
-    if "result" in env:
-        try:
-            # Ensure the result is JSON serializable
-            json.dumps(env["result"])
-            return env["result"]
-        except Exception:
-            return {"error": "Function returned a non-JSON-serializable value", "value_repr": repr(env["result"])}
-    return {"error": "No result returned from function"}
-
-def _save_local_function(fid: str, code: str, meta: dict):
-    (LOCAL_FUNC_DIR / f"{fid}.py").write_text(code)
-    (LOCAL_FUNC_DIR / f"{fid}.meta.json").write_text(json.dumps(meta))
-
-def _load_local_function(fid: str):
-    code = None
-    meta = {}
-    code_path = LOCAL_FUNC_DIR / f"{fid}.py"
-    meta_path = LOCAL_FUNC_DIR / f"{fid}.meta.json"
-    if code_path.exists():
-        code = code_path.read_text()
-    try:
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-    except Exception:
-        meta = {}
-    return code, meta
-def _list_all_functions() -> List[Dict[str, Any]]:
-    functions = {}
-    
-    # -------------------------
-    # Redis-based functions
-    # -------------------------
-    if r:
-        try:
-            for key in r.scan_iter(match="function:*:meta"):
-                fid = key.split(":")[1]
-                meta = r.hgetall(key) or {}
-
-                functions[fid] = {
-                    "id": fid,
-                    "name": meta.get("name", ""),
-                    "created_at": int(meta.get("created_at") or meta.get("ts") or 0),
-                    "updated_at": int(meta.get("updated_at") or meta.get("ts") or 0),
-                    "source": "redis"
-                }
-        except Exception:
-            pass
-
-    # -------------------------
-    # Local filesystem functions
-    # -------------------------
-    try:
-        for meta_file in LOCAL_FUNC_DIR.glob("*.meta.json"):
-            fid = meta_file.stem.replace(".meta", "")
-            if fid in functions:
-                continue
-
-            try:
-                meta = json.loads(meta_file.read_text())
-            except Exception:
-                meta = {}
-
-            functions[fid] = {
-                "id": fid,
-                "name": meta.get("name", ""),
-                "created_at": int(meta.get("created_at") or meta.get("ts") or 0),
-                "updated_at": int(meta.get("updated_at") or meta.get("ts") or 0),
-                "source": "local"
-            }
+        items = qp.multi_items() if hasattr(qp, "multi_items") else (qp.items() if hasattr(qp, "items") else [])
+        for k, v in items:
+            if k in out:
+                if isinstance(out[k], list):
+                    out[k].append(v)
+                else:
+                    out[k] = [out[k], v]
+            else:
+                out[k] = v
     except Exception:
         pass
+    return out
 
-    return sorted(
-        functions.values(),
-        key=lambda x: x["created_at"],
-        reverse=True
-    )
-
-def _find_project_file(filename: str) -> Optional[Path]:
-    # Normalize to a .py filename
-    if not filename.endswith(".py"):
-        filename = f"{filename}.py"
-    try:
-        for p in BASE_DIR.rglob(filename):
-            if p.name == filename:
-                return p
-    except Exception as e:
-        print(f"Error scanning project files: {e}")
+def _get_case_insensitive(payload: Dict[str, Any], key: str) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    if key in payload:
+        return payload.get(key)
+    low_key = key.lower()
+    for k, v in payload.items():
+        if isinstance(k, str) and k.lower() == low_key:
+            return v
     return None
 
-@app.post("/createfunction")
-async def create_function(file: UploadFile = File(...), name: str = Form(...)):
-    content = await file.read()
-    try:
-        code = _sanitize_code(content.decode())
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    fid = f"func{int(time.time())}"
-    meta = {"name": name, "ts": int(time.time())}
-    if r:
-        try:
-            r.set(f"function:{fid}:code", code)
-            # Upstash-safe write of meta
-            hset_map(f"function:{fid}:meta", meta)
-            return {"id": fid, "status": "created"}
-        except Exception:
-            # fallback to local
-            _save_local_function(fid, code, meta)
-            return {"id": fid, "status": "local"}
-    _save_local_function(fid, code, meta)
-    return {"id": fid, "status": "local"}
+def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not instructions_text:
+        return out
+    for m in re.finditer(r"'([^']+)'.*?AskGuidance=([A-Z_]+)", instructions_text):
+        field_path = m.group(1).strip()
+        guidance_raw = m.group(2).strip()
+        guidance = "SHOULD_BE_ASKED" if guidance_raw == "SHOULD_BE_ASKED" else "NOT_TO_BE_ASKED"
+        if field_path:
+            out[field_path] = guidance
+    return out
 
-@app.post("/runfunction")
-async def run_function(request: Request, id: Optional[str] = None):
-    # Parse body, but be tolerant if body is missing or not JSON
+# ---------------------------
+# Variable management tool
+# ---------------------------
+class ManageVariablesArgs(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    updates: Optional[Dict[str, str]] = None
+
+def manage_variables(state: Optional[dict] = None, updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Any:
+    """
+    Use this tool to save, update, or create variables in your internal memory.
+    Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
+    """
+    merged: Dict[str, str] = {}
+    if isinstance(updates, dict):
+        merged.update(updates)
+    for k, v in (kwargs or {}).items():
+        merged[str(k)] = "" if v is None else str(v)
+    sanitized: Dict[str, str] = {}
+    for k, v in merged.items():
+        if k is None:
+            continue
+        sanitized[str(k)] = "" if v is None else str(v)
+    # Update process-level runtime state for this request
+    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+    if not isinstance(runtime_vars, dict):
+        runtime_vars = {}
+    runtime_vars.update(sanitized)
+    globals()["_CURRENT_AGENT_VARIABLES"] = runtime_vars
+    # If state is injected (newer LangGraph), update it too
+    if isinstance(state, dict):
+        current = state.get("variables", {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update(sanitized)
+        state["variables"] = current
+    return {"variables": sanitized}
+
+MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
+    func=manage_variables,
+    name="manage_variables",
+    description="Use this tool to save, update, or create variables in memory for later turns."
+    ,args_schema=ManageVariablesArgs
+)
+
+# ---------------------------
+# Field Resolution Engine (NEW)
+# ---------------------------
+# Lightweight evidence extraction regexes
+_PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\d{10}|\d{3}[\s-]\d{3}[\s-]\d{4}|\d{5}[\s-]\d{5})")
+_DATE_KEYWORDS = re.compile(r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|tomorrow|today|next\s+\w+)\b", re.I)
+
+def _gather_evidence_from_conversation(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {"emails": [], "phones": [], "dates": [], "intent_keywords": [], "names": []}
+    if not conversation:
+        return evidence
+    text = " ".join((turn.get("content") or turn.get("message") or "") for turn in (conversation or [])).strip()
+    if not text:
+        return evidence
+    # emails
+    for m in re.finditer(r"[\w.+-]+@[\w-]+\.[\w.-]+", text):
+        evidence["emails"].append(m.group(0))
+    # phones
+    for m in _PHONE_RE.finditer(text):
+        evidence["phones"].append(m.group(0))
+    # dates / date keywords
+    for m in _DATE_KEYWORDS.finditer(text):
+        evidence["dates"].append(m.group(0))
+    # simple intent keywords for appointment types
+    for kw in ("cleaning", "checkup", "extraction", "consult", "filling", "root canal", "crown", "book", "appointment", "reschedule", "resched"):
+        if re.search(r"\b" + re.escape(kw) + r"\b", text, re.I):
+            evidence["intent_keywords"].append(kw)
+    # simple name heuristics: "My name is X"
+    nm = re.search(r"\b(?:my name is|i am|this is)\s+([A-Z][a-z]{2,20})\b", text)
+    if nm:
+        evidence["names"].append(nm.group(1))
+    return evidence
+
+def _auto_fill_for_field(field: str, payload: Dict[str, Any], template: Dict[str, Any], evidence: Dict[str, Any], agent_prompt: str) -> Optional[Any]:
+    # end_date_time -> default +30 minutes if start provided and isoparseable
+    if field in ("end_date_time", "endTime", "end") and _is_empty(payload.get(field)):
+        start = payload.get("start_date_time") or payload.get("start") or payload.get("dtstart")
+        if isinstance(start, str) and start:
+            try:
+                dt = datetime.fromisoformat(start)
+                return (dt + timedelta(minutes=30)).isoformat()
+            except Exception:
+                return None
+    # title generation: use intent keywords to create a sensible title
+    if field in ("title", "summary") and (_is_empty(payload.get(field))):
+        if evidence.get("intent_keywords"):
+            kw = evidence["intent_keywords"][0]
+            return f"{kw.capitalize()} Appointment"
+        if re.search(r"\bdental\b|\bclinic\b", agent_prompt, re.I) and evidence.get("intent_keywords"):
+            return "Clinic Appointment"
+        return "Appointment"
+    # attendees: avoid inventing emails
+    return None
+
+def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: Dict[str, str], payload: Dict[str, Any], conversation: List[Dict[str, Any]], agent_prompt: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Returns (ok, question_if_any, final_payload).
+    ok True means ready to call. If not ok, question is the single question to ask user.
+    """
+    tpl = template_obj or {}
+    evidence = _gather_evidence_from_conversation(conversation or [])
+    final = dict(payload or {})
+    missing_should: List[str] = []
+
+    preferred_not_ask = {"title", "summary", "id", "start_date_time", "end_date_time", "dtstart", "dtend"}
+
+    booking_mode = bool(re.search(r"\b(book|appointment|schedule|resched|reschedule)\b", agent_prompt, re.I))
+
+    for field in tpl.keys():
+        cur_val = final.get(field)
+        # if non-empty, ok
+        if not _is_empty(cur_val):
+            continue
+        # try deterministic autofill
+        auto = _auto_fill_for_field(field, final, tpl, evidence, agent_prompt)
+        if auto is not None:
+            final[field] = auto
+            logger.log("autofill", f"Auto-filled field {field}", {"value": auto})
+            continue
+        guidance = (ask_map or {}).get(field, None)
+        # system preference for not asking certain fields
+        if field in preferred_not_ask:
+            if guidance == "SHOULD_BE_ASKED":
+                pass
+            else:
+                continue
+        # booking mode: treat emails/attendees as required
+        if booking_mode and _looks_like_email_field(field):
+            missing_should.append(field)
+            continue
+        # respect ask_map
+        if guidance == "SHOULD_BE_ASKED":
+            missing_should.append(field)
+            continue
+        if guidance == "CAN_BE_ASKED":
+            # optional, do not block
+            continue
+        # optional keys skip
+        if field in _OPTIONAL_KEYS:
+            continue
+        # if field looks like email/attendee, ask
+        if _looks_like_email_field(field):
+            missing_should.append(field)
+            continue
+        # otherwise skip
+        continue
+
+    # Validate email-like fields for basic format if present
+    invalid_email_fields: List[str] = []
+    for f in list(final.keys()):
+        if _looks_like_email_field(f):
+            norm = _normalize_email_list(final.get(f))
+            if not norm and not _is_empty(final.get(f)):
+                invalid_email_fields.append(f)
+            else:
+                final[f] = norm if norm else final.get(f)
+
+    if invalid_email_fields:
+        if len(invalid_email_fields) == 1:
+            return False, f"Could you share a valid email address for {invalid_email_fields[0]}?", final
+        else:
+            return False, f"Could you share valid email addresses for {', '.join(invalid_email_fields)}?", final
+
+    if missing_should:
+        priority = ["attendees", "email", "emails", "invitees", "phone", "contact", "name"]
+        chosen = None
+        for p in priority:
+            for m in missing_should:
+                if p in m.lower():
+                    chosen = m
+                    break
+            if chosen:
+                break
+        if not chosen:
+            chosen = missing_should[0]
+        q = f"Could you provide {chosen} so I can complete the booking?"
+        return False, q, final
+
+    return True, None, final
+
+def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template_obj: Any, ask_map: Dict[str, str], conversation: Optional[List[Dict[str, Any]]] = None, agent_prompt: str = "") -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Backwards-compatible wrapper that uses the deterministic resolver.
+    """
+    if not isinstance(payload, dict):
+        return False, "Payload must be a JSON object.", {}
+    if not isinstance(template_obj, dict):
+        return True, None, payload
+    # Ensure template keys exist in payload (allow empty so resolver can decide)
+    for k in template_obj.keys():
+        if k not in payload:
+            payload[k] = payload.get(k, "")
+    ok, question, final_payload = _resolve_fields_and_produce_question(template_obj, ask_map or {}, payload, conversation or [], agent_prompt or "")
+    # final end_date_time fill
+    if ok and "start_date_time" in final_payload and _is_empty(final_payload.get("end_date_time")) and "end_date_time" in template_obj:
+        start_val = final_payload.get("start_date_time")
+        if isinstance(start_val, str):
+            try:
+                dt = datetime.fromisoformat(start_val)
+                final_payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
+            except Exception:
+                pass
+    return ok, question, final_payload
+
+# ---------------------------
+# End Field Resolution Engine
+# ---------------------------
+
+def _is_valid_api_url(u: str) -> bool:
     try:
-        body = await request.json()
+        p = urllib.parse.urlparse(u)
+        return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
-        body = {}
+        return False
 
-    if not isinstance(body, dict):
-        body = {}
 
-    # Primary: get function id from body["id"]
-    fid = body.get("id")
-
-    # Secondary: if no id in body, use query parameter ?id=...
-    if not fid:
-        fid = id
-
-    if not fid:
-        raise HTTPException(status_code=400, detail="Function id required")
-
-    # Primary: if body.input exists and is a non-empty dict, use that
-    inputs: Dict[str, Any] = {}
-    input_obj = body.get("input")
-    if isinstance(input_obj, dict) and len(input_obj) > 0:
-        inputs = input_obj
-    else:
-        # Secondary: use entire body as input, optionally dropping "id"
-        inputs = {k: v for k, v in body.items() if k != "id"}
-
-    code = None
-    # Try Redis first
-    if r:
-        try:
-            code = r.get(f"function:{fid}:code")
-        except Exception:
-            code = None
-    if not code:
-        code, _ = _load_local_function(fid)
-    if not code:
-        return JSONResponse(status_code=404, content={"error": "Function not found"})
-
-    result = _run_code(code, inputs)
-    return {"result": result}
-@app.get("/functions")
-def list_functions():
-    """
-    Returns all custom functions with metadata.
-    """
-    return {
-        "functions": _list_all_functions(),
-        "count": len(_list_all_functions())
-    }
-
-@app.post("/updatefunction")
-async def update_function(id: str = Form(...), file: UploadFile = File(...), name: str = Form(...)):
-    content = await file.read()
+def _extract_flow_id_from_url(api_url: str) -> Optional[str]:
+    """Extract the Activepieces flow id from a webhook URL."""
     try:
-        code = _sanitize_code(content.decode())
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    meta = {"name": name, "ts": int(time.time())}
-    if r:
-        try:
-            r.set(f"function:{id}:code", code)
-            # Upstash-safe write of meta
-            hset_map(f"function:{id}:meta", meta)
-            return {"id": id, "status": "updated"}
-        except Exception:
-            _save_local_function(id, code, meta)
-            return {"id": id, "status": "updated_local"}
-    _save_local_function(id, code, meta)
-    return {"id": id, "status": "updated_local"}
+        parsed = urllib.parse.urlparse(api_url)
+        segments = [seg for seg in (parsed.path or "").split("/") if seg]
+        if "webhooks" in segments:
+            idx = segments.index("webhooks")
+            if idx + 1 < len(segments):
+                return segments[idx + 1]
+    except Exception:
+        pass
+    return None
 
-@app.delete("/deletefunction")
-def delete_function(id: str):
-    deleted = False
-    if r:
+
+def _fetch_activepieces_api_key() -> Optional[str]:
+    """Fetch the Activepieces APP_KEY from the remote config service."""
+    url = "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json() if resp.ok else None
+        if isinstance(data, dict):
+            for _, rec in data.items():
+                if not isinstance(rec, dict):
+                    continue
+                if str(rec.get("name", "")).lower() == "active_pieces":
+                    val = rec.get("value")
+                    if val:
+                        return str(val)
+    except Exception as e:
+        logger.log("tool.diag.app_key_error", "Failed to fetch active_pieces app key", {"error": str(e)})
+    return None
+
+
+def _fetch_failed_run_details(flow_id: str, app_key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Fetch the latest failed run details and return (error_message, trigger_raw_body, display_name)."""
+    try:
+        headers = {"Authorization": app_key}
+        list_url = (
+            "https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs"
+            f"?flowId={flow_id}&projectId=m6IFepCya4gsolsay8PoM&limit=1&status=FAILED"
+        )
+        resp1 = requests.get(list_url, headers=headers, timeout=15)
+        data = resp1.json() if resp1.ok else None
+        run_id = None
+        if isinstance(data, dict):
+            arr = data.get("data")
+            if isinstance(arr, list) and arr:
+                first = arr[0]
+                if isinstance(first, dict):
+                    run_id = first.get("id")
+        if not run_id:
+            return (None, None, None)
+        detail_url = f"https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs/{run_id}"
+        resp2 = requests.get(detail_url, headers=headers, timeout=15)
+        detail = resp2.json() if resp2.ok else None
+        if not isinstance(detail, dict):
+            return (None, None, None)
+        steps = detail.get("steps") or {}
+        flow_version = detail.get("flowVersion") or {}
+        display_name = None
+        if isinstance(flow_version, dict):
+            display_name = flow_version.get("displayName")
+        if not isinstance(steps, dict):
+            return (None, None, display_name)
+        trigger_raw = None
+        run_error = None
+        trigger = steps.get("trigger") or {}
+        if isinstance(trigger, dict):
+            output = trigger.get("output") or {}
+            if isinstance(output, dict):
+                trigger_raw = output.get("rawBody") or output.get("raw_body")
+        step_1 = steps.get("step_1") or {}
+        if isinstance(step_1, dict):
+            run_error = step_1.get("errorMessage") or step_1.get("error_message")
+        if not run_error:
+            for s in steps.values():
+                if isinstance(s, dict) and str(s.get("status", "")).upper() == "FAILED":
+                    run_error = s.get("errorMessage") or s.get("error_message") or run_error
+                    if run_error:
+                        break
+        return (run_error, trigger_raw, display_name)
+    except Exception as e:
+        logger.log("tool.diag.run_fetch_error", "Failed to fetch flow run details", {"flow_id": flow_id, "error": str(e)})
+        return (None, None, None)
+
+# ---------------------------
+# Tool factory
+# ---------------------------
+def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
+    generated_tools: List[StructuredTool] = []
+    for tool_id, cfg in (config or {}).items():
+        api_url = str(cfg.get("api_url", "") or "").strip()
+        instructions = str(cfg.get("instructions", "") or "")
+        when_run = str(cfg.get("when_run", "") or "")
+        raw_payload_template = urllib.parse.unquote(str(cfg.get("api_payload_json", "") or ""))
+        tpl_obj = _safe_json_loads(raw_payload_template)
+        ask_map = _parse_ask_guidance(instructions)
+        DynamicArgsModel = None
+        if isinstance(tpl_obj, dict) and tpl_obj:
+            try:
+                fields = {k: (Any, Field(description=f"Value for {k}")) for k in tpl_obj.keys()}
+                DynamicArgsModel = create_model(f"Args_{tool_id}", **fields)
+            except Exception:
+                DynamicArgsModel = None
+        def _make_api_call_factory(_tool_id: str, _api_url: str, _tpl_obj: Any, _ask_map: Dict[str, str]):
+            def make_api_call(state: Annotated[Optional[dict], InjectedState] = None, **kwargs) -> str:
+                event_id = str(uuid.uuid4())
+                payload = dict(kwargs or {})
+                logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
+                # Determine conversation and agent_prompt context to pass to resolver.
+                # Prefer explicit kwargs override, otherwise fallback to runtime globals set before agent.invoke.
+                conversation_for_context = None
+                agent_prompt_for_context = None
+                if "_conversation" in payload:
+                    conversation_for_context = payload.pop("_conversation")
+                if "_agent_prompt" in payload:
+                    agent_prompt_for_context = payload.pop("_agent_prompt")
+                if conversation_for_context is None:
+                    conversation_for_context = globals().get("_CURRENT_RUNTIME_CONVERSATION", [])
+                if agent_prompt_for_context is None:
+                    agent_prompt_for_context = globals().get("_CURRENT_AGENT_PROMPT", "")
+                current_vars: Dict[str, Any] = {}
+                try:
+                    if isinstance(state, dict):
+                        current_vars = state.get("variables", {}) or {}
+                except Exception:
+                    current_vars = {}
+                if not current_vars:
+                    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+                    if isinstance(runtime_vars, dict):
+                        current_vars = runtime_vars
+                # Validate using the new resolver (passes conversation and agent prompt)
+                ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map, conversation_for_context, agent_prompt_for_context)
+                if not ok:
+                    tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "needs_input": True, "question": question}
+                    logger.log("tool.validation", f"api_tool_{_tool_id} needs user input", tool_result)
+                    return json.dumps(tool_result, ensure_ascii=False)
+                if not _is_valid_api_url(_api_url):
+                    error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": "Invalid api_url"}
+                    logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
+                    return json.dumps(error_data, ensure_ascii=False)
+                try:
+                    if isinstance(payload2, dict):
+                        context_vars: Dict[str, Any] = {}
+                        existing_ctx = payload2.get("context_variables")
+                        if isinstance(existing_ctx, dict):
+                            context_vars.update(existing_ctx)
+                        if isinstance(current_vars, dict):
+                            context_vars.update(current_vars)
+                        payload2["context_variables"] = context_vars
+                    resp = requests.post(_api_url, json=payload2, timeout=20)
+                    try:
+                        response_data = resp.json()
+                    except Exception:
+                        response_data = resp.text
+                    tool_result = {"ok": bool(resp.ok), "status_code": resp.status_code, "response": response_data, "event_id": event_id}
+                except Exception as e:
+                    tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
+
+                # Failure enrichment for 500/ok=False
+                try:
+                    should_enrich = (tool_result.get("status_code") == 500) or (tool_result.get("ok") is False)
+                    if should_enrich:
+                        app_key = _fetch_activepieces_api_key()
+                        flow_id = _extract_flow_id_from_url(_api_url)
+                        err_msg, trigger_raw, display_name = (None, None, None)
+                        if app_key and flow_id:
+                            err_msg, trigger_raw, display_name = _fetch_failed_run_details(flow_id, app_key)
+                        issue_message = f"{(display_name or f'api_tool_{_tool_id}')} HAD AN ISSUE, DETAILS: {err_msg or 'Unknown error'} ; raw payload body {trigger_raw or 'No trigger raw body'}"
+                        tool_result["response"] = issue_message
+                        tool_result["error"] = True
+                except Exception as enrich_err:
+                    logger.log("tool.diag.enrich_error", "Failed to enrich tool failure", {"event_id": event_id, "error": str(enrich_err)})
+
+                log_type = "tool.response" if tool_result.get("ok") else "tool.error"
+                logger.log(log_type, f"api_tool_{_tool_id} result", tool_result)
+                return json.dumps(tool_result, ensure_ascii=False)
+            return make_api_call
+        make_api_call = _make_api_call_factory(str(tool_id), api_url, tpl_obj, ask_map)
+        description = (f"WHEN_RUN: {when_run}\nINSTRUCTIONS: {instructions}\nPAYLOAD_TEMPLATE: {raw_payload_template}\nDo not invent missing details. Ask if unsure.")
+        new_tool = StructuredTool.from_function(func=make_api_call, name=f"sync_data_tool_{tool_id}", description=description, args_schema=DynamicArgsModel)
+        generated_tools.append(new_tool)
+    return generated_tools
+
+# ---------------------------
+# Convert conversation to messages
+# ---------------------------
+def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) -> List[Any]:
+    msgs: List[Any] = []
+    for turn in (conversation_history or []):
+        role = str(turn.get("role", "") or "").lower().strip()
+        content = turn.get("content") if "content" in turn else turn.get("message")
+        if content is None:
+            content = ""
+        if role == "user":
+            msgs.append(HumanMessage(content=str(content)))
+        elif role == "assistant":
+            msgs.append(AIMessage(content=str(content)))
+        else:
+            msgs.append(HumanMessage(content=str(content)))
+    if user_message is not None:
+        msgs.append(HumanMessage(content=str(user_message)))
+    return msgs
+
+# ---------------------------
+# Core run logic
+# ---------------------------
+def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+    logger.clear()
+    logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
+    initial_vars = _variables_array_to_dict(variables)
+    globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
+    agent_resp = fetch_agent_details(agent_id)
+    if not agent_resp:
+        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
+        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    api_key_to_use = None
+    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
+        if agent_resp.get(key_name):
+            api_key_to_use = agent_resp.get(key_name)
+            break
+    if not api_key_to_use:
+        api_key_to_use = os.getenv("OPENAI_API_KEY")
+    if not api_key_to_use:
+        logger.log("run.error", "OpenAI API key missing", {})
+        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
+    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
+        "Runtime rulebook for planning and tool calls.\n"
+        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
+        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
+        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
+        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
+        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
+        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
+        "IMPORTANT: IF YOU RECIVE AN ERROR RESPONSE FROM A TOOL, DO NOT RETRY THE SAME TOOL AGAIN, OR DO NOT SKIP THE TOOL AND JUMP TO NEXT TOOL, OR JUST SKIP THE WHOLE TOOL CALL AND IT'S RESPONSE, INSTEAD ACKOWLEDGE USER THE ERROR. FOLLOW THESE BOTH STRICTLY, UNTILL AND UNLESS GLOBAL PROMPT OF AGENT ASKS TO NOT DO SO."
+
+    )
+    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
         try:
-            r.delete(f"function:{id}:code")
-            r.delete(f"function:{id}:meta")
-            deleted = True
+            vars_str = json.dumps(current_vars, ensure_ascii=False)
+        except Exception:
+            vars_str = str(current_vars)
+        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
+
+    def _state_modifier_fn(state: AgentState) -> List[Any]:
+        current_vars: Dict[str, Any] = {}
+        try:
+            if isinstance(state, dict):
+                current_vars = state.get("variables", {}) or {}
+        except Exception:
+            current_vars = {}
+        if not current_vars:
+            runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+            if isinstance(runtime_vars, dict):
+                current_vars = runtime_vars
+        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
+        messages: List[Any] = []
+        if isinstance(state, dict):
+            messages = state.get("messages", []) or []
+        # Avoid stacking multiple system messages across steps
+        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
+        return [system_msg] + filtered
+    fetched_tools = fetch_agent_tools(str(agent_id))
+    merged_config = dict(DYNAMIC_CONFIG)
+    if isinstance(fetched_tools, dict):
+        for tid, tcfg in fetched_tools.items():
+            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
+    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
+    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
+    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
+    # Build agent (new API expects prompt, not state_modifier)
+    initial_prompt = _render_system_prompt(initial_vars)
+    agent = create_react_agent(llm, tools, prompt=initial_prompt, state_schema=AgentState)
+    msgs = _to_messages(conversation_history, message)
+
+    # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
+    # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
+    globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
+    globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+
+    try:
+        # Log before model call
+        logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
+        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
+        logger.log("agent.invoke.end", "Agent finished invoke")
+    except GraphRecursionError as ge:
+        # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
+        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
+        fallback_prompt = _render_system_prompt(initial_vars)
+        try:
+            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_resp = llm.invoke(fallback_msgs)
+            reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
+        except Exception as le:
+            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
+            reply_text = f"Error: {str(ge)}"
+        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    except Exception as e:
+        logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
+        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+    # Extract last assistant message
+    reply_text = ""
+    try:
+        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
+        last_ai = None
+        for m in reversed(out_msgs):
+            if isinstance(m, AIMessage):
+                last_ai = m
+                break
+        if last_ai and isinstance(last_ai.content, str):
+            reply_text = last_ai.content.strip()
+        elif last_ai:
+            reply_text = str(last_ai.content)
+        else:
+            reply_text = "Done."
+    except Exception:
+        reply_text = "Done."
+    final_variables_dict: Dict[str, Any] = dict(initial_vars)
+    try:
+        if isinstance(state, dict) and isinstance(state.get("variables"), dict):
+            final_variables_dict.update(state.get("variables", {}) or {})
+    except Exception:
+        pass
+    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
+    if isinstance(runtime_vars, dict):
+        final_variables_dict.update(runtime_vars)
+    # Detect if any tool result asked for more input and surface question
+    try:
+        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
+        for m in out_msgs:
+            if isinstance(m, ToolMessage):
+                content = m.content
+                if isinstance(content, str):
+                    parsed = _safe_json_loads(content)
+                    if isinstance(parsed, dict) and parsed.get("needs_input"):
+                        q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
+                        logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
+                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    except Exception:
+        pass
+    # Compact trace for logs
+    try:
+        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
+        compact_trace: List[Dict[str, Any]] = []
+        for m in out_msgs[-40:]:
+            if isinstance(m, HumanMessage):
+                compact_trace.append({"role": "user", "content": (m.content[:500] + "…") if len(m.content) > 500 else m.content})
+            elif isinstance(m, ToolMessage):
+                compact_trace.append({"role": "tool", "content": (m.content[:700] + "…") if isinstance(m.content, str) and len(m.content) > 700 else m.content})
+            elif isinstance(m, AIMessage):
+                tc = getattr(m, "tool_calls", None)
+                compact_trace.append({"role": "assistant", "content": (m.content[:500] + "…") if isinstance(m.content, str) and len(m.content) > 500 else m.content, "tool_calls": tc})
+        logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
+    except Exception:
+        pass
+    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+
+async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    Lightweight async wrapper that offloads the sync run_agent to a thread.
+    """
+    return await asyncio.to_thread(run_agent, agent_id, conversation_history, message, variables)
+
+# ---------------------------
+# Async streaming entrypoint (WebSocket friendly)
+# ---------------------------
+async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
+
+
+    agent = _get_cached_agent(agent_id)
+    config = {"configurable": {"thread_id": thread_id}}
+    input_data: Dict[str, Any] = {"messages": [("user", message)]}
+    if variables:
+        input_data["variables"] = variables
+
+    try:
+        async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
+            # Skip non-assistant content (e.g., tool responses) for websocket streaming
+            if isinstance(chunk, ToolMessage) or isinstance(chunk, SystemMessage):
+                continue
+            text = _chunk_to_text(chunk)
+            if text:
+                yield text
+
+        final_vars: Dict[str, Any] = {}
+        try:
+            state = await agent.aget_state(config)
+            if state and hasattr(state, "values"):
+                vals = getattr(state, "values", {}) or {}
+                if isinstance(vals, dict):
+                    final_vars = vals.get("variables", {}) or {}
         except Exception:
             pass
-    try:
-        (LOCAL_FUNC_DIR / f"{id}.py").unlink(missing_ok=True)
-        (LOCAL_FUNC_DIR / f"{id}.meta.json").unlink(missing_ok=True)
-        deleted = True
-    except Exception:
-        pass
-    if deleted:
-        return {"id": id, "status": "deleted"}
-    raise HTTPException(status_code=404, detail="Function not found")
+        yield "||VARS||" + json.dumps(final_vars or {})
+    except Exception as e:
+        yield "||ERROR||" + str(e)
 
-# ----------------------------------------------------------------------
-# NEW: /int endpoint to run project Python files by name
-# ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# FINAL /int endpoint — BLOCKING for all files EXCEPT the hourly A2P job
-# ----------------------------------------------------------------------
-import sys
-from io import StringIO
+# ---------------------------
+# FastAPI app
+# ---------------------------
+app = FastAPI()
+# In dev allow all origins. In production set explicit origins list.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@app.api_route("/int", methods=["GET", "POST"])
-async def int_endpoint(request: Request, file: str):
-    target = _find_project_file(file)
-    if not target:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # === Extract payload/input exactly like your old injection logic ===
+@app.post("/run-agent")
+async def run_endpoint(request: Request):
     try:
         body = await request.json()
-    except:
-        body = {}
+    except Exception:
+        return JSONResponse({"reply": "Error: Invalid JSON request body", "logs": logger.to_list()})
+    query_params = _query_params_to_dict(request.query_params)
+    payload = body.get("input") if isinstance(body.get("input"), dict) else body
+    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or query_params.get("agent_id") or query_params.get("agentId") or query_params.get("id")
+    is_demo_sms = isinstance(payload, dict) and (_get_case_insensitive(payload, "Body") is not None and _get_case_insensitive(payload, "From") is not None)
+    conversation = payload.get("conversation", []) if not is_demo_sms else []
+    variables_payload = payload.get("variables", [])
+    message = payload.get("message", "")
+    existing_convo_row = None
+    reciever_phone = None
+    if is_demo_sms:
+        reciever_phone = str(_get_case_insensitive(payload, "From") or "")
+        message = str(_get_case_insensitive(payload, "Body") or "")
+        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
+        if existing_convo_row:
+            if not agent_id:
+                agent_id = existing_convo_row.get("agent_id")
+            convo_json = existing_convo_row.get("conversation_json") or []
+            if isinstance(convo_json, list):
+                conversation = convo_json
+            stored_vars = existing_convo_row.get("variables") or {}
+            if isinstance(stored_vars, dict):
+                variables_payload = stored_vars
+    if not agent_id:
+        return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
+    res = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    if is_demo_sms and reciever_phone:
+        prev_convo = conversation if isinstance(conversation, list) else []
+        new_convo = list(prev_convo)
+        new_convo.append({"role": "user", "content": message})
+        new_convo.append({"role": "assistant", "content": res.get("reply", "")})
+        assistant_index = len(new_convo)
+        prior_tool_logs = []
+        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
+            prior_tool_logs = existing_convo_row.get("tool_run_logs")
+        tool_events = []
+        for ev in res.get("logs", []):
+            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+                ev_copy = dict(ev)
+                ev_copy["assistant_index"] = assistant_index
+                tool_events.append(ev_copy)
+        updated_tool_logs = prior_tool_logs + tool_events
+        updated_variables = res.get("variables", {})
+        if not isinstance(updated_variables, dict):
+            updated_variables = {}
+        row_id = existing_convo_row.get("id") if existing_convo_row else None
+        _upsert_conversation_row(row_id, {
+            "agent_id": agent_id,
+            "conversation_json": new_convo,
+            "reciever_phone": reciever_phone,
+            "tool_run_logs": updated_tool_logs,
+            "type": "demo-sms",
+            "variables": updated_variables,
+        })
+    if is_demo_sms:
+        return Response(content=_format_sms_xml(res.get("reply", "")), media_type="application/xml")
+    return JSONResponse(res)
 
-    # Merge URL query params (excluding "file") into inputs
-    query_data = {}
+# Support inline execution when running inside CI or sandbox that injects 'inputs'
+if "inputs" in globals():
+    data = globals().get("inputs", {}) or {}
+    q = globals().get("query", {}) or {}
+    payload = data.get("input") if isinstance(data.get("input"), dict) else data
+    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or q.get("agent_id") or q.get("agentId") or q.get("id")
+    is_demo_sms = isinstance(payload, dict) and (_get_case_insensitive(payload, "Body") is not None and _get_case_insensitive(payload, "From") is not None)
+    conversation = payload.get("conversation", []) if not is_demo_sms else []
+    variables_payload = payload.get("variables", [])
+    message = payload.get("message", "")
+    existing_convo_row = None
+    reciever_phone = None
+    if is_demo_sms:
+        reciever_phone = str(_get_case_insensitive(payload, "From") or "")
+        message = str(_get_case_insensitive(payload, "Body") or "")
+        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
+        if existing_convo_row:
+            if not agent_id:
+                agent_id = existing_convo_row.get("agent_id")
+            convo_json = existing_convo_row.get("conversation_json") or []
+            if isinstance(convo_json, list):
+                conversation = convo_json
+            stored_vars = existing_convo_row.get("variables") or {}
+            if isinstance(stored_vars, dict):
+                variables_payload = stored_vars
+    _out = run_agent(str(agent_id), conversation, str(message), variables_payload)
+    if is_demo_sms and reciever_phone:
+        prev_convo = conversation if isinstance(conversation, list) else []
+        new_convo = list(prev_convo)
+        new_convo.append({"role": "user", "content": message})
+        new_convo.append({"role": "assistant", "content": _out.get("reply", "")})
+        assistant_index = len(new_convo)
+        prior_tool_logs = []
+        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
+            prior_tool_logs = existing_convo_row.get("tool_run_logs")
+        tool_events = []
+        for ev in _out.get("logs", []):
+            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
+                ev_copy = dict(ev)
+                ev_copy["assistant_index"] = assistant_index
+                tool_events.append(ev_copy)
+        updated_tool_logs = prior_tool_logs + tool_events
+        updated_variables = _out.get("variables", {})
+        if not isinstance(updated_variables, dict):
+            updated_variables = {}
+        row_id = existing_convo_row.get("id") if existing_convo_row else None
+        _upsert_conversation_row(row_id, {
+            "agent_id": agent_id,
+            "conversation_json": new_convo,
+            "reciever_phone": reciever_phone,
+            "tool_run_logs": updated_tool_logs,
+            "type": "demo-sms",
+            "variables": updated_variables,
+        })
     try:
-        for key, value in request.query_params.multi_items():
-            if key == "file":
-                continue
-            if key in query_data:
-                if isinstance(query_data[key], list):
-                    query_data[key].append(value)
-                else:
-                    query_data[key] = [query_data[key], value]
-            else:
-                query_data[key] = value
+        _out["debug_inputs"] = {
+            "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
+            "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+            "from": _get_case_insensitive(payload, "From"),
+            "body": _get_case_insensitive(payload, "Body"),
+        }
     except Exception:
         pass
-
-    raw_body = body if isinstance(body, dict) else {}
-    if isinstance(raw_body, dict) and "payload" not in raw_body and "input" not in raw_body:
-        payload = raw_body
-        input_data = {}
+    if is_demo_sms:
+        globals()["result"] = _format_sms_xml(_out.get("reply", ""))
     else:
-        payload = raw_body.get("payload", {})
-        input_data = raw_body.get("input", {})
-    combined_input = {}
-    if isinstance(payload, dict):
-        combined_input.update(payload)
-    if isinstance(input_data, dict):
-        combined_input.update(input_data)
-    if query_data:
-        combined_input.update(query_data)
-
-    # === ONLY hourly A2P job runs in background ===
-    if target.stem == "a2p-profile-every-hour-check-runtime":
-        job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        def runner():
-            try:
-                code = target.read_text()
-                env = {"__name__": "__main__", "__file__": str(target)}
-                exec(compile(code, str(target), "exec"), env)
-            except Exception:
-                traceback.print_exc()
-        threading.Thread(target=runner, daemon=True).start()
-        return {
-            "status": "started (background)",
-            "file": target.name,
-            "job_id": job_id,
-            "note": "Hourly A2P check running"
-        }
-
-    # === ALL OTHER FILES: Full blocking execution with result ===
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    redirected_output = StringIO()
-    sys.stdout = redirected_output
-    sys.stderr = redirected_output
-
-    try:
-        code = target.read_text()
-        env = {
-            "__name__": "__main__",
-            "__file__": str(target),
-            "inputs": combined_input,        # ← now defined!
-            "payload": payload,
-            "input": input_data,
-            "query": query_data
-        }
-        exec(compile(code, str(target), "exec"), env)
-
-        result = env.get("result")
-        if isinstance(result, str):
-            stripped = result.lstrip()
-            if stripped.startswith("<?xml") or stripped.startswith("<Response"):
-                return Response(content=result, media_type="application/xml")
-        if result is not None:
-            return {"result": result, "output": redirected_output.getvalue().strip()}
-
-        output = redirected_output.getvalue().strip()
-        return {
-            "status": "completed",
-            "file": target.name,
-            "output": output or "No output"
-        }
-
-    except Exception as e:
-        error_detail = {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "output": redirected_output.getvalue().strip()
-        }
-        raise HTTPException(status_code=500, detail=error_detail)
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
-# ----------------------------------------------------------------------
-# ADD
-# ----------------------------------------------------------------------
-@app.post("/add")
-def add_endpoint(req: AddRequest):
-    _require_redis()
-    data = req.data.copy()
-    ts = int(time.time())
-    data["created_at"] = ts
-    data["updated_at"] = ts
-
-    # --- Dynamic Table Support ---
-    if req.table not in ["users", "agents", "conversations"]:
-        if not _table_exists(req.table):
-            raise HTTPException(status_code=404, detail="Table does not exist")
-        ids_key = _table_ids_key(req.table)
-        next_id_key = f"nextid:{req.table}"
-        next_id = int(r.get(next_id_key) or 0) + 1
-        r.set(next_id_key, next_id)
-        row_key = _table_row_key(req.table, next_id)
-        # Upstash-safe write
-        hset_map(row_key, data)
-        r.sadd(ids_key, str(next_id))
-        return {"id": str(next_id), "table": req.table, "status": "success"}
-
-    if req.table == "users":
-            nxt = _get_next_user_id() + 1
-            r.set("next_user_id", nxt)
-            uid = nxt
-            hset_map(_user_key(uid), data)
-            r.sadd("users", str(uid))
-            return {"id": str(uid), "status": "success"}
-
-
-    if req.table == "agents":
-        nxt = _get_next_agent_id() + 1
-        r.set("next_agent_id", nxt)
-        aid_name = _agent_name(nxt)
-        if "tools" in data:
-            data["tools"] = json.dumps(data["tools"])
-        # Upstash-safe write
-        hset_map(aid_name, data)
-        r.sadd("agents", aid_name)
-        return {"id": aid_name, "status": "success"}
-
-    if req.table == "conversations":
-        agent_id = data.get("agent_id")
-        phone = data.get("phone")
-        if not agent_id or not phone:
-            raise HTTPException(status_code=400, detail="agent_id and phone required")
-        key = _convo_msg_key(agent_id, phone)
-        meta_key = _convo_meta_key(agent_id, phone)
-        messages = data.pop("messages", [])
-        r.delete(key)
-        for m in messages:
-            r.rpush(key, json.dumps(m))
-        r.expire(key, 30 * 86400)
-        # Upstash-safe write of meta
-        hset_map(meta_key, data)
-        r.sadd("conversations", f"{agent_id}:{phone}")
-        return {"id": f"{agent_id}:{phone}", "status": "success"}
-
-    raise HTTPException(status_code=400, detail="Invalid table")
-
-# ----------------------------------------------------------------------
-# FETCH - optimized with Redis pipelines
-# ----------------------------------------------------------------------
-def _parse_filters(filter_str: Optional[str]) -> Dict[str, str]:
-    filters = {}
-    if filter_str:
-        for part in filter_str.split(","):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                filters[k.strip()] = v.strip()
-    return filters
-
-def _matches(record: Dict[str, Any], filters: Dict[str, str]) -> bool:
-    if not filters:
-        return True
-    for k, v in filters.items():
-        if str(record.get(k, "")).lower() != v.lower():
-            return False
-    return True
-
-@app.get("/fetch")
-def fetch_endpoint(table: str, id: Optional[str] = None, filters: Optional[str] = None):
-    _require_redis()
-    filt = _parse_filters(filters)
-
-    # --- Dynamic Table Fetch ---
-    if table not in ["users", "agents", "conversations"]:
-        if not _table_exists(table):
-            raise HTTPException(status_code=404, detail="Table does not exist")
-        ids_key = _table_ids_key(table)
-        ids = r.smembers(ids_key)
-        out = {}
-        if id:
-            row_key = _table_row_key(table, id)
-            rec = r.hgetall(row_key)
-            return rec if rec else {}
-        for row_id in ids:
-            if row_id == "_meta":
-                continue
-            row_key = _table_row_key(table, row_id)
-            rec = r.hgetall(row_key)
-            if rec:
-                out[row_id] = rec
-        return out
-
-    # USERS - batch HGETALL via pipeline
-    if table == "users":
-        if id:
-            try:
-                uid = int(id)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid user id")
-            rec = dict(r.hgetall(_user_key(uid)))
-            if not rec:
-                return {}
-            rec.setdefault("name", "")
-            rec.setdefault("phone", "")
-            rec["last_active"] = int(rec.get("last_active", 0))
-            rec["created_at"] = int(rec.get("created_at", 0))
-            return rec if _matches(rec, filt) else {}
-        max_id = _get_next_user_id()
-        out: Dict[str, Any] = {}
-        if max_id > 0 and max_id <= MAX_FETCH_KEYS:
-            keys = [_user_key(uid) for uid in range(1, max_id + 1)]
-        else:
-            members = r.smembers("users")
-            keys = [_user_key(int(x)) for x in sorted([int(x) for x in members])]
-        if not keys:
-            return out
-
-        # REPLACE THE PIPELINE BLOCK WITH THIS:
-        results = [r.hgetall(k) for k in keys]
-        
-        # Extract UIDs from keys for the zip
-        uids = [int(k.split(":")[1]) for k in keys]
-        for uid, rec in zip(uids, results):
-            if rec:
-                rec.setdefault("name", "")
-                rec.setdefault("phone", "")
-                rec["last_active"] = int(rec.get("last_active", 0))
-                rec["created_at"] = int(rec.get("created_at", 0))
-                if _matches(rec, filt):
-                    out[str(uid)] = rec
-        return out
-
-    # AGENTS - batch HGETALL via pipeline
-    if table == "agents":
-        if id:
-            aid = id if id.startswith("agent") else _agent_name(int(id))
-            rec = dict(r.hgetall(aid))
-            if not rec:
-                return {}
-            rec.setdefault("prompt", "")
-            rec.setdefault("user_id", "")
-            rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
-            rec["created_at"] = int(rec.get("created_at", 0))
-            rec["updated_at"] = int(rec.get("updated_at", 0))
-            return rec if _matches(rec, filt) else {}
-        max_agent = _get_next_agent_id()
-        out: Dict[str, Any] = {}
-        if max_agent > 0 and max_agent <= MAX_FETCH_KEYS:
-            agent_keys = [_agent_name(n) for n in range(1, max_agent + 1)]
-        else:
-            members = r.smembers("agents")
-            agent_keys = sorted(list(members))
-        if not agent_keys:
-            return out
-            
-        # REPLACE THE PIPELINE BLOCK WITH THIS:
-        results = [r.hgetall(aid) for aid in agent_keys]
-        
-        for aid, rec in zip(agent_keys, results):
-            if rec:
-                # rec is already a dict from upstash-redis
-                rec.setdefault("prompt", "")
-                rec.setdefault("user_id", "")
-                rec["tools"] = json.loads(rec["tools"]) if "tools" in rec and rec["tools"] else []
-                rec["created_at"] = int(rec.get("created_at", 0))
-                rec["updated_at"] = int(rec.get("updated_at", 0))
-                if _matches(rec, filt):
-                    out[aid] = rec
-        return out
-
-    # CONVERSATIONS - batch LRANGE and HGETALL via pipeline
-    if table == "conversations":
-        if id:
-            try:
-                agent_id, phone = id.split(":", 1)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid conversation id")
-            key = _convo_msg_key(agent_id, phone)
-            msgs = []
-            if r.exists(key):
-                msgs = [json.loads(m) for m in r.lrange(key, 0, -1)]
-            meta_key = _convo_meta_key(agent_id, phone)
-            meta = dict(r.hgetall(meta_key))
-            meta.setdefault("agent_id", agent_id)
-            meta.setdefault("phone", phone)
-            meta["created_at"] = int(meta.get("created_at", 0))
-            meta["updated_at"] = int(meta.get("updated_at", 0))
-            if filt:
-                msgs = [m for m in msgs if _matches(m, filt)]
-                if not msgs:
-                    return {"messages": [], "meta": meta}
-            return {"messages": msgs, "meta": meta}
-        out: Dict[str, Any] = {}
-        # REPLACE THE PIPELINE BLOCK WITH THIS:
-        for ck in convs:
-            try:
-                agent_id, phone = ck.split(":", 1)
-                msg_key = _convo_msg_key(agent_id, phone)
-                meta_key = _convo_meta_key(agent_id, phone)
-                
-                # Direct calls instead of pipe.lrange and pipe.hgetall
-                msgs_raw = r.lrange(msg_key, 0, -1)
-                meta = dict(r.hgetall(meta_key))
-                
-                msgs = [json.loads(m) for m in msgs_raw] if msgs_raw else []
-                # ... (keep the rest of your processing/filtering logic) ...
-                if not filt or any(_matches(m, filt) for m in msgs):
-                    out[ck] = {"messages": msgs, "meta": meta}
-            except Exception:
-                continue
-        return out
-
-    raise HTTPException(status_code=400, detail="Invalid table")
-
-# ----------------------------------------------------------------------
-# UPDATE
-# ----------------------------------------------------------------------
-@app.post("/update")
-def update_endpoint(req: UpdateRequest):
-    _require_redis()
-    ts = int(time.time())
-    updates = req.updates.copy()
-    updates["updated_at"] = ts
-
-    # --- Dynamic Table Update ---
-    if req.table not in ["users", "agents", "conversations"]:
-        if not _table_exists(req.table):
-            raise HTTPException(status_code=404, detail="Table does not exist")
-        row_key = _table_row_key(req.table, req.id)
-        if not r.exists(row_key):
-            raise HTTPException(status_code=404, detail="Row not found")
-        # Upstash-safe write
-        hset_map(row_key, updates)
-        return {"status": "success", "id": req.id}
-
-    if req.table == "users":
-        try:
-            uid = int(req.id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid user id")
-        key = _user_key(uid)
-        if not r.exists(key):
-            raise HTTPException(status_code=404, detail="User not found")
-        # Upstash-safe write
-        hset_map(key, updates)
-        return {"status": "success"}
-
-    if req.table == "agents":
-        aid = req.id if req.id.startswith("agent") else _agent_name(int(req.id))
-        if not r.exists(aid):
-            raise HTTPException(status_code=404, detail="Agent not found")
-        if "tools" in updates:
-            updates["tools"] = json.dumps(updates["tools"])
-        # Upstash-safe write
-        hset_map(aid, updates)
-        return {"status": "success"}
-
-    if req.table == "conversations":
-        try:
-            agent_id, phone = req.id.split(":", 1)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid conversation id")
-        meta_key = _convo_meta_key(agent_id, phone)
-        msg_key = _convo_msg_key(agent_id, phone)
-        if not r.exists(meta_key) and not r.exists(msg_key):
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        if "append" in updates:
-            for m in updates.pop("append"):
-                r.rpush(msg_key, json.dumps(m))
-        if updates:
-            # Upstash-safe write
-            hset_map(meta_key, updates)
-        return {"status": "success"}
-
-    raise HTTPException(status_code=400, detail="Invalid table")
-
-# ----------------------------------------------------------------------
-# DELETE with automatic compaction
-# ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# DELETE ALL RECORDS OF A DYNAMIC TABLE (but keep the table itself)
-# ----------------------------------------------------------------------
-
-def clear_dynamic_table(name: str):
-    """
-    Deletes ALL rows inside a dynamic table but keeps the table definition.
-    Does NOT remove the table from the global 'tables' set.
-    Example:
-        DELETE /table/clear?name=log
-    """
-    _require_redis()
-    name = name.strip()
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-
-    if name in ["users", "agents", "conversations"]:
-        raise HTTPException(status_code=400, detail="Cannot clear system tables")
-
-    # Validate table exists
-    if not _table_exists(name):
-        raise HTTPException(status_code=404, detail="Table does not exist")
-
-    ids_key = _table_ids_key(name)
-    row_ids = r.smembers(ids_key)
-
-    # Delete all rows
-    deleted_count = 0
-    for rid in row_ids:
-        if rid == "_meta":
-            continue
-        r.delete(_table_row_key(name, rid))
-        deleted_count += 1
-
-    # Reset table id set and nextid counter
-    r.delete(ids_key)
-    r.sadd(ids_key, "_meta")
-    r.set(f"nextid:{name}", 0)
-
-    # Optionally clear meta:
-    r.delete(_table_meta_key(name))
-    hset_map(_table_meta_key(name), {"created_at": int(time.time())})
-
-    return {
-        "status": "success",
-        "table": name,
-        "deleted_rows": deleted_count,
-        "message": f"All rows cleared for table '{name}'"
-    }
-@app.delete("/table/clear")
-def clear_table(name: str):
-    """
-    Deletes ALL records inside a dynamic table but keeps the table definition.
-    Example:
-        DELETE /table/clear?name=logs
-    """
-    _require_redis()
-
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-
-    # Prevent clearing system tables
-    if name in ["users", "agents", "conversations"]:
-        raise HTTPException(
-            status_code=400,
-            detail="System tables cannot be cleared"
-        )
-
-    # Ensure table exists
-    if not _table_exists(name):
-        raise HTTPException(status_code=404, detail="Table does not exist")
-
-    ids_key = _table_ids_key(name)
-    row_ids = r.smembers(ids_key)
-
-    deleted = 0
-    for rid in row_ids:
-        if rid == "_meta":
-            continue
-        r.delete(_table_row_key(name, rid))
-        deleted += 1
-
-    # Reset ID tracking
-    r.delete(ids_key)
-    r.sadd(ids_key, "_meta")
-    r.set(f"nextid:{name}", 0)
-
-    # Reset table meta timestamp
-    r.delete(_table_meta_key(name))
-    hset_map(
-        _table_meta_key(name),
-        {"created_at": int(time.time())}
-    )
-
-    return {
-        "status": "success",
-        "table": name,
-        "deleted_rows": deleted
-    }
-@app.post("/table/bulk-delete")
-def bulk_delete_rows(name: str, req: BulkDeleteRequest):
-    _require_redis()
-
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Table name required")
-
-    if name in ["users", "agents", "conversations"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Bulk delete not allowed on system tables"
-        )
-
-    if not _table_exists(name):
-        raise HTTPException(status_code=404, detail="Table does not exist")
-
-    ids_key = _table_ids_key(name)
-
-    deleted = []
-    skipped = []
-
-    for rid in req.ids:
-        rid = str(rid)
-        row_key = _table_row_key(name, rid)
-
-        if r.exists(row_key):
-            r.delete(row_key)
-            r.srem(ids_key, rid)
-            deleted.append(rid)
-        else:
-            skipped.append(rid)
-
-    return {
-        "status": "success",
-        "table": name,
-        "deleted_ids": deleted,
-        "skipped_ids": skipped,
-        "deleted_count": len(deleted)
-    }
-
-@app.delete("/delete")
-def delete_endpoint(table: str, id: str):
-    _require_redis()
-
-    # --- Dynamic Table Delete ---
-    if table not in ["users", "agents", "conversations"]:
-        if not _table_exists(table):
-            raise HTTPException(status_code=404, detail="Table does not exist")
-        ids_key = _table_ids_key(table)
-        row_key = _table_row_key(table, id)
-        if r.exists(row_key):
-            r.delete(row_key)
-            r.srem(ids_key, id)
-            return {"status": "deleted", "id": id}
-        raise HTTPException(status_code=404, detail="Row not found")
-
-    if table == "users":
-        try:
-            uid = int(id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid user id")
-        key = _user_key(uid)
-        if r.delete(key):
-            r.srem("users", str(uid))
-            compact_users()
-            return {"status": "deleted", "id": str(uid)}
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if table == "agents":
-        if id.startswith("agent"):
-            try:
-                idx = int(id[len("agent"):])
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid agent id")
-        else:
-            try:
-                idx = int(id)
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid agent id")
-        aid_name = _agent_name(idx)
-        if r.delete(aid_name):
-            r.srem("agents", aid_name)
-            compact_agents()
-            return {"status": "deleted", "id": aid_name}
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    if table == "conversations":
-        try:
-            agent_id, phone = id.split(":", 1)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid conversation id")
-        msg_key = _convo_msg_key(agent_id, phone)
-        meta_key = _convo_meta_key(agent_id, phone)
-        deleted = r.delete(msg_key, meta_key)
-        if deleted:
-            r.srem("conversations", id)
-            return {"status": "deleted", "id": id}
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    raise HTTPException(status_code=400, detail="Invalid table")
-
-# ----------------------------------------------------------------------
-# Admin compaction endpoint
-# ----------------------------------------------------------------------
-@app.post("/admin/compact")
-def admin_compact(payload: Optional[Dict[str, Any]] = None):
-    _require_redis()
-    table = None
-    if payload and isinstance(payload, dict):
-        table = payload.get("table")
-    result = {}
-    if table is None or table == "users" or table == "all":
-        result["users"] = compact_users()
-    if table is None or table == "agents" or table == "all":
-        result["agents"] = compact_agents()
-    return {"status": "ok", "result": result}
-
-# ----------------------------------------------------------------------
-# Run
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+        globals()["result"] = _out
