@@ -19,7 +19,7 @@ import re
 import builtins
 import threading
 load_dotenv()
-# Fallback TCP Redis URL for AsyncRedisSaver (override with env in production)
+# Fallback TCP Redis URL for AsyncRedisSaver (override with env in production).
 os.environ.setdefault(
     "REDIS_TCP_URL",
     "rediss://default:AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM@climbing-hyena-56303.upstash.io:6379",
