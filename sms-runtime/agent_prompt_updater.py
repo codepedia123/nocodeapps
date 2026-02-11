@@ -114,8 +114,9 @@ def _parse_when_run_payload(raw_payload: Any) -> Dict[str, Any]:
             else:
                 cleaned = []
             tools.append({"tool_id": str(key), "when_run": cleaned})
+    # Accept empty tool lists: when_run is optional
     if not tools:
-        return {"tools": [], "error": "No valid tools found in when_run payload."}
+        return {"tools": [], "error": None}
     return {"tools": tools, "error": None}
 
 
@@ -745,7 +746,7 @@ def run_updater_agent():
 
 
 # ------------------------------------------------------------------
-# 6. SET GLOBAL RESULTT
+# 6. SET GLOBAL RESULT
 # ------------------------------------------------------------------
 if any(k in globals() for k in ("inputs", "input", "payload")):
     globals()["result"] = run_updater_agent()
