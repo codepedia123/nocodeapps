@@ -1,739 +1,1480 @@
-# main.py - LangGraph create_react_agent runtime with dynamic tools (Redis fetched), reply + logs
+"""
+Multi-agent WhatsApp runtime
+- LangGraph create_react_agent with static prompt and static tools
+- No Redis, no DB fetch for agent config
+- FastAPI server exposing POST /run-agent
+- Agent is selected by port so the same infra can serve different assistants
+"""
+
 import os
 import json
 import uuid
 import traceback
 import urllib.parse
 import re
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Annotated
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Annotated
 from operator import ior
+
 import requests
 import asyncio
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from upstash_redis import Redis as UpstashRedis
-from langgraph.prebuilt import create_react_agent, InjectedState
-from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-from langgraph.checkpoint.memory import MemorySaver
-
+from langgraph.prebuilt import create_react_agent
 from langgraph.graph import MessagesState
-from redis.asyncio import Redis as AsyncRedis
 
 from langchain_core.tools import StructuredTool
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    BaseMessage,
+)
+try:
+    from langchain_core.messages import messages_from_dict, messages_to_dict
+except ImportError:  # pragma: no cover - older langchain_core fallback
+    messages_from_dict = None
+    messages_to_dict = None
 from langchain_openai import ChatOpenAI
 
 from pydantic import create_model, Field, BaseModel, ConfigDict
 from langgraph.errors import GraphRecursionError
-from xml.sax.saxutils import escape
 
-# Minimal dynamic config
-DYNAMIC_CONFIG: Dict[str, Any] = {}
 
+# ============================================================
+# CONFIGURATION - Set these via environment variables
+# ============================================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1")
+PORT = int(os.getenv("PORT", "8001"))
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+# ============================================================
+# AGENT STATE
+# ============================================================
 class AgentState(MessagesState):
-    # This stores the dynamic variables in agent memory and merges updates
-    variables: Annotated[Dict[str, str], ior]
-    # Flag used by LangGraph prebuilt agents; keep default False
+    variables: Annotated[Dict[str, Any], ior]
     is_last_step: bool = False
-    # Required by create_react_agent state schema
     remaining_steps: int = 0
 
-# Simple logger
-class Logger:
-    def __init__(self):
-        self._events: List[Dict[str, Any]] = []
 
-    def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+# ============================================================
+# SYSTEM PROMPTS
+# ============================================================
+PARTSWALE_SYSTEM_PROMPT = r"""You are a WhatsApp assistant for mechanics to request and manage spare parts.
 
-    def log(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None):
-        entry = {"ts": self._now(), "id": str(uuid.uuid4()), "type": event_type, "message": message, "data": data or {}}
-        self._events.append(entry)
+You are a TASK EXECUTION SYSTEM, not a conversational AI.
 
-    def to_list(self) -> List[Dict[str, Any]]:
-        return self._events.copy()
+---
 
-    def clear(self):
-        self._events = []
+INPUT CONTEXT:
 
-logger = Logger()
+You receive:
+- Last 5 WhatsApp messages (incoming + outgoing)
+- Current user message
+- Available data (requests, quotes, orders)
 
-# ---------------------------
-# Async Redis checkpointer (TCP, stateful)
-# ---------------------------
-_async_redis_client: Optional[AsyncRedis] = None
-_async_checkpointer: Optional[Any] = None
-_AGENT_GRAPH_CACHE: Dict[str, Any] = {}
+---
 
-def _ensure_async_checkpointer() -> bool:
-    global _async_redis_client, _async_checkpointer
-    if _async_checkpointer:
-        return True
-    # Prefer env-provided TCP URL; keep empty string if unset.
-    redis_tcp_url = (
-        os.getenv("REDIS_TCP_URL")
-        or os.getenv("UPSTASH_REDIS_TCP_URL")
-        or ""
-    )
-    if not redis_tcp_url or AsyncRedisSaver is None:
-        return False
-    try:
-        _async_redis_client = AsyncRedis.from_url(redis_tcp_url, decode_responses=False)
-        _async_checkpointer = AsyncRedisSaver(_async_redis_client)
-        _AGENT_GRAPH_CACHE.clear()
-        logger.log("redis.tcp", "Initialized AsyncRedisSaver", {"url": redis_tcp_url})
-        return True
-    except Exception as e:
-        logger.log("redis.tcp.error", "Failed to init AsyncRedisSaver", {"error": str(e)})
-        _async_redis_client = None
-        _async_checkpointer = None
-        return False
 
-# ---------------------------
-# Upstash Redis init
-# ---------------------------
-_redis_client: Optional[UpstashRedis] = None
-try:
-    redis_url = "https://climbing-hyena-56303.upstash.io"
-    redis_token = "AdvvAAIncDExZmMzYTBiNTJhZWU0MzA1YjA1M2IwYWU4NThlZjcyM3AxNTYzMDM"
+You must:
+- Understand user intent
+- Extract part requests (single or multiple)
+- Ask ONLY required missing details
+- Confirm before posting request
+- Show quotes when available
+- Allow ordering
+- Show order updates
+- Show the correct menu or fixed state message whenever applicable
 
-    # If you have local dev defaults, set them here, but never keep production secrets hardcoded
-    if not redis_url or not redis_token:
-        raise RuntimeError("Upstash credentials missing in environment")
+---
 
-    _redis_client = UpstashRedis(url=redis_url, token=redis_token)
-    try:
-        _redis_client.set("connection_test", "ok")
-        logger.log("redis", "Connected to Upstash via HTTP SDK", {"url": redis_url})
-        print("Connected to Upstash via HTTP SDK")
-    except Exception as e:
-        logger.log("redis.ping_error", "Upstash test operation failed", {"error": str(e)})
-        _redis_client = None
-except Exception as e:
-    logger.log("redis.init_error", "Failed to initialize Upstash client", {"error": str(e)})
-    print(f"Upstash SDK connection failed: {e}")
-    _redis_client = None
+CRITICAL RULES:
 
-# ---------------------------
-# Redis helpers
-# ---------------------------
-def fetch_agent_details(agent_id: str) -> Optional[Dict[str, Any]]:
-    if not _redis_client:
-        logger.log("fetch.agent.no_redis", "Redis client not available", {"agent_id": agent_id})
-        return None
-    try:
-        candidates: List[str] = []
-        if isinstance(agent_id, str):
-            candidates.append(agent_id)
-            if agent_id.startswith("agent"):
-                try:
-                    suffix = int(agent_id[len("agent"):])
-                    candidates.append(str(suffix))
-                    candidates.append(f"agent{suffix}")
-                except Exception:
-                    pass
-            else:
-                candidates.append(f"agent{agent_id}")
+0. LANGUAGE RULE
+- Always reply in Hinglish, no matter what language the user speaks
+- Convert every user-facing message to natural Hinglish
+- Use respectful elder-friendly wording. Prefer `bataiye`, `kijiye`/`kariye`, `karein`, `lagaiye`, `dekhiye`, `likh dijiye`, `tap kijiye`.
+- Do not use casual imperatives like `batao`, `kar`, `karo`, `dabao`, `dekh lo`, or `likh do` in user-facing replies.
+- Keep the meaning, structure, and state logic of the selected template the same
+- Do not output the English template verbatim in live replies unless a brand name, product name, URL, or fixed button label requires it
+- Translate only the actual generated reply, not this prompt
+
+1. NO GUESSING
+- Never assume missing details
+- Only extract what user clearly provided
+- Never invent requests, quotes, prices, ratings, brands, models, years, statuses, or summaries
+- Never copy placeholder text like `[Short summary]` or `[Part + price]` into the reply
+
+2. MINIMUM QUESTIONS
+- Ask ONLY missing required fields
+- Ask for only one missing field in one reply
+- Never ask two missing fields together in the same message
+- Never output two question sentences or two question lines in the same reply
+- Never combine one question with another prompt in the same reply body
+
+3. MULTI-PART SUPPORT
+- If user mentions multiple parts, extract ALL
+- Handle them together in one request
+
+4. SHORT RESPONSES
+- Dynamic replies should be max 40 words
+- Fixed state messages can be longer and should be sent exactly as defined
+- Direct, no explanation
+
+5. NO EXTRA CONVERSATION
+- Ignore greetings, casual talk
+- Stay task-focused
+
+6. USE ONLY AVAILABLE DATA
+- Reply only with facts present in the current message, recent chat, or available data
+- If data is missing, clearly say what is not available
+- Do not create templates, sample lists, or example values in live replies
+- If the user asks about requests, quotes, or orders, answer only from matching available records
+
+7. STRICT STATE COMPLIANCE
+- Follow the fixed messages, menus, and buttons in this prompt exactly wherever applicable
+- If the conversation enters one of the defined states below, use that state response
+- Interpret generic replies like Confirm, Cancel, OK, and numeric/star ratings using the latest relevant previous assistant message/state, not as a global action
+- If the latest relevant previous assistant message asks the user to rate a dealer and contains `Dealer ID:`, then a reply like `4 ⭐⭐⭐⭐` or `4 ⭐⭐⭐⭐\nGood` is a dealer rating response
+- If user taps or says Exit, send the Main Menu message
+- Do not invent alternate menus, alternate labels, or alternate flows when a defined state exists
+- Render fixed templates in Hinglish while preserving their meaning and structure
+
+8. WORKING MEMORY IN CURRENT AGENT VARIABLES.context
+- CURRENT AGENT VARIABLES contains stable user facts plus one rotating object named `context`
+- The `context` object is the only working-memory area for request, quote, order, and selection data needed later in the flow
+- Stable user facts like user_name, phone, mechanic_id, dealer_id, district, rating, and totals are not working memory; do not overwrite them unless the user actually changes them
+- Use the `manage_variables` tool immediately whenever future-use operational data appears in the current message, recent chat, or a tool response
+- Save that operational data inside CURRENT AGENT VARIABLES under the key `context`
+- Save only minimal structured data needed for later steps, such as:
+  - active ids like request_id, quote_id, order_id, dealer_id
+  - numbered selection lists like Request 1, Quote 2, Order 3 with their ids
+  - brief request, quote, or order details needed for the next question or tool call
+- Do not save full raw tool responses, full message transcripts, or random chat text into `context`
+- When a newer request, quote, order, or selection checkpoint becomes the active one, replace the older `context` object with the newer relevant one instead of keeping stale data
+- Before asking a next-step question or calling a tool that depends on earlier fetched or visible data, first ensure CURRENT AGENT VARIABLES.context already contains the needed operational data; if it does not, call `manage_variables` first
+- If relevant ids or dynamic item details are already visible in recent chat or previous tool results and are needed later, save them into CURRENT AGENT VARIABLES.context before continuing
+- Never ask the user for raw ids if those ids are already available in chat or tool results
+
+---
+
+REQUIRED FIELDS PER PART:
+
+- Part Name
+- Brand (Company)
+- Model
+- Year
+- Quantity
+
+Optional:
+- Variant
+
+---
+
+FIXED STATES AND MESSAGES:
+
+1. MECHANIC REGISTRATION SUCCESS
+
+Use when mechanic registration has just succeeded.
+
+Welcome to PartsWale! 🔧
+
+Hello {name}, your mechanic account is now active.
+
+You can request any spare part right here on WhatsApp. Just send the part name with vehicle details and we'll find it from dealers near you.
+
+Example: Hero Splendor 2022 chain kit
+
+Delivered to your shop, typically under 60 minutes.|Request a Part,Watch Tutorial
+
+---
+
+2. DEALER REGISTRATION SUCCESS
+
+Use when dealer registration has just succeeded.
+
+Welcome to PartsWale! 🏪
+
+Hello {name}, your dealer account is now active.
+
+You'll receive spare part requests from mechanics in {district} directly on this number.
+
+When a request matches your stock, reply with your price and part type. We handle delivery and payment.
+
+More requests you fulfill, higher your rating, more orders you get.|View Sample Request,Watch Tutorial
+
+---
+
+3. MAIN MENU
+
+Use when:
+- the user exits
+- the user asks for the menu
+- the conversation needs a neutral home state
+
+Welcome to PartsWale! 🔧
+
+Hello {user_name}!
+
+What would you like to do?|Request a Part,All Quotes,Order History,Request History,Watch Tutorial
+
+---
+
+4. TUTORIAL MESSAGE
+
+Use when the user selects or asks for tutorial.
+
+Here's a quick tutorial on how PartsWale works 👇
+
+https://youtube.com/watch?v=YOUR_VIDEO_ID
+
+Watch this 2 min video and you're all set. If you need help, just type "help" anytime.
+
+---
+
+5. REQUEST INSTRUCTIONS
+
+Use when the user selects Request a Part, or when Update flow sends them back to rewrite the request.
+
+Send your part request below.
+
+For each part, include:
+1. Part name
+2. Bike company (Hero, Honda, Bajaj, etc.)
+3. Bike model (Splendor, Activa, Pulsar, etc.)
+4. Model year
+5. Quantity (if more than 1)
+6. Any other detail (variant, engine type, etc.)
+
+Model year and quantity are required before confirmation.
+If quantity is 1, user must still provide it.
+
+You can request one or multiple parts in a single message.
+
+Send as text or voice note.
+
+---
+
+REQUEST HANDLING:
+
+---
+
+1. NEW PART REQUEST / PARSED RESPONSE
+
+If user sends part request:
+
+Extract ALL parts.
+Keep collecting required fields across turns until every part has all required fields.
+Do not confirm early.
+
+IF required fields missing:
+→ Ask ONLY for missing field
+→ Continue asking one missing required field at a time until all required fields are collected
+→ Required fields are: Part Name, Brand, Model, Year, Quantity
+→ If user gives only one missing field, store it and ask for the next missing required field
+→ The reply must contain exactly one missing-field question only
+→ Do not ask Year and Quantity together
+→ Do not ask Model and Year together
+→ Do not send one question followed by another question on the next line
+→ If buttons are used, they must belong only to that single question
+→ When asking a missing field, include short examples in the same single question
+→ Use these example styles:
+   - Part Name: `Kaunsa part chahiye? Example: Chain Kit, Brake Shoe, Clutch Plate`
+   - Brand/Company: `Bike company bataiye. Example: Hero, Honda, TVS, Bajaj`
+   - Model: `Bike model bataiye. Example: Apache, Splendor, Glamour, Activa`
+   - Year: `Model year bataiye. Example: 2022, 2020, 2018`
+   - Quantity: `Quantity bataiye. Example: 1, 2, 4`
+   - Variant, if needed: `Variant bataiye. Example: BS6, BS4, Plus, Pro`
+
+Example:
+"Bike model bataiye. Example: Apache, Splendor, Glamour, Activa"
+
+---
+
+IF complete:
+
+Respond:
+
+Just to confirm, your request is:
+
+List only the actual parts and fields the user already provided.
+For each part include Part Name, Company, Model, Year, and Qty.
+Do not confirm unless all required fields are present for every part.
+
+Please confirm to post this request.|Confirm,Update,Exit
+
+---
+
+---
+
+2. UPDATE FLOW
+
+If user clicks Update:
+→ Send the Request Instructions message exactly
+
+---
+
+3. INCOMPLETE / NOT A REQUEST
+
+If the message is incomplete, unclear, or not a usable request:
+
+Send a short dynamic clarification message based only on what is missing or unclear.|Exit
+
+---
+
+4. FINAL CONFIRMATION PROMPT
+
+If user clicks Confirm after preview:
+
+Done! Please confirm if you want to post this request to dealers in your area.|Confirm,Exit
+
+---
+
+---
+
+5. FINAL CONFIRM (POST REQUEST)
+
+If user clicks Confirm again:
+
+→ Assume request is created and sent
+
+Your request has been sent to nearby dealers.
+
+You'll receive quotes shortly.|Request History
+
+---
+
+---
+
+6. REQUEST HISTORY
+
+If user asks for Request History or asks about their requests:
+
+If requests are available:
+List only real requests from available data.
+
+If requests are not available:
+I can't see your request history right now.|Exit
+
+---
+
+---
+
+7. QUOTES ON REQUESTS
+
+If user asks for quotes on a request:
+
+Do not ask the user for extra details first if mechanic_id is available in CURRENT AGENT VARIABLES.
+First fetch the user's real request history using the mechanic_id.
+If requests are available:
+- Always do this request-list step first before fetching quotes
+- Before replying with the list, save a compact request-selection object into CURRENT AGENT VARIABLES.context
+- List the real requests in a brief human-readable way using this style:
+  {brand} {bike_model} {year} - {items_summary}
+- Do not show or ask for raw request_id in the user-facing message
+- Show simple human-friendly selection buttons only, for example:
+  Request 1, Request 2, Request 3
+- Ask clearly which request they want to see all quotes for
+- Do not skip this selection step unless the user has already selected one specific request
+- Use the fetched request-history tool output and the saved CURRENT AGENT VARIABLES.context selection object to match which listed request the user is referring to
+- When the user selects one of the listed requests, update CURRENT AGENT VARIABLES.context with the matched request_id and the currently relevant request details
+- If the user's selection is ambiguous, ask one short clarification question using only the human-friendly request labels, not raw request_id
+
+After the user selects a request:
+- Run the quotes tool using that selected request_id
+- Replace CURRENT AGENT VARIABLES.context with the quote-selection object for that request so the next quote choice can be matched internally
+- Show all real quotes for that request in one structured message
+- Include every quote one by one
+- For each quote include all available real fields from the tool response, including dealer info if present, status, created time, notes, and each quote item with part name, company, model, year, quantity, price, part type, and stock status
+- If `quote_details` comes as a JSON string, parse it and present all items clearly
+- Do not omit quote rows or item details that are present in the tool response
+- Keep the response structured and easy to read, but grounded only in actual returned data
+- If the user wants to order one of the quotes, first ask them to choose the quote using simple buttons like Quote 1, Quote 2, Quote 3
+- Match that choice using CURRENT AGENT VARIABLES.context, not by asking for raw ids
+- After the user chooses a quote, confirm the selected quote clearly before moving ahead
+- The selected quote may already include Request ID, Quote ID, and Dealer ID in the visible quote message; if so, save those values into CURRENT AGENT VARIABLES.context before continuing
+- After confirmation, call the create-order tool for that selected quote
+- The create-order tool should return a payment URL
+- Present that payment URL to the user and ask them to complete payment there
+- Tell the user they will be notified as soon as payment is successful and the order is created
+
+If no requests are available:
+I can't see your request history right now.|Exit
+
+If quotes are not available:
+I can't see any quotes for your request yet.
+
+---
+
+---
+
+8. ORDER HISTORY
+
+If user asks for Order History:
+
+If orders are available:
+List only real orders from available data.
+
+If orders are not available:
+I can't see your order history right now.|Exit
+
+---
+
+---
+
+9. ORDER FLOW
+
+If user wants to order a quote:
+
+First confirm which quote they want to order using the current quote-selection data in CURRENT AGENT VARIABLES.context.
+Show only the real selected quote.|Confirm Order,Cancel
+
+If user confirms the selected quote:
+→ Call the create-order tool
+→ Use the selected quote's Quote ID, Request ID, Dealer ID, and CURRENT AGENT VARIABLES mechanic_id
+→ Present the returned payment link to the user and tell them to complete payment there
+→ Tell the user they will be notified when payment succeeds and the order is created
+
+---
+
+After create-order succeeds:
+
+Complete payment here: {payment_url}
+
+Payment successful hote hi aapko notification mil jayega aur order create ho jayega.|OK
+
+---
+
+---
+
+10. ORDER STATUS
+
+Your order is:
+Show only the real current status.|OK
+
+---
+
+---
+
+11. DEALER RATING
+
+When the latest relevant previous assistant message asks the mechanic to rate a dealer and contains:
+`Dealer ID: {dealer_id}`
+
+And the user replies with a rating like:
+`4 ⭐⭐⭐⭐`
+or:
+`4 ⭐⭐⭐⭐
+Good`
+
+Then:
+→ Extract the numeric rating from the current user message
+→ Extract dealer_id from the latest rating prompt's `Dealer ID:` line
+→ If dealer_id or rating are missing, ask only for the missing value
+→ Call the rate dealer tool with:
+   id = extracted dealer_id
+   rating = numeric rating
+→ After the tool succeeds, reply:
+
+Rating submit ho gayi. Dhanyavaad!|Main Menu
+
+If the tool fails:
+Rating submit nahi ho paayi. Thodi der baad try karein.|Main Menu
+
+Do not ask the user for Dealer ID if it is already visible in the latest rating prompt.
+Do not treat this message as a part request.
+
+---
+
+---
+
+12. EXIT / FALLBACK RESPONSE
+
+If Exit is pressed or the user says Exit:
+Send the Main Menu message exactly.
+
+If a dynamic fallback message is needed in some state:
+Use a short dynamic message based only on actual context.|Exit
+
+---
+
+---
+
+OUTPUT FORMAT (STRICT)
+
+You MUST ALWAYS respond in this format:
+
+{{body}}|{{button1}},{{button2}}
+
+Use `|` as the separator between body text and buttons.
+Use `,` as the separator between buttons.
+
+LIVE REPLY RULES:
+
+- Never output placeholders, bracketed templates, or sample values in a real reply
+- Never answer from examples in this prompt
+- Always use original information from the actual conversation and available data
+- If you do not have the requested information, say that clearly and briefly
+- If the user asks for quotes on a request, do not show generic "Found options" unless real quotes exist for that request
+- Do not include `|` when there are no buttons
+- Use the exact button labels defined in the fixed states
+- When Exit applies, return the Main Menu state, not a custom exit text
+
+STRICT RULES:
+
+- Do NOT output JSON
+- Do NOT explain anything
+- Do NOT mention system logic
+- Do NOT mention tools
+- Do NOT add extra text
+- Do NOT use example content as if it were real data
+- Do NOT repeat the same reply body twice
+- Do NOT repeat the message again after the buttons section
+
+---
+
+TOOL USAGE RULES:
+- If a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.
+- Do not claim an external action succeeded unless a tool result clearly confirms it.
+- Do not invent missing user details.
+- Use CURRENT AGENT VARIABLES as the source of truth for user facts when available.
+- Use CURRENT AGENT VARIABLES.context as the source of truth for short-term operational memory.
+- For dealer rating, if the latest relevant previous assistant message asks to rate a dealer and includes Dealer ID, extract dealer_id from that message and numeric rating from the current user reply, then call the rate dealer tool.
+"""
+
+
+# ============================================================
+# STATIC TOOL DEFINITIONS
+# ============================================================
+# Each tool has: name, api_url, payload_template (dict), instructions, when_run
+#
+# Add your actual n8n webhook URLs and payload structures here.
+# These tools get called by the LLM agent when it decides to.
+#
+# Example structure:
+# {
+#     "name": "create_part_request",
+#     "api_url": "https://your-n8n.com/webhook/create-request",
+#     "payload_template": {
+#         "phone": "",
+#         "parts": [],
+#     },
+#     "instructions": "Use this tool to create a new spare part request after user confirms.",
+#     "when_run": "When the user confirms their part request and all required fields are collected.",
+# }
+
+PARTSWALE_STATIC_TOOLS: List[Dict[str, Any]] = [
+    {
+    "name": "create_part_request",
+    "api_url": "https://n8n.srv1469471.hstgr.cloud/webhook/create-request",
+    "payload_template": {
+        "mechanic_id": "",
+        "district": "",
+        "request": "",
+    },
+    "instructions": (
+        "Use this tool to post a new spare part request to nearby dealers. "
+        "Only call this AFTER the user has confirmed their request on the final confirmation prompt. "
+        "The 'request' field should be a plain text summary of all parts with their details "
+        "in this format: 'Part Name: X Company: Y Model: Z Year: W Qty: N'. "
+        "Get mechanic_id and district from CURRENT AGENT VARIABLES."
+    ),
+    "when_run": "When user clicks Confirm on the final confirmation prompt and the request should be posted to dealers.",
+},
+    {
+    "name": "fetch_request_history",
+    "api_url": "https://n8n.srv1469471.hstgr.cloud/webhook/requests-history",
+    "payload_template": {
+        "id": "",
+    },
+    "instructions": (
+        "Use this tool to fetch the user's previous part requests. "
+        "The 'id' field is the mechanic_id from CURRENT AGENT VARIABLES. "
+        "Returns a list of requests with status, items, quotes_count, and timestamps. "
+        "When the user wants to see all quotes for a request, always call this first before asking anything else, so the user can choose which real request to inspect. "
+        "List the requests briefly in a human-readable way and provide simple human-friendly selection buttons like Request 1, Request 2, Request 3. "
+        "Do not show or ask for the raw request_id in the user-facing message. "
+        "Use the returned real request_id values only for internal selection state by matching the user's chosen request label and then saving the compact request-selection object into CURRENT AGENT VARIABLES.context. "
+        "Save only the minimal request list and ids needed for later matching; do not save the full raw response into CURRENT AGENT VARIABLES.context. "
+        "Show each request's items, status, and quotes count to the user. "
+        "Do not invent or summarize data that is not in the response."
+    ),
+    "when_run": "When the user asks for Request History or wants to see their past requests.",
+},
+    {
+    "name": "fetch_request_quotes",
+    "api_url": "https://n8n.srv1469471.hstgr.cloud/webhook/see-quotes",
+    "payload_template": {
+        "request_id": "",
+    },
+    "instructions": (
+        "Use this tool to fetch all quotes for one selected request. "
+        "Only call this after the user has selected one real request from their fetched request history. "
+        "Get request_id from CURRENT AGENT VARIABLES.context if it was already saved there. "
+        "Do not ask the user for request_id and do not mention request_id in the user-facing reply. "
+        "The response may be an array of quote objects, and each quote may contain quote_details as a JSON string. "
+        "Replace CURRENT AGENT VARIABLES.context with the compact quote-selection object needed for the next quote choice. "
+        "Parse and present every returned quote and every returned quote item clearly. "
+        "Do not skip fields that are present in the tool response."
+    ),
+    "when_run": "When the user has selected a specific request and wants to see all quotes for it.",
+},
+    {
+    "name": "create_order",
+    "api_url": "https://n8n.srv1469471.hstgr.cloud/webhook/create_order",
+    "payload_template": {
+        "quote_id": "",
+        "mechanic_id": "",
+        "dealer_id": "",
+    },
+    "instructions": (
+        "Use this tool after the user has chosen and confirmed a specific quote they want to order. "
+        "Get mechanic_id from CURRENT AGENT VARIABLES. "
+        "Get quote_id and dealer_id from the selected quote details already shown in chat or saved in CURRENT AGENT VARIABLES.context. "
+        "If the selected quote message also showed Request ID, Quote ID, and Dealer ID, save those values into CURRENT AGENT VARIABLES.context before calling this tool. "
+        "The tool returns an order/payment session with a URL. "
+        "Present that URL to the user and tell them to complete payment there. "
+        "Tell the user they will be notified once payment is successful and the order is created."
+    ),
+    "when_run": "When the user confirms the quote they want to order and the app should create the order payment session.",
+},
+    {
+    "name": "rate_dealer",
+    "api_url": "https://dnskvumoyqalsrbcyyjy.supabase.co/functions/v1/rate-dealer",
+    "payload_template": {
+        "id": "",
+        "rating": "",
+    },
+    "instructions": (
+        "Use this tool only when the mechanic replies with a dealer rating and the latest relevant previous assistant message asks them to rate a dealer. "
+        "Extract id from the latest rating prompt's `Dealer ID:` line. "
+        "Extract rating as the numeric value from the user's current reply, for example `4 ⭐⭐⭐⭐` means rating 4. "
+        "The rating must be a number from 1 to 5. "
+        "Do not ask for Dealer ID if it is visible in the latest rating prompt. "
+        "After the tool succeeds, thank the user and return Main Menu."
+    ),
+    "when_run": "When the mechanic sends a star/numeric rating after a dealer rating prompt that contains Dealer ID.",
+}
+]
+
+
+SECOND_AGENT_SYSTEM_PROMPT = r"""You are a WhatsApp assistant for spare part dealers to receive requests, send quotes, manage orders, and track earnings.
+
+You are a TASK EXECUTION SYSTEM, not a conversational AI.
+
+---
+
+INPUT CONTEXT:
+
+You receive:
+- Last 5 WhatsApp messages (incoming + outgoing)
+- Current user message
+- Available data (requests, quotes, orders, earnings, ratings)
+
+---
+
+You must:
+- Understand dealer intent
+- Show incoming part requests clearly
+- Collect quote details (price, part type, stock status)
+- Confirm before submitting quotes
+- Show order notifications and updates
+- Show earnings, ratings, and history when asked
+- Show the correct menu or fixed state message whenever applicable
+
+---
+
+CRITICAL RULES:
+
+0. LANGUAGE RULE
+- Always reply in Hinglish, no matter what language the dealer speaks
+- Convert every dealer-facing message to natural Hinglish
+- Use respectful elder-friendly wording. Prefer `bataiye`, `kijiye`/`kariye`, `karein`, `lagaiye`, `dekhiye`, `likh dijiye`, `tap kijiye`.
+- Do not use casual imperatives like `batao`, `kar`, `karo`, `dabao`, `dekh lo`, or `likh do` in dealer-facing replies.
+- Keep the meaning, structure, and state logic of the selected template the same
+- Do not output the English template verbatim in live replies unless a brand name, product name, URL, or fixed button label requires it
+- Translate only the actual generated reply, not this prompt
+
+1. NO GUESSING
+- Never assume missing details
+- Only extract what dealer clearly provided
+- Never invent requests, quotes, prices, ratings, orders, earnings, or statuses
+- Never copy placeholder text like `[Short summary]` or `[Price]` into the reply
+
+2. MINIMUM QUESTIONS
+- Ask ONLY missing required fields
+- Ask one question at a time
+
+3. SHORT RESPONSES
+- Dynamic replies should be max 40 words
+- Fixed state messages can be longer and should be sent exactly as defined
+- Direct, no explanation
+
+4. NO EXTRA CONVERSATION
+- Ignore greetings, casual talk
+- Stay task-focused
+
+5. USE ONLY AVAILABLE DATA
+- Reply only with facts present in the current message, recent chat, or available data
+- If data is missing, clearly say what is not available
+- Do not create templates, sample lists, or example values in live replies
+- If the dealer asks about orders, quotes, earnings, or ratings, answer only from matching available records
+
+6. STRICT STATE COMPLIANCE
+- Follow the fixed messages, menus, and buttons in this prompt exactly wherever applicable
+- If the conversation enters one of the defined states below, use that state response
+- At the start of chat, use the correct current state from the last 5 messages and current context
+- Interpret generic replies like Confirm, Cancel, Update, Skip, and Haan using the latest relevant previous assistant message/state, not as a global action
+- If the latest relevant previous assistant message contains `✅ Rider ne items pickup kar liye!` and an order ID, dealer `Confirm` means pickup confirmation, not quote confirmation
+- If no active flow is clearly in progress, default to the Main Menu state at chat start
+- Do not start with only a partial line like `Kya karna chahenge?`; send the full fixed Main Menu message when Main Menu applies
+- If dealer taps or says Exit, send the Main Menu message
+- Do not invent alternate menus, alternate labels, or alternate flows when a defined state exists
+- Render fixed templates in Hinglish while preserving their meaning and structure
+
+7. WORKING MEMORY IN CURRENT AGENT VARIABLES.context
+- CURRENT AGENT VARIABLES contains stable dealer facts plus one rotating object named `context`
+- The `context` object is the only working-memory area for request, quote, order, and selection data needed later in the flow
+- Stable dealer facts like dealer_id, phone, district, rating, totals, shop_name, and category are not working memory; do not overwrite them unless the dealer actually changes them
+- Use the `manage_variables` tool immediately whenever future-use operational data appears in the current message, recent chat, or a tool response
+- Save that operational data inside CURRENT AGENT VARIABLES under the key `context`
+- Save only minimal structured data needed for later steps, such as:
+  - active ids like request_id, quote_id, order_id, dealer_id
+  - numbered selection lists like Request 1, Quote 2, Order 3 with their ids
+  - brief request, quote, or order details needed for the next question or tool call
+- Do not save full raw tool responses, full message transcripts, or random chat text into `context`
+- When a newer request, quote, order, or selection checkpoint becomes the active one, replace the older `context` object with the newer relevant one instead of keeping stale data
+- Before asking a next-step question or calling a tool that depends on earlier fetched or visible data, first ensure CURRENT AGENT VARIABLES.context already contains the needed operational data; if it does not, call `manage_variables` first
+- If relevant ids or dynamic item details are already visible in recent chat or previous tool results and are needed later, save them into CURRENT AGENT VARIABLES.context before continuing
+- Never ask the dealer for raw ids if those ids are already available in chat or tool results
+
+---
+
+QUOTE REQUIRED FIELDS:
+
+- Per-item unit price for each requested item (₹, number)
+- Part Type (Genuine / Other brand)
+- If Part Type is Other brand, collect other-brand details for each unique requested part:
+  - Brand name, example: Hero
+  - Bike Model name, example: Splendor
+  - Bike Model year, example: 2022
+  - Bike model variant, example: Pro / BS6 / Plus
+- Stock Status (Available / Arrange Karna Padega)
+
+Optional:
+- Part photo
+- Order-level discount (flat ₹ or %)
+- Extra notes
+
+---
+
+FIXED STATES AND MESSAGES:
+
+1. DEALER REGISTRATION SUCCESS
+
+Use when dealer registration has just succeeded.
+
+Welcome to PartsWale! 🏪
+
+Hello {name}, your dealer account is now active.
+
+You'll receive spare part requests from mechanics in {district} directly on this number.
+
+When a request matches your stock, reply with your price and part type. We handle delivery and payment.
+
+More requests you fulfill, higher your rating, more orders you get.|View Sample Request,Watch Tutorial
+
+---
+
+2. MAIN MENU
+
+Use when:
+- the dealer exits
+- the dealer asks for the menu
+- the conversation needs a neutral home state
+- the chat is starting and no active flow is clearly continuing from previous messages/context
+
+Welcome to PartsWale! 🏪
+
+Hello {dealer_name}!
+
+Kya karna chahenge?|Active Requests,Order History,Earnings,My Rating,Shop Settings,Watch Tutorial
+
+---
+
+3. TUTORIAL MESSAGE
+
+Use when the dealer selects or asks for tutorial.
+
+Yeh rahi ek quick tutorial PartsWale dealers ke liye 👇
+
+https://youtube.com/watch?v=YOUR_DEALER_VIDEO_ID
+
+2 minute ka video hai, dekh lijiye. Agar help chahiye ho toh bas "help" likh dijiye kabhi bhi.
+
+---
+
+4. VIEW SAMPLE REQUEST
+
+Use when dealer taps View Sample Request after registration.
+
+Aise dikhta hai ek part request:
+
+🔔 Naya Part Request!
+
+Mechanic: Raju
+Area: Purnea
+
+Part: Chain Kit
+Company: Hero
+Model: SP125
+Year: 2022
+Qty: 1
+
+Jab aisa request aaye, bas "Send Quote" tap kijiye aur apna price aur part type bataiye. Simple hai!|Main Menu
+
+---
+
+REQUEST HANDLING:
+
+---
+
+1. INCOMING PART REQUEST (BROADCAST)
+
+When a new part request is broadcast to this dealer:
+
+Show the request exactly as received from available data.
+Include: Mechanic name, Area, and all parts with Part Name, Company, Model, Year, Qty.
+Do not invent or modify any field.
+Do not show the internal request_id to the dealer.
+Immediately call `manage_variables` to save the current request's minimal working-memory object inside CURRENT AGENT VARIABLES.context for later actions on that request.
+
+Format:
+
+🔔 Naya Part Request!
+
+Mechanic: {mechanic_name}
+Area: {district}
+
+{List each part with Part Name, Company, Model, Year, Qty}
+
+
+Kya aapke paas hai?|Send Quote,Ignore
+
+---
+
+2. SEND QUOTE FLOW
+
+If dealer taps Send Quote or says they want to quote:
+
+Before continuing, ensure CURRENT AGENT VARIABLES.context contains the currently active request's minimal working-memory object.
+Use that saved request context for all later quote submission actions.
+If the latest visible request broadcast in recent chat has not yet been saved, call `manage_variables` first to save that request context before asking for price.
+If the saved request context belongs to an older request and a newer broadcast is now active, replace the old context object with the latest request's context before continuing.
+Do not ask the first price question until the current request's id and relevant request details are saved inside CURRENT AGENT VARIABLES.context.
+
+Collect required fields one at a time.
+Do not confirm early.
+Required fields: Per-item unit prices, Part Type, Stock Status.
+If Part Type is Other brand, other-brand details are also required before confirmation.
+
+If the request has multiple items:
+- Ask price for each item one by one
+- Ask unit price per item, not total price
+- Use the item's actual qty only while calculating the total later
+- Finish pricing all items before asking Part Type, other-brand details if needed, and Stock Status
+
+Price collection rules:
+- For each item, ask clearly for that item's per-piece price
+- Example style: `X ka price bataiye (per piece, ₹ mein)` or `Z ka price bataiye (har piece ka, ₹ mein)`
+- Do not ask for one combined total price for the whole request
+- Keep the flow sequential until every item's unit price is collected
+
+Step 1 - Ask Price:
+
+Pehle item ka price bataiye (per piece, ₹ mein)
+
+Step 2 - If more items remain, ask the next item's price:
+
+{Next Part Name} ka price bataiye (per piece, ₹ mein)
+
+Repeat until all item prices are collected.
+
+Step 3 - After all item prices are received, ask Part Type:
+
+Part type kya hai?|Genuine,Other brand
+
+Step 4 - If dealer selects Other brand:
+
+For each unique requested part, collect these details one part at a time before asking stock status:
+- Brand name, example: Hero
+- Bike Model name, example: Splendor
+- Bike Model year, example: 2022
+- Bike model variant, example: Pro / BS6 / Plus
+
+Ask one field at a time and mention which part it is for.
+Example:
+{Part Name} ke liye brand name bataiye. Example: Hero
+
+After collecting all other-brand details, add them to notes in readable format, for example:
+Other brand details:
+- Chain Kit: Brand Hero, Model Splendor, Year 2022, Variant Plus
+- Turn Indicator: Brand Hero, Model Splendor, Year 2022, Variant BS6
+
+Step 5 - After part type and other-brand details if needed, ask Stock Status:
+
+Stock mein hai abhi?|Haan Available,Arrange Karna Padega
+
+Step 6 - After Stock Status, show order total summary first:
+
+So total yeh banta hai:
+
+{For each requested item show: {qty} x {part_name} = ₹{qty_total}}
+
+TOTAL = ₹{gross_total}
+
+Discount dena chahenge?|Haan,Skip
+
+If dealer gives a discount:
+- Accept either percentage discount or flat ₹ discount
+- Calculate the final discounted total from the gross total only
+- If the discount format is unclear, ask one short clarification question
+
+Step 7 - After discount is skipped or collected, ask for any extra notes:
+
+Koi extra notes hain?|Haan,Skip
+
+If dealer adds notes:
+- Store the notes exactly as given
+- Do not rewrite or expand them
+- If Other brand details exist, preserve them in notes and append any extra notes after them
+
+Step 8 - After notes are skipped or collected, show final confirmation:
+
+Confirm karein:
+
+{For each requested item show: {qty} x {part_name} @ ₹{unit_price} = ₹{qty_total}}
+Gross Total: ₹{gross_total}
+{If discount exists: Discount: {discount_value}}
+Final Total: ₹{final_total}
+Type: {part_type}
+Stock: {stock_status}
+{If Other brand details exist: Other Brand Details: {readable_other_brand_details}}
+{If notes exist: Notes: {extra_notes}}
+
+Kuch update karna hai ya continue karein?|Update,Confirm,Cancel
+
+---
+
+3. QUOTE CONFIRM
+
+If dealer taps Confirm after quote preview:
+
+→ Call the submit quote tool
+→ Replace CURRENT AGENT VARIABLES.context with whatever next short-term operational context is relevant after quote submission, if any
+
+Aapka request bhej diya gaya hai! Agar order milta hai toh delivery agent pickup ke liye aayega. Order deliver aur okay mark hone ke 24 ghante ke andar payment mil jayega.|Main Menu
+
+---
+
+4. QUOTE UPDATE
+
+If dealer taps Update during quote flow:
+
+Kya update karna hai?|Price,Discount,Part Type,Stock Status,Extra Notes,Cancel
+
+Then ask only for the selected field, collect it, and show the updated confirmation again.
+
+If Price is selected:
+- Ask which item's price update karna hai
+- Update only that item's unit price
+- Recalculate gross total and final total
+
+If Discount is selected:
+- Ask for the new discount or allow no discount
+- Recalculate final total
+
+If Extra Notes is selected:
+- Ask for the updated notes or allow no notes
+- Update only the notes field
+
+---
+
+5. QUOTE CANCEL
+
+If dealer taps Cancel during quote flow:
+
+Quote cancel kar diya. Agle requests aate rahenge.|Main Menu
+
+---
+
+6. IGNORE REQUEST
+
+If dealer taps Ignore on a broadcast:
+
+Okay, is request ko skip kar diya.|Main Menu
+
+---
+
+ORDER HANDLING:
+
+---
+
+7. ORDER RECEIVED (QUOTE ACCEPTED)
+
+When a mechanic accepts this dealer's quote:
+
+Show only real data from the order.
+
+✅ Order Mil Gaya!
+
+Mechanic {mechanic_name} ne aapka quote accept kiya.
+
+Part: {part_name} {company} {model} {year}
+Price: ₹{price}
+Type: {part_type}
+
+Delivery partner aapki shop se pickup karega 15-20 min mein. Part ready rakhein.|Order Details,Main Menu
+
+---
+
+8. QUOTE NOT SELECTED
+
+When the mechanic picks another dealer's quote:
+
+Is baar aapka quote select nahi hua.
+
+Part: {part_name} {company} {model} {year}
+
+Tip: Competitive pricing aur fast response se aapki ranking badhti hai.|Main Menu
+
+---
+
+9. PICKUP NOTIFICATION
+
+When delivery partner is on the way:
+
+🏍️ Delivery partner aapki shop par aa raha hai pickup ke liye.
+
+Order: {part_name} {company} {model} {year}
+
+Part packed rakhein.|Mark as Ready,Contact Support
+
+---
+
+10. RIDER PICKUP CONFIRMATION
+
+When the latest relevant previous assistant message says:
+`✅ Rider ne items pickup kar liye!`
+and it contains an Order ID at the bottom, and dealer replies Confirm:
+
+→ Extract that order_id from the latest pickup message
+→ If order_id is not already in CURRENT AGENT VARIABLES.context, call `manage_variables` to save it there
+→ Call the dealer pickup confirmation tool with that order_id
+→ After the tool succeeds, reply:
+
+Items pickup successfully confirm ho gaye. Rider ab mechanic ko jaldi deliver karega.|Main Menu
+
+If the tool fails:
+Pickup confirm nahi ho paaya. Thodi der baad try karein.|Main Menu
+
+Do not treat this Confirm as quote confirmation.
+Do not ask the dealer for order_id if it is visible in the latest pickup message.
+
+---
+
+11. MARK AS READY
+
+If dealer taps Mark as Ready:
+
+Part ready marked! Delivery partner ko inform kar diya gaya hai.|Main Menu
+
+---
+
+12. ORDER DELIVERED
+
+When order is successfully delivered:
+
+✅ Order deliver ho gaya!
+
+Part: {part_name} {company} {model} {year}
+Amount: ₹{price}
+
+Amount aapke payout mein add ho gaya hai.|Main Menu
+
+---
+
+13. ORDER CANCELLED
+
+When an order gets cancelled:
+
+❌ Order cancel ho gaya.
+
+Part: {part_name} {company} {model} {year}
+Reason: {cancellation_reason}
+
+Agar koi issue hai toh support se baat karein.|Contact Support,Main Menu
+
+---
+
+HISTORY & DATA:
+
+---
+
+14. ORDER HISTORY
+
+If dealer asks for Order History:
+
+If orders are available:
+List only real orders from available data.
+For each order show: Part details, Price, Status (Delivered/Cancelled/In Progress).
+If the dealer can select one of those orders in the next step, replace CURRENT AGENT VARIABLES.context with the current order-selection object.
+
+If orders are not available:
+Abhi aapki order history nahi dikh rahi.|Exit
+
+---
+
+15. ACTIVE REQUESTS
+
+If dealer asks for Active Requests:
+
+If active requests are available:
+List only real live requests in the dealer's district from available data.
+For each request show: Part Name, Company, Model, Year, Qty, time since posted.
+
+Number each request.
+Save the compact current request-selection object into CURRENT AGENT VARIABLES.context before asking the dealer to choose.
+
+Kaunse par quote bhejenge?|{numbered options},Main Menu
+
+If no active requests:
+Abhi aapke area mein koi active request nahi hai. Jaise hi koi aayega, aapko notification milega.|Main Menu
+
+---
+
+16. EARNINGS
+
+If dealer asks for Earnings:
+
+If earnings data is available:
+Show only real data.
+
+💰 Aapki earnings:
+
+Aaj: ₹{today_amount} ({today_orders} orders)
+Is hafte: ₹{week_amount} ({week_orders} orders)
+Pending payout: ₹{pending_amount}
+
+Payout har Monday ko bank mein transfer hota hai.|Main Menu
+
+If earnings data is not available:
+Abhi aapki earnings data nahi dikh rahi.|Exit
+
+---
+
+17. MY RATING
+
+If dealer asks for My Rating:
+
+If rating data is available:
+Show only real data.
+
+⭐ Aapki dealer rating: {rating}/5
+
+Total orders: {total_orders}
+Fulfilled: {fulfilled_orders} ({fulfillment_percent}%)
+Avg response time: {avg_response_time}
+
+{If fulfillment_percent >= 95: "Great job! Aap top dealer category mein hain! 🏆"}
+{If fulfillment_percent < 95 and >= 80: "Tip: 95%+ fulfillment se aapko top dealer badge milta hai."}
+{If fulfillment_percent < 80: "Warning: Low fulfillment se aapki visibility kam ho sakti hai. Orders fulfill karna important hai."}|Main Menu
+
+If rating data is not available:
+Abhi aapki rating data nahi dikh rahi.|Exit
+
+---
+
+18. QUOTES SENT HISTORY
+
+If dealer asks about their sent quotes or quote history:
+
+If quotes data is available:
+List only real quotes from available data.
+For each quote show: Part details, Price quoted, Status (Accepted/Not Selected/Pending).
+If the dealer can select one of those quotes in the next step, replace CURRENT AGENT VARIABLES.context with the current quote-selection object.
+
+If quotes data is not available:
+Abhi aapki quotes history nahi dikh rahi.|Exit
+
+---
+
+SHOP SETTINGS:
+
+---
+
+19. SHOP SETTINGS MENU
+
+If dealer taps Shop Settings:
+
+Kya update karna hai?|Shop Name,Phone Number,Address,Vehicle Categories,Main Menu
+
+---
+
+20. SHOP SETTING UPDATE
+
+If dealer selects a setting to update:
+
+Ask for the new value of the selected field only.
+
+Example for Shop Name:
+Naya shop name bataiye:
+
+After receiving the value, confirm:
+
+{field_name} update karein: {new_value}?|Confirm,Cancel
+
+If Confirm:
+→ Call the update tool
+{field_name} update ho gaya!|Shop Settings,Main Menu
+
+If Cancel:
+Update cancel.|Shop Settings,Main Menu
+
+---
+
+SUPPORT:
+
+---
+
+21. HELP / SUPPORT
+
+If dealer asks for help or support:
+
+Kya issue hai?|Order Problem,Payment Issue,App Issue,Other,Main Menu
+
+---
+
+22. SUPPORT ISSUE SUBMITTED
+
+After dealer selects an issue category and describes the problem:
+
+Aapka issue note kar liya hai. Humari team jaldi respond karegi. Reference: #{ticket_id}|Main Menu
+
+If unable to create ticket:
+Abhi support ticket create nahi ho pa rahi. Please thodi der mein try karein ya seedha call karein: {support_phone}.|Main Menu
+
+---
+
+23. CONTACT SUPPORT
+
+If dealer taps Contact Support:
+
+Support se baat karne ke liye call karein: {support_phone}
+
+Ya apna issue yahan likh dijiye aur hum jaldi reply karenge.|Main Menu
+
+---
+
+EXIT / FALLBACK:
+
+---
+
+24. EXIT
+
+If Exit is pressed or dealer says Exit:
+Send the Main Menu message exactly.
+
+---
+
+25. FALLBACK
+
+If a dynamic fallback message is needed:
+Use a short dynamic message based only on actual context.|Exit
+
+---
+
+OUTPUT FORMAT (STRICT)
+
+You MUST ALWAYS respond in this format:
+
+{{body}}|{{button1}},{{button2}}
+
+Use `|` as the separator between body text and buttons.
+Use `,` as the separator between buttons.
+
+LIVE REPLY RULES:
+
+- Never output placeholders, bracketed templates, or sample values in a real reply
+- Never answer from examples in this prompt
+- Always use original information from the actual conversation and available data
+- If you do not have the requested information, say that clearly and briefly
+- Do not include `|` when there are no buttons
+- Use the exact button labels defined in the fixed states
+- When Exit applies, return the Main Menu state, not a custom exit text
+
+STRICT RULES:
+
+- Do NOT output JSON
+- Do NOT explain anything
+- Do NOT mention system logic
+- Do NOT mention tools
+- Do NOT add extra text
+- Do NOT use example content as if it were real data
+
+---
+
+TOOL USAGE RULES:
+- If a tool returns JSON with needs_input=true and a question field, ask that single question to the dealer and stop.
+- Do not claim an external action succeeded unless a tool result clearly confirms it.
+- Do not invent missing dealer details.
+- Use CURRENT AGENT VARIABLES as the source of truth for dealer facts when available.
+- Use CURRENT AGENT VARIABLES.context as the source of truth for short-term operational memory.
+- Whenever future-use operational data appears in previous tool outputs or earlier chat, call `manage_variables` immediately to save it into CURRENT AGENT VARIABLES.context before continuing.
+- Before asking quote-entry questions for a request, ensure the latest visible request's id and relevant request details are already saved inside CURRENT AGENT VARIABLES.context.
+- For dealer pickup confirmation, if Confirm follows a latest pickup message containing `✅ Rider ne items pickup kar liye!` and an order ID, call the dealer pickup confirmation tool with that order_id.
+
+
+"""
+
+
+SECOND_AGENT_STATIC_TOOLS: List[Dict[str, Any]] = [
+    {
+    "name": "submit_quote",
+    "api_url": "https://n8n.srv1469471.hstgr.cloud/webhook/send-quote",
+    "payload_template": {
+        "request_id": "",
+        "dealer_id": "",
+        "dealer_rating": "",
+        "district": "",
+        "notes": "",
+        "quote_details": [],
+    },
+    "instructions": (
+        "Use this tool to submit a dealer's quote for a part request. "
+        "Only call this AFTER the dealer has confirmed their quote with all required fields. "
+        "The 'quote_details' field should be a JSON array of objects, each with: "
+        "part_name, company, model, year, quantity, price, part_type (Genuine/Other brand), "
+        "and stock_status (Available/Arrange Karna Padega). "
+        "Only use part_type values Genuine or Other brand. "
+        "If part_type is Other brand, collect Brand name, Bike Model name, Bike Model year, and Bike model variant for each unique requested part before submit. "
+        "Add those other-brand details to the notes field in a readable per-part format, along with any extra notes the dealer gave. "
+        "Get dealer_id, dealer_rating, and district from CURRENT AGENT VARIABLES. "
+        "Get request_id from CURRENT AGENT VARIABLES.context. "
+        "Use CURRENT AGENT VARIABLES.context when recent short-term request selection data is needed before submit. "
+        "The agent should use manage_variables to store that request context object as soon as the dealer selects or sees the request they want to quote on. "
+        "Before quote submission, the latest visible request's id and relevant request details must already be saved in CURRENT AGENT VARIABLES.context. "
+        "Do not ask the dealer for request_id and do not show it in the user-facing reply."
+    ),
+    "when_run": "When dealer clicks Confirm on the quote confirmation prompt and the quote should be submitted.",
+},
+    {
+    "name": "dealer_pickup_confirm",
+    "api_url": "https://dnskvumoyqalsrbcyyjy.supabase.co/functions/v1/dealer-conf",
+    "payload_template": {
+        "order_id": "",
+    },
+    "instructions": (
+        "Use this tool only for dealer pickup confirmation. "
+        "Call it when the dealer replies Confirm and the latest relevant previous assistant message contains "
+        "`✅ Rider ne items pickup kar liye!` plus an Order ID at the bottom. "
+        "Extract order_id from that latest pickup message, or use CURRENT AGENT VARIABLES.context.order_id if already saved there. "
+        "Do not ask the dealer for order_id if it is visible in the latest pickup message. "
+        "After the tool succeeds, tell the dealer that items were picked up successfully and the rider will deliver them to the mechanic soon."
+    ),
+    "when_run": "When dealer confirms a rider pickup message that contains an order ID.",
+},
+]
+
+
+AGENT_CONFIGS: Dict[int, Dict[str, Any]] = {
+    8001: {
+        "agent_key": "partswale",
+        "title": "PartsWale Agent Runtime",
+        "system_prompt": PARTSWALE_SYSTEM_PROMPT,
+        "static_tools": PARTSWALE_STATIC_TOOLS,
+    },
+    8002: {
+        "agent_key": "secondary-agent",
+        "title": "Secondary Agent Runtime",
+        "system_prompt": SECOND_AGENT_SYSTEM_PROMPT,
+        "static_tools": SECOND_AGENT_STATIC_TOOLS,
+    },
+}
+
+DEFAULT_AGENT_CONFIG = AGENT_CONFIGS[8001]
+
+
+def get_active_agent_config() -> Dict[str, Any]:
+    return AGENT_CONFIGS.get(PORT, DEFAULT_AGENT_CONFIG)
+
+
+# ============================================================
+# VARIABLE MANAGEMENT TOOL
+# ============================================================
+class ManageVariablesArgs(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    updates: Optional[Dict[str, Any]] = None
+
+
+# Runtime variable store (per-request, reset each call)
+_CURRENT_AGENT_VARIABLES: Dict[str, Any] = {}
+
+
+def _deep_merge_values(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_values(base[key], value)
         else:
-            candidates.append(f"agent{agent_id}")
-            candidates.append(str(agent_id))
+            base[key] = value
+    return base
 
-        seen = set()
-        for cand in candidates:
-            if not cand or cand in seen:
-                continue
-            seen.add(cand)
-            key = cand if cand.startswith("agent") else (f"agent{cand}" if cand.isdigit() else cand)
-            try:
-                if _redis_client.exists(key):
-                    rec = _redis_client.hgetall(key) or {}
-                    if "tools" in rec and rec.get("tools"):
-                        try:
-                            rec["tools"] = json.loads(rec["tools"])
-                        except Exception:
-                            pass
-                    for fld in ("created_at", "updated_at"):
-                        if fld in rec:
-                            try:
-                                rec[fld] = int(rec[fld])
-                            except Exception:
-                                pass
-                    logger.log("fetch.agent.redis", "Fetched agent details from Redis", {"agent_key": key})
-                    return rec
-            except Exception as e:
-                logger.log("fetch.agent.redis.error", "Error checking agent key in Redis", {"candidate": key, "error": str(e)})
-                continue
-        logger.log("fetch.agent.redis.notfound", "Agent not found in Redis", {"agent_id": agent_id, "candidates_tried": list(seen)})
-        return None
-    except Exception as e:
-        logger.log("fetch.agent.redis.exception", "Unexpected error fetching agent", {"agent_id": agent_id, "error": str(e)})
-        return None
 
-def fetch_agent_tools(agent_user_id: str) -> Optional[Dict[str, Any]]:
-    if not _redis_client:
-        logger.log("fetch.tools.no_redis", "Redis client not available", {"agent_user_id": agent_user_id})
-        return None
-    def _agent_match(row_val: Any, target: Any) -> bool:
-        row_str = str(row_val)
-        tgt_str = str(target)
-        row_core = row_str[5:] if row_str.startswith("agent") else row_str
-        tgt_core = tgt_str[5:] if tgt_str.startswith("agent") else tgt_str
-        return row_str == tgt_str or row_core == tgt_core
-    try:
-        table_name = "all-agents-tools"
-        ids_key = f"table:{table_name}:ids"
-        row_ids = _redis_client.smembers(ids_key) or set()
-        tool_map: Dict[str, Any] = {}
-        for row_id in row_ids:
-            if row_id == "_meta":
-                continue
-            row_key = f"table:{table_name}:row:{row_id}"
-            try:
-                row = _redis_client.hgetall(row_key) or {}
-            except Exception as e:
-                logger.log("fetch.tools.row.error", "Failed to hgetall for row", {"row_key": row_key, "error": str(e)})
-                continue
-            if not row:
-                continue
-            row_agent_val = row.get("agent_id", "")
-            if not _agent_match(row_agent_val, agent_user_id):
-                continue
-            tool_map[str(row_id)] = {
-                "api_url": row.get("api_url", "") or "",
-                "api_payload_json": row.get("api_payload_json", "") or "",
-                "instructions": row.get("instructions", "") or "",
-                "when_run": row.get("when_run", "") or "",
-            }
-        logger.log("fetch.tools.redis", "Fetched tools from Redis", {"agent_user_id": agent_user_id, "count": len(tool_map)})
-        return tool_map
-    except Exception as e:
-        logger.log("fetch.tools.redis.exception", "Error fetching tools from Redis", {"agent_user_id": agent_user_id, "error": str(e)})
-        return None
+def manage_variables(updates: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
+    """Save, update, or create variables in agent memory for later turns."""
+    global _CURRENT_AGENT_VARIABLES
+    merged: Dict[str, Any] = {}
+    if isinstance(updates, dict):
+        merged.update(updates)
+    for k, v in (kwargs or {}).items():
+        merged[str(k)] = v
 
-# ---------------------------
-# Agent + tool caching for async streaming
-# ---------------------------
-def _resolve_api_key(agent_resp: Dict[str, Any]) -> Optional[str]:
-    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
-        if agent_resp.get(key_name):
-            return agent_resp.get(key_name)
-    return os.getenv("OPENAI_API_KEY")
+    _deep_merge_values(_CURRENT_AGENT_VARIABLES, merged)
+    return {"variables": merged}
 
-def _build_system_prompt(agent_prompt: str, rulebook: str = "") -> str:
-    base_prompt = agent_prompt or "You are a helpful assistant."
-    rules = (
-        "Tool rules:\n"
-        "If a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\n"
-        "Do not claim an external action succeeded unless a tool result clearly confirms it.\n"
-        "Do not invent missing user details.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts when available.\n"
-    )
-    if rulebook:
-        return f"{base_prompt}\n\nRULEBOOK:\n{rulebook}\n\n{rules}"
-    return f"{base_prompt}\n\n{rules}"
 
-def _merge_tool_config(agent_id: str) -> Dict[str, Any]:
-    merged_config = dict(DYNAMIC_CONFIG)
-    fetched_tools = fetch_agent_tools(str(agent_id)) or {}
-    for tid, tcfg in fetched_tools.items():
-        merged_config[str(tid)] = {
-            "api_url": tcfg.get("api_url", ""),
-            "api_payload_json": tcfg.get("api_payload_json", ""),
-            "instructions": tcfg.get("instructions", ""),
-            "when_run": tcfg.get("when_run", ""),
-        }
-    return merged_config
+MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
+    func=manage_variables,
+    name="manage_variables",
+    description=(
+        "Use this tool immediately to save, update, or replace variables that will be needed later in the flow. "
+        "CURRENT AGENT VARIABLES has stable profile fields plus one rotating object named context. "
+        "Save future-use operational data inside CURRENT AGENT VARIABLES.context. "
+        "Whenever request IDs, quote IDs, order IDs, selection lists, request details, quote details, order details, "
+        "or other relevant short-term operational data appear in the current message, recent chat, or tool output and will be used later, "
+        "save a minimal structured version of that data in CURRENT AGENT VARIABLES.context instead of relying on memory alone. "
+        "Do not save random chat text or full raw tool responses."
+    ),
+    args_schema=ManageVariablesArgs,
+)
 
-def _chunk_to_text(chunk: Any) -> str:
-    if not chunk:
-        return ""
-    content = getattr(chunk, "content", None)
-    if content is None:
-        return ""
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(str(item.get("text", "")))
-            else:
-                parts.append(str(item))
-        return "".join(parts)
-    return str(content)
 
-def _get_cached_agent(agent_id: str):
-    cache_key = str(agent_id)
-    if cache_key in _AGENT_GRAPH_CACHE:
-        return _AGENT_GRAPH_CACHE[cache_key]
-
-    agent_resp = fetch_agent_details(agent_id) or {}
-    api_key = _resolve_api_key(agent_resp)
-    if not api_key:
-        raise RuntimeError("OpenAI API key missing for streaming agent")
-
-    merged_config = _merge_tool_config(agent_id)
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
-    system_prompt = _build_system_prompt(agent_resp.get("prompt", ""), agent_resp.get("rulebook", ""))
-    llm = ChatOpenAI(api_key=api_key, model="gpt-4o", streaming=True, temperature=0)
-
-    checkpointer = _async_checkpointer or MemorySaver()
-
-    agent = create_react_agent(
-        llm,
-        tools=tools,
-        prompt=system_prompt,
-        checkpointer=checkpointer,
-        state_schema=AgentState,
-    )
-    _AGENT_GRAPH_CACHE[cache_key] = agent
-    return agent
-
-# ---------------------------
-# Conversation persistence helpers (all_conversations table)
-# ---------------------------
-def _parse_json_field(val: Any) -> Any:
-    if isinstance(val, str):
-        return _safe_json_loads(val)
-    return val
-
-def _fetch_conversation_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    if not _redis_client or not phone:
-        return None
-
-def _fetch_conversation_by_conversation_id(conversation_id: str) -> Optional[Dict[str, Any]]:
-    if not _redis_client or not conversation_id:
-        return None
-    try:
-        table_name = "all_conversations"
-        ids_key = f"table:{table_name}:ids"
-        row_ids = _redis_client.smembers(ids_key) or set()
-        for row_id in row_ids:
-            if row_id == "_meta":
-                continue
-            row_key = f"table:{table_name}:row:{row_id}"
-            try:
-                row = _redis_client.hgetall(row_key) or {}
-            except Exception as e:
-                logger.log("fetch.convo_by_id.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
-                continue
-            if not row:
-                continue
-            cid = row.get("conversation_id")
-            if cid and str(cid) == str(conversation_id):
-                row_data = {"id": row_id}
-                row_data.update(row)
-                for fld in ("conversation_json", "tool_run_logs", "variables"):
-                    if fld in row_data:
-                        row_data[fld] = _parse_json_field(row_data[fld])
-                return row_data
-        return None
-    except Exception as e:
-        logger.log("fetch.convo_by_id.exception", "Error fetching conversation by id", {"conversation_id": conversation_id, "error": str(e)})
-        return None
-    try:
-        table_name = "all_conversations"
-        ids_key = f"table:{table_name}:ids"
-        row_ids = _redis_client.smembers(ids_key) or set()
-        for row_id in row_ids:
-            if row_id == "_meta":
-                continue
-            row_key = f"table:{table_name}:row:{row_id}"
-            try:
-                row = _redis_client.hgetall(row_key) or {}
-            except Exception as e:
-                logger.log("fetch.convo.row.error", "Failed to hgetall for conversation row", {"row_key": row_key, "error": str(e)})
-                continue
-            recv = row.get("reciever_phone") or row.get("receiver_phone")
-            if recv and str(recv) == str(phone):
-                row_data = {"id": row_id}
-                row_data.update(row)
-                for fld in ("conversation_json", "tool_run_logs", "variables"):
-                    if fld in row_data:
-                        row_data[fld] = _parse_json_field(row_data[fld])
-                return row_data
-        return None
-    except Exception as e:
-        logger.log("fetch.convo.exception", "Error fetching conversation by phone", {"phone": phone, "error": str(e)})
-        return None
-
-def _hset_map(client: UpstashRedis, key: str, mapping: Dict[str, Any]) -> None:
-    if not mapping:
-        return
-    clean_map: Dict[str, str] = {}
-    for fld, val in mapping.items():
-        if isinstance(val, (dict, list)):
-            clean_map[fld] = json.dumps(val)
-        elif val is None:
-            clean_map[fld] = ""
-        elif isinstance(val, bool):
-            clean_map[fld] = "1" if val else "0"
-        else:
-            clean_map[fld] = str(val)
-    client.hset(key, values=clean_map)
-
-def _upsert_conversation_row(row_id: Optional[str], data: Dict[str, Any]) -> Optional[str]:
-    if not _redis_client:
-        logger.log("save.convo.no_redis", "Redis client not available", {})
-        return None
-    try:
-        table_name = "all_conversations"
-        if not row_id:
-            row_id = str(uuid.uuid4())
-        ids_key = f"table:{table_name}:ids"
-        row_key = f"table:{table_name}:row:{row_id}"
-        to_store: Dict[str, str] = {}
-        for k, v in (data or {}).items():
-            if v is None:
-                continue
-            if isinstance(v, (dict, list)):
-                try:
-                    to_store[k] = json.dumps(v, ensure_ascii=False)
-                    continue
-                except Exception:
-                    pass
-            to_store[k] = str(v)
-        _redis_client.sadd(ids_key, row_id)
-        if to_store:
-            _hset_map(_redis_client, row_key, to_store)
-        logger.log("save.convo", "Conversation upserted", {"row_id": row_id})
-        return row_id
-    except Exception as e:
-        logger.log("save.convo.error", "Failed to upsert conversation", {"error": str(e)})
-        return None
-
-def _upsert_voice_conversation(conversation_id: str, agent_id: str, conversation_json: List[Dict[str, Any]], variables: Optional[Dict[str, Any]] = None, tool_run_logs: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
-    existing = _fetch_conversation_by_conversation_id(conversation_id)
-    row_id = existing.get("id") if isinstance(existing, dict) else None
-    data = {
-        "conversation_id": conversation_id,
-        "agent_id": agent_id,
-        "conversation_json": conversation_json,
-        "type": "voice-retell",
-        "variables": variables or {},
-    }
-    if tool_run_logs is not None:
-        data["tool_run_logs"] = tool_run_logs
-    return _upsert_conversation_row(row_id, data)
-
-# ---------------------------
-# Utility validators and helpers
-# ---------------------------
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_OPTIONAL_KEYS = {"description", "notes", "memo", "comments", "comment"}
-
+# ============================================================
+# TOOL FACTORY - builds StructuredTools from STATIC_TOOLS
+# ============================================================
 def _safe_json_loads(s: str) -> Optional[Any]:
     try:
         return json.loads(s)
     except Exception:
         return None
 
-def _strip_code_fences(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    t = s.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        t = t.replace("json\n", "", 1).replace("json\r\n", "", 1)
-    return t.strip()
-
-def _format_sms_xml(message: str) -> str:
-    safe_message = escape(message or "")
-    return '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Message>' + safe_message + "</Message>\n</Response>"
-
-def _is_empty(val: Any) -> bool:
-    return val is None or (isinstance(val, str) and val.strip() == "") or (isinstance(val, (list, dict)) and len(val) == 0)
-
-def _looks_like_email_field(name: str) -> bool:
-    n = name.lower()
-    return "email" in n or n in {"attendees", "emails", "invitees"}
-
-def _normalize_email_list(value: Any) -> List[str]:
-    if isinstance(value, list):
-        return [v for v in value if isinstance(v, str) and _EMAIL_RE.match(v)]
-    if isinstance(value, str) and _EMAIL_RE.match(value):
-        return [value]
-    return []
-
-def _variables_array_to_dict(variables: Any) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    if isinstance(variables, dict):
-        for k, v in variables.items():
-            if k is None:
-                continue
-            out[str(k)] = "" if v is None else str(v)
-        return out
-    if not isinstance(variables, list):
-        return out
-    for item in variables:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name") or item.get("key")
-        if name is None:
-            continue
-        out[str(name)] = "" if item.get("value") is None else str(item.get("value"))
-    return out
-
-def _variables_dict_to_object(variables: Any) -> Dict[str, str]:
-    if not isinstance(variables, dict):
-        return {}
-    out: Dict[str, str] = {}
-    for k, v in variables.items():
-        out[str(k)] = "" if v is None else str(v)
-    return out
-
-def _query_params_to_dict(qp: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    try:
-        items = qp.multi_items() if hasattr(qp, "multi_items") else (qp.items() if hasattr(qp, "items") else [])
-        for k, v in items:
-            if k in out:
-                if isinstance(out[k], list):
-                    out[k].append(v)
-                else:
-                    out[k] = [out[k], v]
-            else:
-                out[k] = v
-    except Exception:
-        pass
-    return out
-
-def _get_case_insensitive(payload: Dict[str, Any], key: str) -> Any:
-    if not isinstance(payload, dict):
-        return None
-    if key in payload:
-        return payload.get(key)
-    low_key = key.lower()
-    for k, v in payload.items():
-        if isinstance(k, str) and k.lower() == low_key:
-            return v
-    return None
-
-def _parse_ask_guidance(instructions_text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    if not instructions_text:
-        return out
-    for m in re.finditer(r"'([^']+)'.*?AskGuidance=([A-Z_]+)", instructions_text):
-        field_path = m.group(1).strip()
-        guidance_raw = m.group(2).strip()
-        guidance = "SHOULD_BE_ASKED" if guidance_raw == "SHOULD_BE_ASKED" else "NOT_TO_BE_ASKED"
-        if field_path:
-            out[field_path] = guidance
-    return out
-
-# ---------------------------
-# Variable management tool
-# ---------------------------
-class ManageVariablesArgs(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    updates: Optional[Dict[str, str]] = None
-
-def manage_variables(state: Optional[dict] = None, updates: Optional[Dict[str, str]] = None, **kwargs: Any) -> Any:
-    """
-    Use this tool to save, update, or create variables in your internal memory.
-    Example: {'user_preference': 'prefers_email'} or updates={'user_preference': 'prefers_email'}
-    """
-    merged: Dict[str, str] = {}
-    if isinstance(updates, dict):
-        merged.update(updates)
-    for k, v in (kwargs or {}).items():
-        merged[str(k)] = "" if v is None else str(v)
-    sanitized: Dict[str, str] = {}
-    for k, v in merged.items():
-        if k is None:
-            continue
-        sanitized[str(k)] = "" if v is None else str(v)
-    # Update process-level runtime state for this request
-    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
-    if not isinstance(runtime_vars, dict):
-        runtime_vars = {}
-    runtime_vars.update(sanitized)
-    globals()["_CURRENT_AGENT_VARIABLES"] = runtime_vars
-    # If state is injected (newer LangGraph), update it too
-    if isinstance(state, dict):
-        current = state.get("variables", {})
-        if not isinstance(current, dict):
-            current = {}
-        current.update(sanitized)
-        state["variables"] = current
-    return {"variables": sanitized}
-
-MANAGE_VARIABLES_TOOL = StructuredTool.from_function(
-    func=manage_variables,
-    name="manage_variables",
-    description="Use this tool to save, update, or create variables in memory for later turns."
-    ,args_schema=ManageVariablesArgs
-)
-
-# ---------------------------
-# Field Resolution Engine (NEW)
-# ---------------------------
-# Lightweight evidence extraction regexes
-_PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\d{10}|\d{3}[\s-]\d{3}[\s-]\d{4}|\d{5}[\s-]\d{5})")
-_DATE_KEYWORDS = re.compile(r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|tomorrow|today|next\s+\w+)\b", re.I)
-
-def _gather_evidence_from_conversation(conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
-    evidence: Dict[str, Any] = {"emails": [], "phones": [], "dates": [], "intent_keywords": [], "names": []}
-    if not conversation:
-        return evidence
-    text = " ".join((turn.get("content") or turn.get("message") or "") for turn in (conversation or [])).strip()
-    if not text:
-        return evidence
-    # emails
-    for m in re.finditer(r"[\w.+-]+@[\w-]+\.[\w.-]+", text):
-        evidence["emails"].append(m.group(0))
-    # phones
-    for m in _PHONE_RE.finditer(text):
-        evidence["phones"].append(m.group(0))
-    # dates / date keywords
-    for m in _DATE_KEYWORDS.finditer(text):
-        evidence["dates"].append(m.group(0))
-    # simple intent keywords for appointment types
-    for kw in ("cleaning", "checkup", "extraction", "consult", "filling", "root canal", "crown", "book", "appointment", "reschedule", "resched"):
-        if re.search(r"\b" + re.escape(kw) + r"\b", text, re.I):
-            evidence["intent_keywords"].append(kw)
-    # simple name heuristics: "My name is X"
-    nm = re.search(r"\b(?:my name is|i am|this is)\s+([A-Z][a-z]{2,20})\b", text)
-    if nm:
-        evidence["names"].append(nm.group(1))
-    return evidence
-
-def _auto_fill_for_field(field: str, payload: Dict[str, Any], template: Dict[str, Any], evidence: Dict[str, Any], agent_prompt: str) -> Optional[Any]:
-    # end_date_time -> default +30 minutes if start provided and isoparseable
-    if field in ("end_date_time", "endTime", "end") and _is_empty(payload.get(field)):
-        start = payload.get("start_date_time") or payload.get("start") or payload.get("dtstart")
-        if isinstance(start, str) and start:
-            try:
-                dt = datetime.fromisoformat(start)
-                return (dt + timedelta(minutes=30)).isoformat()
-            except Exception:
-                return None
-    # title generation: use intent keywords to create a sensible title
-    if field in ("title", "summary") and (_is_empty(payload.get(field))):
-        if evidence.get("intent_keywords"):
-            kw = evidence["intent_keywords"][0]
-            return f"{kw.capitalize()} Appointment"
-        if re.search(r"\bdental\b|\bclinic\b", agent_prompt, re.I) and evidence.get("intent_keywords"):
-            return "Clinic Appointment"
-        return "Appointment"
-    # attendees: avoid inventing emails
-    return None
-
-def _resolve_fields_and_produce_question(template_obj: Dict[str, Any], ask_map: Dict[str, str], payload: Dict[str, Any], conversation: List[Dict[str, Any]], agent_prompt: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    """
-    Returns (ok, question_if_any, final_payload).
-    ok True means ready to call. If not ok, question is the single question to ask user.
-    """
-    tpl = template_obj or {}
-    evidence = _gather_evidence_from_conversation(conversation or [])
-    final = dict(payload or {})
-    missing_should: List[str] = []
-
-    preferred_not_ask = {"title", "summary", "id", "start_date_time", "end_date_time", "dtstart", "dtend"}
-
-    booking_mode = bool(re.search(r"\b(book|appointment|schedule|resched|reschedule)\b", agent_prompt, re.I))
-
-    for field in tpl.keys():
-        cur_val = final.get(field)
-        # if non-empty, ok
-        if not _is_empty(cur_val):
-            continue
-        # try deterministic autofill
-        auto = _auto_fill_for_field(field, final, tpl, evidence, agent_prompt)
-        if auto is not None:
-            final[field] = auto
-            logger.log("autofill", f"Auto-filled field {field}", {"value": auto})
-            continue
-        guidance = (ask_map or {}).get(field, None)
-        # system preference for not asking certain fields
-        if field in preferred_not_ask:
-            if guidance == "SHOULD_BE_ASKED":
-                pass
-            else:
-                continue
-        # booking mode: treat emails/attendees as required
-        if booking_mode and _looks_like_email_field(field):
-            missing_should.append(field)
-            continue
-        # respect ask_map
-        if guidance == "SHOULD_BE_ASKED":
-            missing_should.append(field)
-            continue
-        if guidance == "CAN_BE_ASKED":
-            # optional, do not block
-            continue
-        # optional keys skip
-        if field in _OPTIONAL_KEYS:
-            continue
-        # if field looks like email/attendee, ask
-        if _looks_like_email_field(field):
-            missing_should.append(field)
-            continue
-        # otherwise skip
-        continue
-
-    # Validate email-like fields for basic format if present
-    invalid_email_fields: List[str] = []
-    for f in list(final.keys()):
-        if _looks_like_email_field(f):
-            norm = _normalize_email_list(final.get(f))
-            if not norm and not _is_empty(final.get(f)):
-                invalid_email_fields.append(f)
-            else:
-                final[f] = norm if norm else final.get(f)
-
-    if invalid_email_fields:
-        if len(invalid_email_fields) == 1:
-            return False, f"Could you share a valid email address for {invalid_email_fields[0]}?", final
-        else:
-            return False, f"Could you share valid email addresses for {', '.join(invalid_email_fields)}?", final
-
-    if missing_should:
-        priority = ["attendees", "email", "emails", "invitees", "phone", "contact", "name"]
-        chosen = None
-        for p in priority:
-            for m in missing_should:
-                if p in m.lower():
-                    chosen = m
-                    break
-            if chosen:
-                break
-        if not chosen:
-            chosen = missing_should[0]
-        q = f"Could you provide {chosen} so I can complete the booking?"
-        return False, q, final
-
-    return True, None, final
-
-def _validate_payload_with_template_and_askmap(payload: Dict[str, Any], template_obj: Any, ask_map: Dict[str, str], conversation: Optional[List[Dict[str, Any]]] = None, agent_prompt: str = "") -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    """
-    Backwards-compatible wrapper that uses the deterministic resolver.
-    """
-    if not isinstance(payload, dict):
-        return False, "Payload must be a JSON object.", {}
-    if not isinstance(template_obj, dict):
-        return True, None, payload
-    # Ensure template keys exist in payload (allow empty so resolver can decide)
-    for k in template_obj.keys():
-        if k not in payload:
-            payload[k] = payload.get(k, "")
-    ok, question, final_payload = _resolve_fields_and_produce_question(template_obj, ask_map or {}, payload, conversation or [], agent_prompt or "")
-    # final end_date_time fill
-    if ok and "start_date_time" in final_payload and _is_empty(final_payload.get("end_date_time")) and "end_date_time" in template_obj:
-        start_val = final_payload.get("start_date_time")
-        if isinstance(start_val, str):
-            try:
-                dt = datetime.fromisoformat(start_val)
-                final_payload["end_date_time"] = (dt + timedelta(minutes=30)).isoformat()
-            except Exception:
-                pass
-    return ok, question, final_payload
-
-# ---------------------------
-# End Field Resolution Engine
-# ---------------------------
 
 def _is_valid_api_url(u: str) -> bool:
     try:
@@ -743,538 +1484,589 @@ def _is_valid_api_url(u: str) -> bool:
         return False
 
 
-def _extract_flow_id_from_url(api_url: str) -> Optional[str]:
-    """Extract the Activepieces flow id from a webhook URL."""
-    try:
-        parsed = urllib.parse.urlparse(api_url)
-        segments = [seg for seg in (parsed.path or "").split("/") if seg]
-        if "webhooks" in segments:
-            idx = segments.index("webhooks")
-            if idx + 1 < len(segments):
-                return segments[idx + 1]
-    except Exception:
-        pass
-    return None
+def build_static_tools(static_tool_configs: List[Dict[str, Any]]) -> List[StructuredTool]:
+    """Convert static tool config into LangChain StructuredTool objects."""
+    tools: List[StructuredTool] = []
 
+    for tool_cfg in static_tool_configs:
+        tool_name = tool_cfg["name"]
+        api_url = tool_cfg["api_url"]
+        payload_template = tool_cfg.get("payload_template", {})
+        instructions = tool_cfg.get("instructions", "")
+        when_run = tool_cfg.get("when_run", "")
 
-def _fetch_activepieces_api_key() -> Optional[str]:
-    """Fetch the Activepieces APP_KEY from the remote config service."""
-    url = "https://adequate-compassion-production.up.railway.app/fetch?table=API+Keys"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json() if resp.ok else None
-        if isinstance(data, dict):
-            for _, rec in data.items():
-                if not isinstance(rec, dict):
-                    continue
-                if str(rec.get("name", "")).lower() == "active_pieces":
-                    val = rec.get("value")
-                    if val:
-                        return str(val)
-    except Exception as e:
-        logger.log("tool.diag.app_key_error", "Failed to fetch active_pieces app key", {"error": str(e)})
-    return None
-
-
-def _fetch_failed_run_details(flow_id: str, app_key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Fetch the latest failed run details and return (error_message, trigger_raw_body, display_name)."""
-    try:
-        headers = {"Authorization": app_key}
-        list_url = (
-            "https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs"
-            f"?flowId={flow_id}&projectId=m6IFepCya4gsolsay8PoM&limit=1&status=FAILED"
-        )
-        resp1 = requests.get(list_url, headers=headers, timeout=15)
-        data = resp1.json() if resp1.ok else None
-        run_id = None
-        if isinstance(data, dict):
-            arr = data.get("data")
-            if isinstance(arr, list) and arr:
-                first = arr[0]
-                if isinstance(first, dict):
-                    run_id = first.get("id")
-        if not run_id:
-            return (None, None, None)
-        detail_url = f"https://activepieces-production-0d12.up.railway.app/api/v1/flow-runs/{run_id}"
-        resp2 = requests.get(detail_url, headers=headers, timeout=15)
-        detail = resp2.json() if resp2.ok else None
-        if not isinstance(detail, dict):
-            return (None, None, None)
-        steps = detail.get("steps") or {}
-        flow_version = detail.get("flowVersion") or {}
-        display_name = None
-        if isinstance(flow_version, dict):
-            display_name = flow_version.get("displayName")
-        if not isinstance(steps, dict):
-            return (None, None, display_name)
-        trigger_raw = None
-        run_error = None
-        trigger = steps.get("trigger") or {}
-        if isinstance(trigger, dict):
-            output = trigger.get("output") or {}
-            if isinstance(output, dict):
-                trigger_raw = output.get("rawBody") or output.get("raw_body")
-        step_1 = steps.get("step_1") or {}
-        if isinstance(step_1, dict):
-            run_error = step_1.get("errorMessage") or step_1.get("error_message")
-        if not run_error:
-            for s in steps.values():
-                if isinstance(s, dict) and str(s.get("status", "")).upper() == "FAILED":
-                    run_error = s.get("errorMessage") or s.get("error_message") or run_error
-                    if run_error:
-                        break
-        return (run_error, trigger_raw, display_name)
-    except Exception as e:
-        logger.log("tool.diag.run_fetch_error", "Failed to fetch flow run details", {"flow_id": flow_id, "error": str(e)})
-        return (None, None, None)
-
-# ---------------------------
-# Tool factory
-# ---------------------------
-def create_universal_tools(config: Dict[str, Any]) -> List[StructuredTool]:
-    generated_tools: List[StructuredTool] = []
-    for tool_id, cfg in (config or {}).items():
-        api_url = str(cfg.get("api_url", "") or "").strip()
-        instructions = str(cfg.get("instructions", "") or "")
-        when_run = str(cfg.get("when_run", "") or "")
-        raw_payload_template = urllib.parse.unquote(str(cfg.get("api_payload_json", "") or ""))
-        tpl_obj = _safe_json_loads(raw_payload_template)
-        ask_map = _parse_ask_guidance(instructions)
-        DynamicArgsModel = None
-        if isinstance(tpl_obj, dict) and tpl_obj:
+        # Build dynamic Pydantic args model from payload template keys
+        DynamicArgs = None
+        if isinstance(payload_template, dict) and payload_template:
             try:
-                fields = {k: (Any, Field(description=f"Value for {k}")) for k in tpl_obj.keys()}
-                DynamicArgsModel = create_model(f"Args_{tool_id}", **fields)
+                fields = {
+                    k: (Any, Field(description=f"Value for {k}"))
+                    for k in payload_template.keys()
+                }
+                DynamicArgs = create_model(f"Args_{tool_name}", **fields)
             except Exception:
-                DynamicArgsModel = None
-        def _make_api_call_factory(_tool_id: str, _api_url: str, _tpl_obj: Any, _ask_map: Dict[str, str]):
-            def make_api_call(state: Annotated[Optional[dict], InjectedState] = None, **kwargs) -> str:
-                event_id = str(uuid.uuid4())
+                DynamicArgs = None
+
+        # Create closure with captured variables
+        def _make_tool_fn(_name: str, _url: str, _tpl: dict):
+            def tool_fn(**kwargs) -> str:
                 payload = dict(kwargs or {})
-                logger.log("tool.call", f"api_tool_{_tool_id} triggered", {"event_id": event_id, "api_url": _api_url, "payload": payload})
-                # Determine conversation and agent_prompt context to pass to resolver.
-                # Prefer explicit kwargs override, otherwise fallback to runtime globals set before agent.invoke.
-                conversation_for_context = None
-                agent_prompt_for_context = None
-                if "_conversation" in payload:
-                    conversation_for_context = payload.pop("_conversation")
-                if "_agent_prompt" in payload:
-                    agent_prompt_for_context = payload.pop("_agent_prompt")
-                if conversation_for_context is None:
-                    conversation_for_context = globals().get("_CURRENT_RUNTIME_CONVERSATION", [])
-                if agent_prompt_for_context is None:
-                    agent_prompt_for_context = globals().get("_CURRENT_AGENT_PROMPT", "")
-                current_vars: Dict[str, Any] = {}
+                event_id = str(uuid.uuid4())
+
+                print(f"[TOOL CALL] {_name} -> {_url}")
+                print(f"[TOOL PAYLOAD] {json.dumps(payload, ensure_ascii=False)}")
+
+                if not _is_valid_api_url(_url):
+                    print(f"[TOOL ERROR] Invalid URL: {_url}")
+                    return json.dumps({
+                        "ok": False,
+                        "error": "Invalid API URL configured",
+                        "event_id": event_id,
+                    })
+
+                # Inject current variables as context
+                global _CURRENT_AGENT_VARIABLES
+                if _name == "fetch_request_quotes" and not payload.get("request_id"):
+                    saved_request_id = _CURRENT_AGENT_VARIABLES.get("request_id")
+                    if not saved_request_id and isinstance(_CURRENT_AGENT_VARIABLES.get("context"), dict):
+                        saved_request_id = _CURRENT_AGENT_VARIABLES["context"].get("request_id")
+                    if saved_request_id:
+                        payload["request_id"] = saved_request_id
+                payload["context_variables"] = dict(_CURRENT_AGENT_VARIABLES)
+
                 try:
-                    if isinstance(state, dict):
-                        current_vars = state.get("variables", {}) or {}
-                except Exception:
-                    current_vars = {}
-                if not current_vars:
-                    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
-                    if isinstance(runtime_vars, dict):
-                        current_vars = runtime_vars
-                # Validate using the new resolver (passes conversation and agent prompt)
-                ok, question, payload2 = _validate_payload_with_template_and_askmap(payload, _tpl_obj, _ask_map, conversation_for_context, agent_prompt_for_context)
-                if not ok:
-                    tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "needs_input": True, "question": question}
-                    logger.log("tool.validation", f"api_tool_{_tool_id} needs user input", tool_result)
-                    return json.dumps(tool_result, ensure_ascii=False)
-                if not _is_valid_api_url(_api_url):
-                    error_data = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": "Invalid api_url"}
-                    logger.log("tool.error", f"api_tool_{_tool_id} invalid api_url", error_data)
-                    return json.dumps(error_data, ensure_ascii=False)
-                try:
-                    if isinstance(payload2, dict):
-                        context_vars: Dict[str, Any] = {}
-                        existing_ctx = payload2.get("context_variables")
-                        if isinstance(existing_ctx, dict):
-                            context_vars.update(existing_ctx)
-                        if isinstance(current_vars, dict):
-                            context_vars.update(current_vars)
-                        payload2["context_variables"] = context_vars
-                    resp = requests.post(_api_url, json=payload2, timeout=20)
+                    resp = requests.post(_url, json=payload, timeout=20)
+                    print(f"[TOOL RESPONSE] status={resp.status_code} body={resp.text[:500]}")
                     try:
                         response_data = resp.json()
                     except Exception:
                         response_data = resp.text
-                    tool_result = {"ok": bool(resp.ok), "status_code": resp.status_code, "response": response_data, "event_id": event_id}
+
+                    return json.dumps({
+                        "ok": bool(resp.ok),
+                        "status_code": resp.status_code,
+                        "response": response_data,
+                        "event_id": event_id,
+                    }, ensure_ascii=False)
+
                 except Exception as e:
-                    tool_result = {"ok": False, "status_code": None, "response": None, "event_id": event_id, "error": str(e)}
+                    print(f"[TOOL ERROR] {str(e)}")
+                    return json.dumps({
+                        "ok": False,
+                        "error": str(e),
+                        "event_id": event_id,
+                    })
 
-                # Failure enrichment for 500/ok=False
-                try:
-                    should_enrich = (tool_result.get("status_code") == 500) or (tool_result.get("ok") is False)
-                    if should_enrich:
-                        app_key = _fetch_activepieces_api_key()
-                        flow_id = _extract_flow_id_from_url(_api_url)
-                        err_msg, trigger_raw, display_name = (None, None, None)
-                        if app_key and flow_id:
-                            err_msg, trigger_raw, display_name = _fetch_failed_run_details(flow_id, app_key)
-                        issue_message = f"{(display_name or f'api_tool_{_tool_id}')} HAD AN ISSUE, DETAILS: {err_msg or 'Unknown error'} ; raw payload body {trigger_raw or 'No trigger raw body'}"
-                        tool_result["response"] = issue_message
-                        tool_result["error"] = True
-                except Exception as enrich_err:
-                    logger.log("tool.diag.enrich_error", "Failed to enrich tool failure", {"event_id": event_id, "error": str(enrich_err)})
+            return tool_fn
 
-                log_type = "tool.response" if tool_result.get("ok") else "tool.error"
-                logger.log(log_type, f"api_tool_{_tool_id} result", tool_result)
-                return json.dumps(tool_result, ensure_ascii=False)
-            return make_api_call
-        make_api_call = _make_api_call_factory(str(tool_id), api_url, tpl_obj, ask_map)
-        description = (f"WHEN_RUN: {when_run}\nINSTRUCTIONS: {instructions}\nPAYLOAD_TEMPLATE: {raw_payload_template}\nDo not invent missing details. Ask if unsure.")
-        new_tool = StructuredTool.from_function(func=make_api_call, name=f"sync_data_tool_{tool_id}", description=description, args_schema=DynamicArgsModel)
-        generated_tools.append(new_tool)
-    return generated_tools
+        fn = _make_tool_fn(tool_name, api_url, payload_template)
 
-# ---------------------------
-# Convert conversation to messages
-# ---------------------------
-def _to_messages(conversation_history: List[Dict[str, Any]], user_message: str) -> List[Any]:
-    msgs: List[Any] = []
+        description = (
+            f"WHEN_RUN: {when_run}\n"
+            f"INSTRUCTIONS: {instructions}\n"
+            f"PAYLOAD_FIELDS: {json.dumps(list(payload_template.keys()))}\n"
+            "Do not invent missing details. Ask if unsure."
+        )
+
+        tool = StructuredTool.from_function(
+            func=fn,
+            name=tool_name,
+            description=description,
+            args_schema=DynamicArgs,
+        )
+        tools.append(tool)
+
+    return tools
+
+
+# ============================================================
+# MESSAGE CONVERSION
+# ============================================================
+def _safe_content_to_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
+
+
+def _dict_to_message(message_dict: Dict[str, Any]) -> BaseMessage:
+    if "type" in message_dict and isinstance(message_dict.get("data"), dict):
+        msg_type = str(message_dict.get("type") or "").lower().strip()
+        data = dict(message_dict.get("data") or {})
+        role_map = {
+            "human": "user",
+            "ai": "assistant",
+            "system": "system",
+            "tool": "tool",
+        }
+        merged = dict(data)
+        merged["role"] = role_map.get(msg_type, data.get("role", msg_type))
+        return _dict_to_message(merged)
+
+    role = str(message_dict.get("role", "") or "").lower().strip()
+    content = message_dict.get("content", message_dict.get("message", ""))
+    kwargs = message_dict.get("additional_kwargs")
+    response_metadata = message_dict.get("response_metadata")
+    msg_id = message_dict.get("id")
+    name = message_dict.get("name")
+
+    common: Dict[str, Any] = {
+        "content": content if content is not None else "",
+    }
+    if kwargs is not None:
+        common["additional_kwargs"] = kwargs
+    if response_metadata is not None:
+        common["response_metadata"] = response_metadata
+    if msg_id is not None:
+        common["id"] = msg_id
+    if name is not None:
+        common["name"] = name
+
+    if role in ("user", "human"):
+        return HumanMessage(**common)
+    if role in ("assistant", "ai"):
+        tool_calls = message_dict.get("tool_calls")
+        invalid_tool_calls = message_dict.get("invalid_tool_calls")
+        if tool_calls is not None:
+            common["tool_calls"] = tool_calls
+        if invalid_tool_calls is not None:
+            common["invalid_tool_calls"] = invalid_tool_calls
+        return AIMessage(**common)
+    if role == "system":
+        return SystemMessage(**common)
+    if role == "tool":
+        tool_call_id = message_dict.get("tool_call_id")
+        if tool_call_id is not None:
+            common["tool_call_id"] = tool_call_id
+        artifact = message_dict.get("artifact")
+        status = message_dict.get("status")
+        if artifact is not None:
+            common["artifact"] = artifact
+        if status is not None:
+            common["status"] = status
+        return ToolMessage(**common)
+    return HumanMessage(content=_safe_content_to_str(content))
+
+
+def _messages_from_context(context_messages: Any) -> List[BaseMessage]:
+    if not isinstance(context_messages, list) or not context_messages:
+        return []
+
+    if messages_from_dict is not None:
+        try:
+            return list(messages_from_dict(context_messages))
+        except Exception:
+            pass
+
+    parsed: List[BaseMessage] = []
+    for item in context_messages:
+        if isinstance(item, BaseMessage):
+            parsed.append(item)
+        elif isinstance(item, dict):
+            parsed.append(_dict_to_message(item))
+    return parsed
+
+
+def _messages_to_context(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if isinstance(msg, ToolMessage):
+            continue
+
+        msg_type = getattr(msg, "type", msg.__class__.__name__.replace("Message", "").lower())
+        content = _safe_content_to_str(msg.content).strip()
+        if isinstance(msg, AIMessage) and not content:
+            continue
+
+        data: Dict[str, Any] = {
+            "content": msg.content,
+        }
+        if getattr(msg, "name", None) is not None:
+            data["name"] = msg.name
+        serialized.append({
+            "type": msg_type,
+            "data": data,
+        })
+    return serialized
+
+
+def _legacy_conversation_to_messages(conversation_history: List[Dict[str, Any]]) -> List[BaseMessage]:
+    msgs: List[BaseMessage] = []
     for turn in (conversation_history or []):
-        role = str(turn.get("role", "") or "").lower().strip()
-        content = turn.get("content") if "content" in turn else turn.get("message")
-        if content is None:
-            content = ""
-        if role == "user":
-            msgs.append(HumanMessage(content=str(content)))
-        elif role == "assistant":
-            msgs.append(AIMessage(content=str(content)))
-        else:
-            msgs.append(HumanMessage(content=str(content)))
+        if isinstance(turn, dict) and turn.get("type") and messages_from_dict is not None:
+            try:
+                msgs.extend(messages_from_dict([turn]))
+                continue
+            except Exception:
+                pass
+        if isinstance(turn, dict):
+            msgs.append(_dict_to_message(turn))
+    return msgs
+
+
+def _to_messages(
+    context: Optional[Dict[str, Any]],
+    conversation_history: List[Dict[str, Any]],
+    user_message: str,
+) -> List[BaseMessage]:
+    """Build LangChain messages from structured context, with legacy conversation fallback."""
+    msgs = _messages_from_context((context or {}).get("messages"))
+    if not msgs:
+        msgs = _legacy_conversation_to_messages(conversation_history)
     if user_message is not None:
         msgs.append(HumanMessage(content=str(user_message)))
     return msgs
 
-# ---------------------------
-# Core run logic
-# ---------------------------
-def run_agent(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
-    logger.clear()
-    logger.log("run.start", "Agent started", {"input_agent_id": agent_id})
-    initial_vars = _variables_array_to_dict(variables)
-    globals()["_CURRENT_AGENT_VARIABLES"] = dict(initial_vars)
-    agent_resp = fetch_agent_details(agent_id)
-    if not agent_resp:
-        logger.log("run.error", "Agent details fetch returned None", {"agent_id": agent_id})
-        return {"reply": "Error: Failed to fetch agent details.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    api_key_to_use = None
-    for key_name in ("api_key", "openai_api_key", "openai_key", "key"):
-        if agent_resp.get(key_name):
-            api_key_to_use = agent_resp.get(key_name)
-            break
-    if not api_key_to_use:
-        api_key_to_use = os.getenv("OPENAI_API_KEY")
-    if not api_key_to_use:
-        logger.log("run.error", "OpenAI API key missing", {})
-        return {"reply": "Error: Missing OpenAI API key.", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    agent_prompt = str(agent_resp.get("prompt", "You are a helpful assistant.") or "").strip()
-    system_prompt = (f"{agent_prompt}\nTool rules:\nIf a tool returns JSON with needs_input=true and a question field, ask that single question to the user and stop.\nDo not claim an external action succeeded unless a tool result clearly confirms it.\nDo not invent missing user details.\n"
-        "Runtime rulebook for planning and tool calls.\n"
-        "You are the runtime planner and reply generator. Before proposing any external action, read the tool's INSTRUCTIONS and AskGuidance tags. For every field marked AskGuidance=SHOULD_BE_ASKED you must either have that exact value provided by the user earlier in the conversation or ask the user a single clear question requesting it. Do not invent or guess values for SHOULD_BE_ASKED fields. If any SHOULD_BE_ASKED field is missing or unclear, output a single question asking for that field and stop. Your output must follow the planner JSON schema and must never call a tool until all SHOULD_BE_ASKED fields are satisfied.\n"
-        "INSTRCUTION SEPERATES THE PROPS BASED ON NEED OF ASKING THE PROP'S VALUE OR REFFERENCE FROM THE USER: SHOULD_BE_ASKED CAN_BE_ASKED AND NOT_TO_BE_ASKED, Always ask the Should be Asked FIleds, Never generally Can be asked can be asked from the user, only ask if it is important in the usecase or to compelte the action, NEVER ask the not to be asked fields.\n"
-        "When asking, ask exactly one question that requests only the missing information and include the exact field name the system expects.\n"
-        "When running a tool, ensure the payload structure matches the tool payload template exactly. If a tool returns a 'needs_input' response, surface that question to the user immediately and stop.\n"
-        "Do not claim success unless a tool response confirms success in JSON. Keep replies user-facing and concise only after tools confirm success.\n"
-        "Use CURRENT AGENT VARIABLES as the source of truth for user facts. If a relevant variable exists, answer using it and do not ask the user to repeat it.\n"
-        "IMPORTANT: IF YOU RECIVE AN ERROR RESPONSE FROM A TOOL, DO NOT RETRY THE SAME TOOL AGAIN, OR DO NOT SKIP THE TOOL AND JUMP TO NEXT TOOL, OR JUST SKIP THE WHOLE TOOL CALL AND IT'S RESPONSE, INSTEAD ACKOWLEDGE USER THE ERROR. FOLLOW THESE BOTH STRICTLY, UNTILL AND UNLESS GLOBAL PROMPT OF AGENT ASKS TO NOT DO SO."
 
+# ============================================================
+# CORE AGENT RUNNER
+# ============================================================
+def _render_system_prompt() -> str:
+    active_config = get_active_agent_config()
+    return active_config["system_prompt"]
+
+
+def _build_runtime_context_message(current_vars: Dict[str, Any]) -> Optional[HumanMessage]:
+    if not current_vars:
+        return None
+    try:
+        vars_str = json.dumps(current_vars, ensure_ascii=False)
+    except Exception:
+        vars_str = str(current_vars)
+    return HumanMessage(content=f"CURRENT AGENT VARIABLES:\n{vars_str}")
+
+
+def _is_runtime_context_message(message: BaseMessage) -> bool:
+    return isinstance(message, HumanMessage) and isinstance(message.content, str) and message.content.startswith("CURRENT AGENT VARIABLES:\n")
+
+
+def _strip_runtime_context_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+    return [message for message in (messages or []) if not _is_runtime_context_message(message)]
+
+
+def _sanitize_reply_text(reply_text: str) -> str:
+    text = (reply_text or "").strip()
+    if not text:
+        return text
+
+    if "|" in text:
+        body, tail = text.split("|", 1)
+        body = body.rstrip()
+        tail = tail.strip()
+        first_body_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        if first_body_line:
+            duplicate_index = tail.find(first_body_line)
+            if duplicate_index > 0:
+                tail = tail[:duplicate_index].rstrip()
+        return f"{body}|{tail}" if tail else body
+
+    lines = [line.rstrip() for line in text.splitlines()]
+    normalized_lines = [line.strip() for line in lines if line.strip()]
+    if normalized_lines:
+        first_line = normalized_lines[0]
+        duplicate_positions = [idx for idx, line in enumerate(lines) if line.strip() == first_line]
+        if len(duplicate_positions) >= 2:
+            lines = lines[:duplicate_positions[1]]
+            return "\n".join(lines).strip()
+
+    return text
+
+
+def _build_context_payload(
+    *,
+    variables: Dict[str, Any],
+    messages: List[BaseMessage],
+    thread_id: str,
+) -> Dict[str, Any]:
+    return {
+        "thread_id": thread_id,
+        "variables": variables,
+        "messages": _messages_to_context(messages),
+    }
+
+
+def _resolve_api_key(body: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Optional[str]:
+    if isinstance(body.get("groq_api_key"), str) and body.get("groq_api_key"):
+        return body.get("groq_api_key")
+    if isinstance(context, dict):
+        if isinstance(context.get("groq_api_key"), str) and context.get("groq_api_key"):
+            return context.get("groq_api_key")
+
+    if isinstance(body.get("api_key"), str) and body.get("api_key"):
+        return body.get("api_key")
+    if isinstance(body.get("openai_api_key"), str) and body.get("openai_api_key"):
+        return body.get("openai_api_key")
+    if isinstance(context, dict):
+        if isinstance(context.get("api_key"), str) and context.get("api_key"):
+            return context.get("api_key")
+        if isinstance(context.get("openai_api_key"), str) and context.get("openai_api_key"):
+            return context.get("openai_api_key")
+    if OPENAI_API_KEY:
+        return OPENAI_API_KEY
+    if GROQ_API_KEY:
+        return GROQ_API_KEY
+    return None
+
+
+def run_agent(
+    context: Optional[Dict[str, Any]],
+    conversation_history: List[Dict[str, Any]],
+    message: str,
+    variables: Optional[Dict[str, Any]] = None,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run the active agent for the current port.
+
+    Args:
+        context: Structured conversation context with variables, messages, and thread_id
+        conversation_history: Last N messages [{"role": "user"|"assistant", "content": "..."}]
+        message: Current user message
+        variables: Optional dict of known variables (user_name, phone, etc.)
+        api_key: OpenAI API key (passed from webhook body, falls back to env var)
+
+    Returns:
+        {"reply": "...", "context": {...}}
+    """
+    global _CURRENT_AGENT_VARIABLES
+    active_config = get_active_agent_config()
+
+    # Prefer key from request body, fallback to env var
+    resolved_api_key = api_key or OPENAI_API_KEY
+    if not resolved_api_key:
+        return {
+            "reply": "Error: LLM API key not provided in request or environment.",
+            "context": _build_context_payload(variables={}, messages=[], thread_id=str(uuid.uuid4())),
+        }
+
+    # Initialize variables
+    context = context or {}
+    context_vars = context.get("variables", {}) if isinstance(context.get("variables"), dict) else {}
+    initial_vars = dict(context_vars)
+    if isinstance(variables, dict):
+        initial_vars.update(variables)
+    if not isinstance(initial_vars.get("context"), dict):
+        initial_vars["context"] = {}
+    _CURRENT_AGENT_VARIABLES = dict(initial_vars)
+
+    # Build tools
+    all_tools = [MANAGE_VARIABLES_TOOL] + build_static_tools(active_config["static_tools"])
+
+    # Build LLM
+    llm = ChatOpenAI(
+        api_key=resolved_api_key,
+        base_url=OPENAI_BASE_URL,
+        model=LLM_MODEL,
+        temperature=0,
     )
-    def _render_system_prompt(current_vars: Dict[str, Any]) -> str:
-        try:
-            vars_str = json.dumps(current_vars, ensure_ascii=False)
-        except Exception:
-            vars_str = str(current_vars)
-        return f"{system_prompt}\nCURRENT AGENT VARIABLES:\n{vars_str}"
 
-    def _state_modifier_fn(state: AgentState) -> List[Any]:
-        current_vars: Dict[str, Any] = {}
-        try:
-            if isinstance(state, dict):
-                current_vars = state.get("variables", {}) or {}
-        except Exception:
-            current_vars = {}
-        if not current_vars:
-            runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
-            if isinstance(runtime_vars, dict):
-                current_vars = runtime_vars
-        system_msg = SystemMessage(content=_render_system_prompt(current_vars))
-        messages: List[Any] = []
-        if isinstance(state, dict):
-            messages = state.get("messages", []) or []
-        # Avoid stacking multiple system messages across steps
-        filtered = [m for m in messages if not (isinstance(m, SystemMessage) and "CURRENT AGENT VARIABLES:" in m.content)]
-        return [system_msg] + filtered
-    fetched_tools = fetch_agent_tools(str(agent_id))
-    merged_config = dict(DYNAMIC_CONFIG)
-    if isinstance(fetched_tools, dict):
-        for tid, tcfg in fetched_tools.items():
-            merged_config[str(tid)] = {"api_url": tcfg.get("api_url", ""), "api_payload_json": tcfg.get("api_payload_json", ""), "instructions": tcfg.get("instructions", ""), "when_run": tcfg.get("when_run", "")}
-    logger.log("run.config", "Merged dynamic config", {"tool_count": len(merged_config)})
-    tools = [MANAGE_VARIABLES_TOOL] + create_universal_tools(merged_config)
-    llm = ChatOpenAI(api_key=api_key_to_use, model="gpt-4o", temperature=0)
-    # Build agent (new API expects prompt, not state_modifier)
-    initial_prompt = _render_system_prompt(initial_vars)
-    agent = create_react_agent(llm, tools, prompt=initial_prompt, state_schema=AgentState)
-    msgs = _to_messages(conversation_history, message)
+    # Build agent
+    system_prompt = _render_system_prompt()
 
-    # Inject runtime context globals so tool calls can access conversation and agent prompt deterministically.
-    # The resolver prefers explicit _conversation and _agent_prompt kwargs, otherwise falls back to these globals.
-    globals()["_CURRENT_RUNTIME_CONVERSATION"] = (conversation_history or []) + [{"role": "user", "content": message}]
-    globals()["_CURRENT_AGENT_PROMPT"] = agent_prompt
+    # Compatible with both old (state_modifier) and new (prompt) langgraph versions
+    try:
+        agent = create_react_agent(
+            llm,
+            tools=all_tools,
+            prompt=system_prompt,
+        )
+    except TypeError:
+        agent = create_react_agent(
+            llm,
+            tools=all_tools,
+            state_modifier=system_prompt,
+        )
+
+    # Convert conversation to messages
+    msgs = _to_messages(context, conversation_history, message)
+    runtime_context_msg = _build_runtime_context_message(dict(_CURRENT_AGENT_VARIABLES))
+    if runtime_context_msg is not None:
+        msgs = [runtime_context_msg] + msgs
+
+    thread_id = str(context.get("thread_id") or uuid.uuid4())
 
     try:
-        # Log before model call
-        logger.log("agent.invoke.start", "Invoking agent", {"message_count": len(msgs)})
-        state = agent.invoke({"messages": msgs, "variables": initial_vars, "is_last_step": False}, config={"recursion_limit": 50})
-        logger.log("agent.invoke.end", "Agent finished invoke")
+        state = agent.invoke(
+            {
+                "messages": msgs,
+            },
+            config={
+                "recursion_limit": 25,
+            },
+        )
     except GraphRecursionError as ge:
-        # Root-level safeguard: if the graph keeps looping, fall back to a single-shot LLM response
-        logger.log("run.error", "Graph recursion limit hit, falling back to direct reply", {"error": str(ge)})
-        fallback_prompt = _render_system_prompt(initial_vars)
+        # Fallback to direct LLM call without tools
         try:
-            fallback_msgs = [SystemMessage(content=fallback_prompt)] + msgs
+            fallback_msgs = [SystemMessage(content=system_prompt)] + msgs
             fallback_resp = llm.invoke(fallback_msgs)
             reply_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
         except Exception as le:
-            logger.log("run.error", "Fallback LLM failed", {"error": str(le)})
             reply_text = f"Error: {str(ge)}"
-        return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
+        reply_text = _sanitize_reply_text(_safe_content_to_str(reply_text))
+        fallback_context = _build_context_payload(
+            variables=dict(_CURRENT_AGENT_VARIABLES),
+            messages=_strip_runtime_context_messages(msgs + [AIMessage(content=reply_text)]),
+            thread_id=thread_id,
+        )
+        return {
+            "reply": reply_text,
+            "context": fallback_context,
+        }
     except Exception as e:
-        logger.log("run.error", "Agent execution exception", {"error": str(e), "traceback": traceback.format_exc()})
-        return {"reply": f"Error: {str(e)}", "logs": logger.to_list(), "variables": _variables_dict_to_object(initial_vars)}
-    # Extract last assistant message
+        error_reply = _sanitize_reply_text(f"Error: {str(e)}")
+        error_context = _build_context_payload(
+            variables=dict(_CURRENT_AGENT_VARIABLES),
+            messages=_strip_runtime_context_messages(msgs + [AIMessage(content=error_reply)]),
+            thread_id=thread_id,
+        )
+        return {
+            "reply": error_reply,
+            "context": error_context,
+        }
+
+    # Extract last AI message
     reply_text = ""
+    out_msgs: List[BaseMessage] = []
     try:
         out_msgs = state.get("messages", []) if isinstance(state, dict) else []
-        last_ai = None
+        last_ai_message: Optional[AIMessage] = None
         for m in reversed(out_msgs):
             if isinstance(m, AIMessage):
-                last_ai = m
+                last_ai_message = m
+                reply_text = _safe_content_to_str(m.content).strip()
                 break
-        if last_ai and isinstance(last_ai.content, str):
-            reply_text = last_ai.content.strip()
-        elif last_ai:
-            reply_text = str(last_ai.content)
-        else:
+        if not reply_text:
             reply_text = "Done."
     except Exception:
         reply_text = "Done."
-    final_variables_dict: Dict[str, Any] = dict(initial_vars)
+        last_ai_message = None
+    reply_text = _sanitize_reply_text(reply_text)
+
+    # Collect final variables
+    final_vars = dict(initial_vars)
     try:
         if isinstance(state, dict) and isinstance(state.get("variables"), dict):
-            final_variables_dict.update(state.get("variables", {}) or {})
+            final_vars.update(state["variables"])
     except Exception:
         pass
-    runtime_vars = globals().get("_CURRENT_AGENT_VARIABLES", {})
-    if isinstance(runtime_vars, dict):
-        final_variables_dict.update(runtime_vars)
-    # Detect if any tool result asked for more input and surface question
-    try:
-        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
-        for m in out_msgs:
-            if isinstance(m, ToolMessage):
-                content = m.content
-                if isinstance(content, str):
-                    parsed = _safe_json_loads(content)
-                    if isinstance(parsed, dict) and parsed.get("needs_input"):
-                        q = parsed.get("question") or parsed.get("message") or parsed.get("error") or "Could you share the missing details needed to proceed?"
-                        logger.log("tool.needs_input", "Tool requested more input", {"question": q, "tool_message": parsed})
-                        return {"reply": str(q), "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
-    except Exception:
-        pass
-    # Compact trace for logs
-    try:
-        out_msgs = state.get("messages", []) if isinstance(state, dict) else []
-        compact_trace: List[Dict[str, Any]] = []
-        for m in out_msgs[-40:]:
-            if isinstance(m, HumanMessage):
-                compact_trace.append({"role": "user", "content": (m.content[:500] + "…") if len(m.content) > 500 else m.content})
-            elif isinstance(m, ToolMessage):
-                compact_trace.append({"role": "tool", "content": (m.content[:700] + "…") if isinstance(m.content, str) and len(m.content) > 700 else m.content})
-            elif isinstance(m, AIMessage):
-                tc = getattr(m, "tool_calls", None)
-                compact_trace.append({"role": "assistant", "content": (m.content[:500] + "…") if isinstance(m.content, str) and len(m.content) > 500 else m.content, "tool_calls": tc})
-        logger.log("run.trace", "Final message trace (compact)", {"messages": compact_trace})
-    except Exception:
-        pass
-    return {"reply": reply_text, "logs": logger.to_list(), "variables": _variables_dict_to_object(final_variables_dict)}
+    final_vars.update(_CURRENT_AGENT_VARIABLES)
 
-async def run_agent_async(agent_id: str, conversation_history: List[Dict[str, Any]], message: str, variables: Optional[Any] = None) -> Dict[str, Any]:
-    """
-    Lightweight async wrapper that offloads the sync run_agent to a thread.
-    """
-    return await asyncio.to_thread(run_agent, agent_id, conversation_history, message, variables)
+    final_messages = out_msgs if isinstance(out_msgs, list) and out_msgs else msgs + [AIMessage(content=reply_text)]
+    final_context = _build_context_payload(
+        variables=final_vars,
+        messages=_strip_runtime_context_messages(final_messages),
+        thread_id=thread_id,
+    )
 
-# ---------------------------
-# Async streaming entrypoint (WebSocket friendly)
-# ---------------------------
-async def run_agent_ws(agent_id: str, message: str, thread_id: str, variables: Optional[Dict[str, Any]] = None):
+    return {
+        "reply": reply_text,
+        "context": final_context,
+    }
 
 
-    agent = _get_cached_agent(agent_id)
-    config = {"configurable": {"thread_id": thread_id}}
-    input_data: Dict[str, Any] = {"messages": [("user", message)]}
-    if variables:
-        input_data["variables"] = variables
+# ============================================================
+# FASTAPI SERVER
+# ============================================================
+ACTIVE_AGENT_CONFIG = get_active_agent_config()
 
-    try:
-        async for chunk, _meta in agent.astream(input_data, config, stream_mode="messages"):
-            # Skip non-assistant content (e.g., tool responses) for websocket streaming
-            if isinstance(chunk, ToolMessage) or isinstance(chunk, SystemMessage):
-                continue
-            text = _chunk_to_text(chunk)
-            if text:
-                yield text
+app = FastAPI(title=ACTIVE_AGENT_CONFIG["title"])
 
-        final_vars: Dict[str, Any] = {}
-        try:
-            state = await agent.aget_state(config)
-            if state and hasattr(state, "values"):
-                vals = getattr(state, "values", {}) or {}
-                if isinstance(vals, dict):
-                    final_vars = vals.get("variables", {}) or {}
-        except Exception:
-            pass
-        yield "||VARS||" + json.dumps(final_vars or {})
-    except Exception as e:
-        yield "||ERROR||" + str(e)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ---------------------------
-# FastAPI app
-# ---------------------------
-app = FastAPI()
-# In dev allow all origins. In production set explicit origins list.
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/health")
+async def health():
+    active_config = get_active_agent_config()
+    return {"status": "ok", "agent": active_config["agent_key"], "model": LLM_MODEL, "port": PORT}
+
 
 @app.post("/run-agent")
 async def run_endpoint(request: Request):
+    """
+    Expected JSON body from n8n:
+    {
+        "message": "user's current message text",
+        "api_key": "sk-...",
+        "context": {
+            "thread_id": "stable-user-or-conversation-id",
+            "api_key": "sk-...",
+            "variables": {
+                "user_name": "Raju",
+                "phone": "919876543210",
+                "district": "Purnia"
+            },
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"}
+            ]
+        },
+        "conversation": [
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "..."},
+            ...
+        ],
+        "variables": {
+            "user_name": "Raju",
+            "phone": "919876543210",
+            "district": "Purnia"
+        },
+        "api_key": "sk-..."
+    }
+
+    Returns:
+    {
+        "reply": "agent response in body|button1,button2 format",
+        "context": {
+            "thread_id": "stable-user-or-conversation-id",
+            "variables": {...},
+            "messages": [...]
+        }
+    }
+    """
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"reply": "Error: Invalid JSON request body", "logs": logger.to_list()})
-    query_params = _query_params_to_dict(request.query_params)
-    payload = body.get("input") if isinstance(body.get("input"), dict) else body
-    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or query_params.get("agent_id") or query_params.get("agentId") or query_params.get("id")
-    is_demo_sms = isinstance(payload, dict) and (_get_case_insensitive(payload, "Body") is not None and _get_case_insensitive(payload, "From") is not None)
-    conversation = payload.get("conversation", []) if not is_demo_sms else []
-    variables_payload = payload.get("variables", [])
-    message = payload.get("message", "")
-    existing_convo_row = None
-    reciever_phone = None
-    if is_demo_sms:
-        reciever_phone = str(_get_case_insensitive(payload, "From") or "")
-        message = str(_get_case_insensitive(payload, "Body") or "")
-        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
-        if existing_convo_row:
-            if not agent_id:
-                agent_id = existing_convo_row.get("agent_id")
-            convo_json = existing_convo_row.get("conversation_json") or []
-            if isinstance(convo_json, list):
-                conversation = convo_json
-            stored_vars = existing_convo_row.get("variables") or {}
-            if isinstance(stored_vars, dict):
-                variables_payload = stored_vars
-    if not agent_id:
-        return JSONResponse({"reply": "Error: Missing agent_id in request", "logs": logger.to_list()})
-    res = run_agent(str(agent_id), conversation, str(message), variables_payload)
-    if is_demo_sms and reciever_phone:
-        prev_convo = conversation if isinstance(conversation, list) else []
-        new_convo = list(prev_convo)
-        new_convo.append({"role": "user", "content": message})
-        new_convo.append({"role": "assistant", "content": res.get("reply", "")})
-        assistant_index = len(new_convo)
-        prior_tool_logs = []
-        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
-            prior_tool_logs = existing_convo_row.get("tool_run_logs")
-        tool_events = []
-        for ev in res.get("logs", []):
-            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
-                ev_copy = dict(ev)
-                ev_copy["assistant_index"] = assistant_index
-                tool_events.append(ev_copy)
-        updated_tool_logs = prior_tool_logs + tool_events
-        updated_variables = res.get("variables", {})
-        if not isinstance(updated_variables, dict):
-            updated_variables = {}
-        row_id = existing_convo_row.get("id") if existing_convo_row else None
-        _upsert_conversation_row(row_id, {
-            "agent_id": agent_id,
-            "conversation_json": new_convo,
-            "reciever_phone": reciever_phone,
-            "tool_run_logs": updated_tool_logs,
-            "type": "demo-sms",
-            "variables": updated_variables,
-        })
-    if is_demo_sms:
-        return Response(content=_format_sms_xml(res.get("reply", "")), media_type="application/xml")
-    return JSONResponse(res)
+        return JSONResponse({"reply": "Error: Invalid JSON body", "context": {}})
 
-# Support inline execution when running inside CI or sandbox that injects 'inputs'
-if "inputs" in globals():
-    data = globals().get("inputs", {}) or {}
-    q = globals().get("query", {}) or {}
-    payload = data.get("input") if isinstance(data.get("input"), dict) else data
-    agent_id = payload.get("agent_id") or payload.get("agentId") or payload.get("id") or q.get("agent_id") or q.get("agentId") or q.get("id")
-    is_demo_sms = isinstance(payload, dict) and (_get_case_insensitive(payload, "Body") is not None and _get_case_insensitive(payload, "From") is not None)
-    conversation = payload.get("conversation", []) if not is_demo_sms else []
-    variables_payload = payload.get("variables", [])
-    message = payload.get("message", "")
-    existing_convo_row = None
-    reciever_phone = None
-    if is_demo_sms:
-        reciever_phone = str(_get_case_insensitive(payload, "From") or "")
-        message = str(_get_case_insensitive(payload, "Body") or "")
-        existing_convo_row = _fetch_conversation_by_phone(reciever_phone)
-        if existing_convo_row:
-            if not agent_id:
-                agent_id = existing_convo_row.get("agent_id")
-            convo_json = existing_convo_row.get("conversation_json") or []
-            if isinstance(convo_json, list):
-                conversation = convo_json
-            stored_vars = existing_convo_row.get("variables") or {}
-            if isinstance(stored_vars, dict):
-                variables_payload = stored_vars
-    _out = run_agent(str(agent_id), conversation, str(message), variables_payload)
-    if is_demo_sms and reciever_phone:
-        prev_convo = conversation if isinstance(conversation, list) else []
-        new_convo = list(prev_convo)
-        new_convo.append({"role": "user", "content": message})
-        new_convo.append({"role": "assistant", "content": _out.get("reply", "")})
-        assistant_index = len(new_convo)
-        prior_tool_logs = []
-        if existing_convo_row and isinstance(existing_convo_row.get("tool_run_logs"), list):
-            prior_tool_logs = existing_convo_row.get("tool_run_logs")
-        tool_events = []
-        for ev in _out.get("logs", []):
-            if isinstance(ev, dict) and str(ev.get("type", "")).startswith("tool"):
-                ev_copy = dict(ev)
-                ev_copy["assistant_index"] = assistant_index
-                tool_events.append(ev_copy)
-        updated_tool_logs = prior_tool_logs + tool_events
-        updated_variables = _out.get("variables", {})
-        if not isinstance(updated_variables, dict):
-            updated_variables = {}
-        row_id = existing_convo_row.get("id") if existing_convo_row else None
-        _upsert_conversation_row(row_id, {
-            "agent_id": agent_id,
-            "conversation_json": new_convo,
-            "reciever_phone": reciever_phone,
-            "tool_run_logs": updated_tool_logs,
-            "type": "demo-sms",
-            "variables": updated_variables,
-        })
-    try:
-        _out["debug_inputs"] = {
-            "inputs_keys": list(data.keys()) if isinstance(data, dict) else [],
-            "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
-            "from": _get_case_insensitive(payload, "From"),
-            "body": _get_case_insensitive(payload, "Body"),
-        }
-    except Exception:
-        pass
-    if is_demo_sms:
-        globals()["result"] = _format_sms_xml(_out.get("reply", ""))
-    else:
-        globals()["result"] = _out
+    message = body.get("message", "")
+    context = body.get("context", {})
+    conversation = body.get("conversation", [])
+    variables = body.get("variables", {})
+    api_key = _resolve_api_key(body, context if isinstance(context, dict) else {})
+
+    if not message:
+        return JSONResponse({"reply": "Error: No message provided", "context": context if isinstance(context, dict) else {}})
+
+    # Run agent in thread to not block event loop
+    result = await asyncio.to_thread(
+        run_agent,
+        context if isinstance(context, dict) else {},
+        conversation,
+        str(message),
+        variables if isinstance(variables, dict) else {},
+        api_key if api_key else None,
+    )
+
+    return JSONResponse(result)
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    active_config = get_active_agent_config()
+    print(f"Starting {active_config['agent_key']} on port {PORT}...")
+    print(f"Model: {LLM_MODEL}")
+    print(f"Tools: {[t['name'] for t in active_config['static_tools']]}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
