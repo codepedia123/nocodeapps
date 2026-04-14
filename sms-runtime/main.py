@@ -760,8 +760,9 @@ CRITICAL RULES:
 QUOTE REQUIRED FIELDS:
 
 - Per-item unit price for each requested item (₹, number)
-- Part Type (Genuine / Other brand)
-- If Part Type is Other brand, collect other-brand details for each unique requested part:
+- Part Type (Genuine / Other Brand)
+- Treat `Other`, `Other Brand`, `Other brand`, `other part`, `local`, `aftermarket`, and `non-genuine` as the same selection: `Other Brand`
+- If Part Type is Other Brand, collect other-brand details for each unique requested part:
   - Brand name, example: Hero
   - Bike Model name, example: Splendor
   - Bike Model year, example: 2022
@@ -883,7 +884,8 @@ Do not ask the first price question until the current request's id and relevant 
 Collect required fields one at a time.
 Do not confirm early.
 Required fields: Per-item unit prices, Part Type, Stock Status.
-If Part Type is Other brand, other-brand details are also required before confirmation.
+If Part Type is Other Brand, other-brand details are also required before confirmation.
+If dealer says `other`, `other part`, `other brand`, `local`, `aftermarket`, or `non-genuine`, treat it as Other Brand and ask the next required other-brand detail immediately.
 
 If the request has multiple items:
 - Ask price for each item one by one
@@ -909,9 +911,21 @@ Repeat until all item prices are collected.
 
 Step 3 - After all item prices are received, ask Part Type:
 
-Part type kya hai?|Genuine,Other brand
+Part type kya hai?|Genuine,Other Brand
 
-Step 4 - If dealer selects Other brand:
+Step 4 - If dealer selects Other Brand:
+
+Treat any of these dealer replies as Other Brand:
+- Other
+- Other Brand
+- Other brand
+- other part
+- local
+- aftermarket
+- non-genuine
+
+After this selection, do not ask Stock Status yet.
+Immediately collect the Other Brand details below.
 
 For each unique requested part, collect these details one part at a time before asking stock status:
 - Brand name, example: Hero
@@ -924,7 +938,7 @@ Example:
 {Part Name} ke liye brand name bataiye. Example: Hero
 
 After collecting all other-brand details, add them to notes in readable format, for example:
-Other brand details:
+Other Brand details:
 - Chain Kit: Brand Hero, Model Splendor, Year 2022, Variant Plus
 - Turn Indicator: Brand Hero, Model Splendor, Year 2022, Variant BS6
 
@@ -954,7 +968,7 @@ Koi extra notes hain?|Haan,Skip
 If dealer adds notes:
 - Store the notes exactly as given
 - Do not rewrite or expand them
-- If Other brand details exist, preserve them in notes and append any extra notes after them
+- If Other Brand details exist, preserve them in notes and append any extra notes after them
 
 Step 8 - After notes are skipped or collected, show final confirmation:
 
@@ -966,7 +980,7 @@ Gross Total: ₹{gross_total}
 Final Total: ₹{final_total}
 Type: {part_type}
 Stock: {stock_status}
-{If Other brand details exist: Other Brand Details: {readable_other_brand_details}}
+{If Other Brand details exist: Other Brand Details: {readable_other_brand_details}}
 {If notes exist: Notes: {extra_notes}}
 
 Kuch update karna hai ya continue karein?|Update,Confirm,Cancel
@@ -1361,10 +1375,11 @@ SECOND_AGENT_STATIC_TOOLS: List[Dict[str, Any]] = [
         "Use this tool to submit a dealer's quote for a part request. "
         "Only call this AFTER the dealer has confirmed their quote with all required fields. "
         "The 'quote_details' field should be a JSON array of objects, each with: "
-        "part_name, company, model, year, quantity, price, part_type (Genuine/Other brand), "
+        "part_name, company, model, year, quantity, price, part_type (Genuine/Other Brand), "
         "and stock_status (Available/Arrange Karna Padega). "
-        "Only use part_type values Genuine or Other brand. "
-        "If part_type is Other brand, collect Brand name, Bike Model name, Bike Model year, and Bike model variant for each unique requested part before submit. "
+        "Only use part_type values Genuine or Other Brand. "
+        "Treat Other, Other brand, other part, local, aftermarket, and non-genuine as Other Brand. "
+        "If part_type is Other Brand, collect Brand name, Bike Model name, Bike Model year, and Bike model variant for each unique requested part before submit. "
         "Add those other-brand details to the notes field in a readable per-part format, along with any extra notes the dealer gave. "
         "Get dealer_id, dealer_rating, and district from CURRENT AGENT VARIABLES. "
         "Get request_id from CURRENT AGENT VARIABLES.context. "
